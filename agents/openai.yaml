@@ -1,0 +1,4 @@
+interface:
+  display_name: "Project Journal"
+  short_description: "Maintain project journal entrypoints, workstream notes, and local indexes."
+  default_prompt: "Use $project-journal to recover or update this repo's short PROJECT_STATE / PROJECT_TODO entrypoints, per-workstream docs/project_journal notes, and ignored local journal index."
