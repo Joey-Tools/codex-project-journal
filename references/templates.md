@@ -11,7 +11,7 @@
 
 ## Recovery Pointers
 - Active workstream: `docs/project_journal/2026/03/2026-03-07-codec-fallback-a1b2c3.md`
-- Local index: optional generated `docs/project_journal/INDEX.md`; regenerate with `scripts/project_journal.py generate`
+- Local index: optional generated `docs/project_journal/INDEX.md`; regenerate with the bundled `project_journal.py generate` helper
 
 ## Global Blockers
 - Only blockers that affect the whole repo or next recovery path.
@@ -91,6 +91,6 @@ superseded_by:
 - Keep the top-level docs as stable entrypoints; move dynamic detail into topic/date subfiles by default.
 - Use a focused note when a blocker set or closure plan would make the top-level trackers noisy.
 - For squash-merge PRs, write tracked journal docs as the target-branch state after the PR lands, preferring the relevant per-workstream journal over top-level entrypoints. If the PR fully completes the workstream, `status: completed` is appropriate before merge; use the PR link as evidence and keep transient review or merge states in the PR body, checklist, or comments.
-- Run `scripts/project_journal.py validate --repo <path>` when using journal frontmatter.
-- Run `scripts/project_journal.py generate --repo <path> --output docs/project_journal/INDEX.md --ensure-exclude` to refresh the ignored local index.
+- Run the bundled `project_journal.py validate --repo <path>` helper when using journal frontmatter.
+- Run the bundled `project_journal.py generate --repo <path> --output docs/project_journal/INDEX.md --ensure-exclude` helper to refresh the ignored local index.
 - If the repo already has task IDs or status labels, keep them consistent.

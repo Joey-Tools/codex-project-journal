@@ -13,6 +13,7 @@ import unittest
 
 
 SCRIPT = pathlib.Path(__file__).resolve().parents[1] / "scripts" / "project_journal.py"
+SKILL_MD = pathlib.Path(__file__).resolve().parents[1] / "SKILL.md"
 SPEC = importlib.util.spec_from_file_location("project_journal", SCRIPT)
 assert SPEC is not None
 project_journal = importlib.util.module_from_spec(SPEC)
@@ -248,6 +249,17 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("field 'created' must not be empty", result.stderr)
         self.assertIn("field 'updated' must not be empty", result.stderr)
+
+    def test_skill_warns_to_use_bundled_helper_path(self) -> None:
+        skill = SKILL_MD.read_text(encoding="utf-8")
+
+        self.assertIn("### Helper Script Path", skill)
+        self.assertIn(
+            "<loaded-skill-dir>/scripts/project_journal.py",
+            skill,
+        )
+        self.assertIn("<target-repo>/scripts/project_journal.py", skill)
+        self.assertNotIn("Use `scripts/project_journal.py validate", skill)
 
     def test_validate_rejects_broken_supersedes_link(self) -> None:
         repo = self.init_repo()
