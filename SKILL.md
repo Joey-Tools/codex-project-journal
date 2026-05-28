@@ -16,14 +16,26 @@ Treat the generated `docs/project_journal/INDEX.md` as a local ignored convenien
 
 1. Treat the docs as the default convention.
 - Read the repo `AGENTS.md`, existing docs, and the user request.
-- For repositorys, assume `docs/PROJECT_STATE.md` and `docs/PROJECT_TODO.md` should exist as stable entrypoints unless the user explicitly opts out or the repo already has a stronger equivalent tracker.
+- For repositories, assume `docs/PROJECT_STATE.md` and `docs/PROJECT_TODO.md` should exist as stable entrypoints unless the user explicitly opts out or the repo already has a stronger equivalent tracker.
 - If the repo already uses `docs/project_journal/`, read the relevant entries and optionally regenerate the ignored index before planning.
 
 2. Recover context before planning.
 - Reuse existing section names, task labels, and terminology.
 - Keep top-level trackers short and stable; do not append ordinary PR/thread changelog noise to `PROJECT_STATE` or `PROJECT_TODO`.
-- Use `scripts/project_journal.py discover-repos` when the task is to find repositorys recently touched by Codex sessions.
-- Use `scripts/project_journal.py validate --repo <path>` to verify journal frontmatter before relying on a migrated journal set.
+- Use the bundled helper script when the task is to find repositories recently touched by Codex sessions.
+- Use the bundled helper script to verify journal frontmatter before relying on a migrated journal set.
+
+### Helper Script Path
+
+`scripts/project_journal.py` belongs to this skill, not to every target repository.
+When invoking the helper from a target repo, resolve the script relative to the loaded skill directory and call it with `python3`, for example:
+
+```bash
+python3 "<loaded-skill-dir>/scripts/project_journal.py" validate --repo <path>
+```
+
+Use a repo-relative `python3 scripts/project_journal.py ...` command only when the current repo is this skill's source checkout and the script file exists there.
+Do not report the journal validator as unavailable merely because `<target-repo>/scripts/project_journal.py` is missing.
 
 3. Create the right layer when setup is needed.
 - If top-level trackers do not exist yet, create both files in the same task.
@@ -36,7 +48,7 @@ Treat the generated `docs/project_journal/INDEX.md` as a local ignored convenien
 - Update `PROJECT_STATE` only when repo-wide state, recovery pointers, or global blockers change.
 - Update `PROJECT_TODO` only when cross-workstream actionable backlog changes.
 - Before a commit: include relevant doc updates in the same commit when they materially changed.
-- If using per-workstream journals, run `scripts/project_journal.py validate --repo <path>` before committing.
+- If using per-workstream journals, run the bundled helper's `validate --repo <path>` command before committing.
 
 5. Prepare PR-bound docs for target-branch semantics.
 - Before marking a PR ready, check the repo's merge model from repo guidance, branch protection, PR settings, or existing project convention.
@@ -65,13 +77,13 @@ Treat the generated `docs/project_journal/INDEX.md` as a local ignored convenien
 - Do not stop after splitting `PROJECT_STATE` and `PROJECT_TODO`; search repo-local guidance and documentation indexes for references to project records, `PROJECT_STATE`, `PROJECT_TODO`, and `project_journal`.
 - Update repo `AGENTS.md` or repo-local skills so future agents know that the top-level trackers are stable short entrypoints, ordinary dynamic workstream state belongs in `docs/project_journal/YYYY/MM/*.md`, and generated `docs/project_journal/INDEX.md` is local and untracked.
 - Keep README and docs index changes minimal: preserve existing `PROJECT_STATE` / `PROJECT_TODO` links, and add a pointer to `docs/project_journal/` when those files become the durable source of truth.
-- Do not add `docs/project_journal/README.md` unless the validator explicitly excludes it or it uses valid journal frontmatter; `scripts/project_journal.py validate` treats Markdown files under `docs/project_journal/` as journal entries.
+- Do not add `docs/project_journal/README.md` unless the validator explicitly excludes it or it uses valid journal frontmatter; the bundled helper's `validate` command treats Markdown files under `docs/project_journal/` as journal entries.
 - For remote repos, make these guidance updates in the same migration PR/branch after confirming the canonical repo root and worktree layout.
 - For multi-repo migrations or legacy tracker splits, load `references/migration-playbook.md` before editing.
 
 9. Generate local indexes only as convenience artifacts.
-- Use `scripts/project_journal.py generate --repo <path> --output docs/project_journal/INDEX.md --ensure-exclude` to refresh the local index.
-- Use `scripts/project_journal.py install-hooks --repo <path>` only when the user wants opt-in local hook refresh for that repo.
+- Use the bundled helper's `generate --repo <path> --output docs/project_journal/INDEX.md --ensure-exclude` command to refresh the local index.
+- Use the bundled helper's `install-hooks --repo <path>` command only when the user wants opt-in local hook refresh for that repo.
 - Do not commit `docs/project_journal/INDEX.md`; the helper writes it to `.git/info/exclude`.
 
 10. Keep the signal high.
@@ -90,9 +102,9 @@ Treat the generated `docs/project_journal/INDEX.md` as a local ignored convenien
 - Prefer moving old detail out of the top-level files over deleting useful context outright; do this opportunistically when the related workstream is touched, not as a mandatory cleanup pass.
 - Do not turn the docs into a fake append-only event log; keep checkpoints and evidence references compact.
 - Top-level trackers should point to focused notes when needed, not absorb every long blocker narrative inline.
-- Do not batch-install hooks across repositorys by default; first generate a candidate report with `discover-repos`.
+- Do not batch-install hooks across repositories by default; first generate a candidate report with `discover-repos`.
 - Remote hosts use the same personal skill script host-locally; let `$remote-host-context` own remote evidence gathering and host selection.
-- `scripts/project_journal.py` is intentionally stdlib-only so it can run in local repos, temporary validation repos, and remote hosts after skill sync.
+- The bundled `scripts/project_journal.py` is intentionally stdlib-only so it can run in local repos, temporary validation repos, and remote hosts after skill sync.
 - During migrations, preserve every old tracker item somewhere intentional: active backlog, completed/history journal, superseded note, or legacy snapshot. Do not leave actionable items only in the snapshot.
 - Do not require a second migration from date-based journals into slot or active directories; keep using existing `docs/project_journal/YYYY/MM/*.md` unless the repo has a stronger local convention.
 - Do not commit generated `docs/project_journal/INDEX.md`, local hooks, or transient PR/branch states unless the user explicitly asks for that exact local state to be tracked.

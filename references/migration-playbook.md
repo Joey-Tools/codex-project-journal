@@ -1,13 +1,13 @@
 # Project Journal Migration Playbook
 
-Use this reference when converting existing repositorys from large tracked
+Use this reference when converting existing repositories from large tracked
 `docs/PROJECT_STATE.md` / `docs/PROJECT_TODO.md` files to short entrypoints plus
 per-workstream journal files. Prefer changing future write behavior over
 performing a second broad file migration.
 
 ## Candidate Filtering
 
-- Start with `scripts/project_journal.py discover-repos`; do not crawl the full
+- Start with the bundled `project_journal.py discover-repos` helper; do not crawl the full
   filesystem.
 - For each discovered repo, check git history for committed trackers:
   `git log --all -- docs/PROJECT_STATE.md docs/PROJECT_TODO.md`.
@@ -50,7 +50,7 @@ performing a second broad file migration.
 
 ## Review And Merge
 
-- Run `scripts/project_journal.py validate --repo <repo>` and
+- Run the bundled `project_journal.py validate --repo <repo>` helper and
   `git diff --check` before review or commit.
 - Use a clean-context review for migrations with substantial legacy tracker
   content. Ask the reviewer to compare old `PROJECT_STATE/TODO` against the new
