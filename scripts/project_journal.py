@@ -75,11 +75,13 @@ MAX_GLOBAL_GIT_CONFIG_OUTPUT_BYTES = 16 * 1024
 MAX_GLOBAL_GIT_CONFIG_SOURCE_BYTES = 1024 * 1024
 MAX_EXISTING_HOOK_BYTES = 1024 * 1024
 MAX_GENERIC_GIT_STDOUT_BYTES = 4 * 1024 * 1024
+MAX_GIT_EXECUTABLE_BYTES = 64 * 1024 * 1024
 GIT_INDEX_SNAPSHOT_TIMEOUT_SECONDS = 10.0
 GIT_CAT_FILE_BATCH_TIMEOUT_SECONDS = 10.0
 GIT_ADOPTION_VALIDATION_TIMEOUT_SECONDS = 10.0
 GIT_COMMAND_TIMEOUT_SECONDS = 10.0
 GIT_VERSION_TIMEOUT_SECONDS = 2.0
+GIT_EXECUTABLE_SNAPSHOT_TIMEOUT_SECONDS = 5.0
 GIT_CONFIG_QUERY_TIMEOUT_SECONDS = 5.0
 GIT_PROCESS_TERMINATE_GRACE_SECONDS = 0.25
 GIT_PROCESS_KILL_DRAIN_SECONDS = 1.0
@@ -260,6 +262,24 @@ class _HookDirectoryBinding:
     install_lock_identity: tuple[int, int, int, int, int] | None = None
 
 
+@dataclasses.dataclass
+class _HookCommitState:
+    phase: str = "staged-cleanup-safe"
+
+    @property
+    def must_preserve_temporary(self) -> bool:
+        return self.phase == "exchange-may-have-committed"
+
+    def begin_exchange(self) -> None:
+        self.phase = "exchange-may-have-committed"
+
+    def mark_cleanup_safe(self) -> None:
+        self.phase = "staged-cleanup-safe"
+
+    def mark_temporary_consumed(self) -> None:
+        self.phase = "temporary-consumed"
+
+
 @dataclasses.dataclass(frozen=True)
 class _ValidationReport:
     issues: tuple[str, ...]
@@ -365,6 +385,18 @@ def _directory_identity(value: os.stat_result) -> tuple[int, int, int, int]:
         value.st_ino,
         value.st_uid,
         stat.S_IMODE(value.st_mode),
+    )
+
+
+def _git_source_identity(value: os.stat_result) -> tuple[int, ...]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        stat.S_IFMT(value.st_mode),
+        value.st_uid,
+        value.st_gid,
+        stat.S_IMODE(value.st_mode),
+        value.st_size,
     )
 
 
@@ -522,31 +554,6 @@ def _global_config_git_environment() -> dict[str, str]:
     return env
 
 
-def _system_config_git_environment() -> dict[str, str]:
-    env = {
-        key: os.environ[key]
-        for key in (
-            "LANG",
-            "LC_ALL",
-            "LC_CTYPE",
-            "PATH",
-            "SYSTEMROOT",
-            "TEMP",
-            "TMP",
-            "TMPDIR",
-        )
-        if key in os.environ
-    }
-    env.update(SAFE_GIT_ENV)
-    env.pop("GIT_CONFIG_NOSYSTEM", None)
-    configured_path = os.environ.get("GIT_CONFIG_SYSTEM")
-    if configured_path is None:
-        env.pop("GIT_CONFIG_SYSTEM", None)
-    else:
-        env["GIT_CONFIG_SYSTEM"] = configured_path
-    return env
-
-
 def _fixed_git_executable() -> pathlib.Path:
     global _GIT_RUNTIME_ERROR
 
@@ -616,7 +623,12 @@ def _resolve_repo(
     deadline: float | None = None,
     deadline_error: str = "repository resolution exceeded its shared deadline",
 ) -> pathlib.Path:
-    candidate = pathlib.Path(repo_arg).expanduser().resolve()
+    candidate = pathlib.Path(repo_arg).expanduser()
+    if not candidate.is_absolute():
+        # Preserve symlink/.. traversal semantics for bounded Git
+        # canonicalization. Lexical normalization before Git would resolve
+        # "link/../repo" against the link's parent instead of its target.
+        candidate = pathlib.Path.cwd() / candidate
     result = _run_git(
         candidate,
         "rev-parse",
@@ -630,7 +642,7 @@ def _resolve_repo(
             result.stderr.strip() or result.stdout.strip() or "not a git repository"
         )
         raise UserError(f"{candidate} is not a git repository: {detail}")
-    return pathlib.Path(result.stdout.strip()).resolve()
+    return _lexical_absolute_path(pathlib.Path(result.stdout.strip()))
 
 
 def _git_path(repo: pathlib.Path, rel: str) -> pathlib.Path:
@@ -1711,6 +1723,9 @@ def _capture_bounded_process(
 
 def _snapshot_git_executable(
     source: pathlib.Path,
+    *,
+    expected_source_identity: tuple[int, ...],
+    deadline: float,
 ) -> tuple[
     pathlib.Path,
     str,
@@ -1718,60 +1733,123 @@ def _snapshot_git_executable(
     tuple[int, int, int, int],
     tempfile.TemporaryDirectory[str],
 ]:
+    no_follow = _required_open_flag("O_NOFOLLOW")
+    nonblock = _required_open_flag("O_NONBLOCK")
+    source_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | no_follow | nonblock
+    destination_flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | no_follow
+        | nonblock
+    )
+    deadline_error = "selected Git executable snapshot exceeded its shared deadline"
+    _check_deadline(deadline, deadline_error)
     owner = tempfile.TemporaryDirectory(prefix="project-journal-git-runtime-")
-    directory = pathlib.Path(owner.name).resolve()
-    os.chmod(directory, 0o700)
-    snapshot = directory / "git"
-    source_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
-    source_flags |= getattr(os, "O_NOFOLLOW", 0)
-    destination_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    destination_flags |= getattr(os, "O_CLOEXEC", 0)
-    destination_flags |= getattr(os, "O_NOFOLLOW", 0)
     try:
+        directory = pathlib.Path(owner.name).resolve()
+        snapshot = directory / "git"
+        _check_deadline(deadline, deadline_error)
+        os.chmod(directory, 0o700)
+        _check_deadline(deadline, deadline_error)
         source_fd = os.open(source, source_flags)
         try:
+            _check_deadline(deadline, deadline_error)
             source_before = os.fstat(source_fd)
             if not stat.S_ISREG(source_before.st_mode):
                 raise OSError("selected Git executable is not a regular file")
+            source_path_before = os.stat(source, follow_symlinks=False)
+            _check_deadline(deadline, deadline_error)
+            source_identity = _git_source_identity(source_before)
+            if (
+                source_identity != expected_source_identity
+                or _git_source_identity(source_path_before) != source_identity
+            ):
+                raise OSError(
+                    "selected Git executable path identity changed before snapshot"
+                )
+            if source_before.st_size > MAX_GIT_EXECUTABLE_BYTES:
+                raise OSError(
+                    f"selected Git executable exceeds {MAX_GIT_EXECUTABLE_BYTES} bytes"
+                )
             destination_fd = os.open(snapshot, destination_flags, 0o600)
             digest = hashlib.sha256()
+            copied = 0
             try:
                 while True:
+                    _check_deadline(deadline, deadline_error)
                     chunk = os.read(source_fd, PROCESS_READ_CHUNK_BYTES)
                     if not chunk:
                         break
+                    copied += len(chunk)
+                    if copied > MAX_GIT_EXECUTABLE_BYTES:
+                        raise OSError(
+                            "selected Git executable exceeds "
+                            f"{MAX_GIT_EXECUTABLE_BYTES} bytes"
+                        )
                     digest.update(chunk)
                     offset = 0
                     while offset < len(chunk):
+                        _check_deadline(deadline, deadline_error)
                         written = os.write(destination_fd, chunk[offset:])
                         if written <= 0:
                             raise OSError("short write while snapshotting Git")
                         offset += written
-                os.fsync(destination_fd)
                 os.fchmod(destination_fd, 0o500)
+                _check_deadline(deadline, deadline_error)
+                os.fsync(destination_fd)
+                _check_deadline(deadline, deadline_error)
                 destination_stat = os.fstat(destination_fd)
             finally:
                 os.close(destination_fd)
             source_after = os.fstat(source_fd)
+            source_path_after = os.stat(source, follow_symlinks=False)
+            _check_deadline(deadline, deadline_error)
+
+            os.lseek(source_fd, 0, os.SEEK_SET)
+            verification_digest = hashlib.sha256()
+            verification_size = 0
+            while True:
+                _check_deadline(deadline, deadline_error)
+                chunk = os.read(source_fd, PROCESS_READ_CHUNK_BYTES)
+                if not chunk:
+                    break
+                verification_size += len(chunk)
+                if verification_size > MAX_GIT_EXECUTABLE_BYTES:
+                    raise OSError(
+                        "selected Git executable exceeds "
+                        f"{MAX_GIT_EXECUTABLE_BYTES} bytes"
+                    )
+                verification_digest.update(chunk)
+            source_verified = os.fstat(source_fd)
+            source_path_verified = os.stat(source, follow_symlinks=False)
+            _check_deadline(deadline, deadline_error)
         finally:
             os.close(source_fd)
 
-        source_signals = (
-            "st_dev",
-            "st_ino",
-            "st_mode",
-            "st_size",
-            "st_mtime_ns",
-            "st_ctime_ns",
-        )
-        if any(
-            getattr(source_before, name) != getattr(source_after, name)
-            for name in source_signals
+        if (
+            _git_source_identity(source_after) != source_identity
+            or _git_source_identity(source_path_after) != source_identity
+            or _git_source_identity(source_verified) != source_identity
+            or _git_source_identity(source_path_verified) != source_identity
         ):
-            raise OSError("selected Git executable changed while being snapshotted")
-        if destination_stat.st_size != source_after.st_size:
+            raise OSError(
+                "selected Git executable path identity changed while being snapshotted"
+            )
+        if verification_digest.digest() != digest.digest():
+            raise OSError(
+                "selected Git executable content changed while being snapshotted"
+            )
+        _check_deadline(deadline, deadline_error)
+        if (
+            copied != source_after.st_size
+            or verification_size != copied
+            or destination_stat.st_size != copied
+        ):
             raise OSError("Git runtime snapshot size does not match its source")
         directory_stat = os.stat(directory, follow_symlinks=False)
+        _check_deadline(deadline, deadline_error)
         return (
             snapshot,
             digest.hexdigest(),
@@ -1802,17 +1880,30 @@ def _initialize_git_runtime() -> None:
             "Git >= 2.45 is required, but no Git executable was found on PATH"
         )
         return
+    snapshot_deadline = time.monotonic() + GIT_EXECUTABLE_SNAPSHOT_TIMEOUT_SECONDS
     try:
         executable = pathlib.Path(candidate).resolve(strict=True)
-        executable_stat = executable.stat()
+        _check_deadline(
+            snapshot_deadline,
+            "selected Git executable snapshot exceeded its shared deadline",
+        )
+        executable_stat = os.stat(executable, follow_symlinks=False)
+        _check_deadline(
+            snapshot_deadline,
+            "selected Git executable snapshot exceeded its shared deadline",
+        )
     except OSError as exc:
         _GIT_RUNTIME_ERROR = UnsupportedGitVersion(
             f"failed to resolve the selected Git executable: {exc}"
         )
         return
-    if not stat.S_ISREG(executable_stat.st_mode) or not os.access(
-        executable,
-        os.X_OK,
+    except UserError as exc:
+        _GIT_RUNTIME_ERROR = UnsupportedGitVersion(str(exc))
+        return
+    if (
+        not stat.S_ISREG(executable_stat.st_mode)
+        or not stat.S_IMODE(executable_stat.st_mode) & 0o111
+        or not os.access(executable, os.X_OK)
     ):
         _GIT_RUNTIME_ERROR = UnsupportedGitVersion(
             f"selected Git executable is not an executable regular file: {executable}"
@@ -1826,8 +1917,15 @@ def _initialize_git_runtime() -> None:
             snapshot_identity,
             directory_identity,
             snapshot_owner,
-        ) = _snapshot_git_executable(executable)
-    except OSError as exc:
+        ) = _snapshot_git_executable(
+            executable,
+            expected_source_identity=_git_source_identity(executable_stat),
+            deadline=snapshot_deadline,
+        )
+    except UnsupportedPlatform as exc:
+        _GIT_RUNTIME_ERROR = exc
+        return
+    except (OSError, UserError) as exc:
         _GIT_RUNTIME_ERROR = UnsupportedGitVersion(
             f"failed to create an owner-private Git runtime snapshot: {exc}"
         )
@@ -2657,50 +2755,22 @@ def _system_git_config_entries() -> list[tuple[str, str]]:
                 "GIT_CONFIG_SYSTEM is empty; cannot prove the actual system "
                 "core.hooksPath configuration safely"
             )
-        path = pathlib.Path(configured_path).expanduser()
+        path = pathlib.Path(configured_path)
         if not path.is_absolute():
-            path = pathlib.Path.cwd() / path
+            raise UserError(
+                "GIT_CONFIG_SYSTEM must be an absolute path so its system Git "
+                "config identity can be proved safely"
+            )
         path = _lexical_absolute_path(path)
         if path == _lexical_absolute_path(pathlib.Path(os.devnull)):
             return []
         return _global_git_config_entries(path, label="system Git config")
 
-    command = [
-        str(_fixed_git_executable()),
-        "--no-pager",
-        "--no-optional-locks",
-        "config",
-        "--system",
-        "--no-includes",
-        "--null",
-        "--list",
-    ]
-    result = _capture_bounded_process(
-        command,
-        env=_system_config_git_environment(),
-        timeout_seconds=GIT_CONFIG_QUERY_TIMEOUT_SECONDS,
-        stdout_limit=MAX_GLOBAL_GIT_CONFIG_OUTPUT_BYTES,
-        stderr_limit=MAX_GIT_STDERR_BYTES,
-        stdout_overflow_error=(
-            "system Git config query stdout exceeds "
-            f"{MAX_GLOBAL_GIT_CONFIG_OUTPUT_BYTES} bytes"
-        ),
-        stderr_overflow_error=(
-            f"system Git config query stderr exceeds {MAX_GIT_STDERR_BYTES} bytes"
-        ),
-        timeout_error=(
-            f"system Git config query timed out after "
-            f"{GIT_CONFIG_QUERY_TIMEOUT_SECONDS:g} seconds"
-        ),
-        operation="system Git config query",
+    raise UserError(
+        "implicit system Git config path cannot be proved safely without "
+        "following an unbound pathname; set GIT_CONFIG_SYSTEM to an absolute "
+        "regular-file path or set GIT_CONFIG_NOSYSTEM=1"
     )
-    if result.returncode != 0:
-        detail = (
-            result.stderr.decode("utf-8", errors="replace").strip()
-            or f"exit {result.returncode}"
-        )
-        raise UserError(f"failed to inspect system Git config safely: {detail}")
-    return _parse_git_config_records(result.stdout, "system Git config query")
 
 
 def _preflight_global_hooks_config(repo: pathlib.Path) -> None:
@@ -2895,6 +2965,7 @@ def _snapshot_hook_target(
                 break
             content.extend(chunk)
         after = os.fstat(fd)
+        linked = os.stat(name, dir_fd=binding.fd, follow_symlinks=False)
     finally:
         os.close(fd)
     if len(content) > MAX_EXISTING_HOOK_BYTES:
@@ -2903,9 +2974,12 @@ def _snapshot_hook_target(
             f"{binding.path / name}"
         )
     identity = _hook_target_identity(before)
-    if _hook_target_identity(after) != identity:
+    if (
+        _hook_target_identity(after) != identity
+        or _hook_target_identity(linked) != identity
+    ):
         raise UserError(
-            f"hook target changed while being inspected: {binding.path / name}"
+            f"hook target identity changed while being inspected: {binding.path / name}"
         )
     raw = bytes(content)
     return (
@@ -3305,11 +3379,45 @@ def _recovery_error(
     )
 
 
+def _interrupted_hook_exchange_recovery_note(
+    binding: _HookDirectoryBinding,
+    target: _HookTargetSnapshot,
+    temporary_name: str,
+) -> str:
+    recovery_path = binding.path / temporary_name
+    durability_error: str | None = None
+    try:
+        os.fsync(binding.fd)
+    except OSError as exc:
+        durability_error = str(exc)
+
+    expected = dataclasses.replace(target, name=temporary_name)
+    try:
+        recovered, _content = _snapshot_hook_target(binding, temporary_name)
+    except BaseException as exc:
+        verification = f"recovery identity is unverified: {exc}"
+    else:
+        if recovered == expected:
+            verification = (
+                "preserved recovery locator with verified displaced-hook "
+                "identity and content"
+            )
+        else:
+            verification = (
+                "recovery locator was retained, but its identity or content "
+                "does not match the displaced hook"
+            )
+    if durability_error is not None:
+        verification += f"; directory durability is unverified: {durability_error}"
+    return f"hook exchange may have committed; {verification}: {recovery_path}"
+
+
 def _commit_hook_target_atomically(
     binding: _HookDirectoryBinding,
     target: _HookTargetSnapshot,
     temporary_name: str,
     staged: _HookTargetSnapshot,
+    commit_state: _HookCommitState,
 ) -> None:
     if not target.exists:
         try:
@@ -3320,18 +3428,22 @@ def _commit_hook_target_atomically(
                 exchange=False,
             )
         except FileExistsError as exc:
+            commit_state.mark_cleanup_safe()
             raise UserError(
                 f"hook target changed at atomic commit: {binding.path / target.name}"
             ) from exc
         except OSError as exc:
+            commit_state.mark_cleanup_safe()
             if exc.errno in {errno.EEXIST, errno.ENOTEMPTY}:
                 raise UserError(
                     f"hook target changed at atomic commit: "
                     f"{binding.path / target.name}"
                 ) from exc
             raise
+        commit_state.mark_temporary_consumed()
         return
 
+    commit_state.begin_exchange()
     try:
         _rename_hook_entry_with_flag(
             binding.fd,
@@ -3340,6 +3452,7 @@ def _commit_hook_target_atomically(
             exchange=True,
         )
     except OSError as exc:
+        commit_state.mark_cleanup_safe()
         if exc.errno in {errno.ENOENT, errno.EEXIST, errno.ENOTEMPTY}:
             raise UserError(
                 f"hook target changed at atomic commit: {binding.path / target.name}"
@@ -3358,6 +3471,7 @@ def _commit_hook_target_atomically(
     expected_displaced = dataclasses.replace(target, name=temporary_name)
     if displaced == expected_displaced:
         os.unlink(temporary_name, dir_fd=binding.fd)
+        commit_state.mark_temporary_consumed()
         return
 
     mismatch = UserError(
@@ -3414,6 +3528,7 @@ def _commit_hook_target_atomically(
             temporary_name,
             "rollback result could not be bound to the staged and displaced objects",
         ) from mismatch
+    commit_state.mark_cleanup_safe()
     raise mismatch
 
 
@@ -3434,6 +3549,7 @@ def _install_hook(
         | _required_open_flag("O_NONBLOCK")
     )
     temporary_created = False
+    commit_state = _HookCommitState()
     try:
         temporary_fd = os.open(temporary_name, flags, 0o600, dir_fd=binding.fd)
         temporary_created = True
@@ -3461,6 +3577,7 @@ def _install_hook(
             target,
             temporary_name,
             staged,
+            commit_state,
         )
         temporary_created = False
         os.fsync(binding.fd)
@@ -3480,9 +3597,35 @@ def _install_hook(
         temporary_created = False
         raise
     except OSError as exc:
+        if commit_state.must_preserve_temporary:
+            temporary_created = False
+            recovery = binding.path / temporary_name
+            try:
+                os.fsync(binding.fd)
+            except OSError as fsync_exc:
+                raise UserError(
+                    f"hook exchange may have committed; preserved recovery "
+                    f"locator {recovery}, but directory fsync failed: {fsync_exc}"
+                ) from exc
+            raise UserError(
+                f"hook exchange may have committed; preserved recovery "
+                f"locator: {recovery}"
+            ) from exc
         raise UserError(
             f"failed to install hook {binding.path / target.name}: {exc}"
         ) from exc
+    except BaseException as exc:
+        if commit_state.must_preserve_temporary:
+            temporary_created = False
+            detail = _interrupted_hook_exchange_recovery_note(
+                binding,
+                target,
+                temporary_name,
+            )
+            add_note = getattr(exc, "add_note", None)
+            if add_note is not None:
+                add_note(detail)
+        raise
     finally:
         if temporary_created:
             try:
@@ -3586,7 +3729,7 @@ def _known_source_root_from_temp_path(path: pathlib.Path) -> pathlib.Path | None
 
 def _is_relative_to(path: pathlib.Path, parent: pathlib.Path) -> bool:
     try:
-        path.resolve().relative_to(parent.resolve())
+        _lexical_absolute_path(path).relative_to(_lexical_absolute_path(parent))
     except ValueError:
         return False
     return True
@@ -3594,15 +3737,32 @@ def _is_relative_to(path: pathlib.Path, parent: pathlib.Path) -> bool:
 
 def _git_output_path(repo: pathlib.Path, raw_path: str) -> pathlib.Path:
     path = pathlib.Path(raw_path.strip())
-    if not path.is_absolute():
-        path = repo / path
-    return path.resolve()
+    return _lexical_absolute_path(path, base=repo)
 
 
-def _source_root_from_linked_worktree(repo: pathlib.Path) -> pathlib.Path | None:
+def _source_root_from_linked_worktree(
+    repo: pathlib.Path,
+    *,
+    deadline: float | None = None,
+) -> pathlib.Path | None:
+    deadline_error = "repository discovery exceeded its shared deadline"
     try:
-        git_dir = _run_git(repo, "rev-parse", "--git-dir")
-        common_dir = _run_git(repo, "rev-parse", "--git-common-dir")
+        git_dir = _run_git(
+            repo,
+            "rev-parse",
+            "--git-dir",
+            deadline=deadline,
+            deadline_error=deadline_error,
+            operation="Git repository discovery",
+        )
+        common_dir = _run_git(
+            repo,
+            "rev-parse",
+            "--git-common-dir",
+            deadline=deadline,
+            deadline_error=deadline_error,
+            operation="Git repository discovery",
+        )
     except UnsupportedGitVersion:
         return None
     if git_dir.returncode != 0 or common_dir.returncode != 0:
@@ -3616,7 +3776,7 @@ def _source_root_from_linked_worktree(repo: pathlib.Path) -> pathlib.Path | None
     source = (
         common_dir_path.parent if common_dir_path.name == ".git" else common_dir_path
     )
-    source_root = _repo_root_for_existing_path(source)
+    source_root = _repo_root_for_existing_path(source, deadline=deadline)
     if source_root is None or source_root == repo:
         return None
     return source_root
@@ -3627,44 +3787,60 @@ def _filesystem_repo_root(path: pathlib.Path) -> pathlib.Path | None:
     while True:
         git_marker = candidate / ".git"
         if git_marker.is_dir() or git_marker.is_file():
-            return candidate.resolve()
+            return _lexical_absolute_path(candidate)
         parent = candidate.parent
         if parent == candidate:
             return None
         candidate = parent
 
 
-def _repo_root_for_existing_path(path: pathlib.Path) -> pathlib.Path | None:
+def _repo_root_for_existing_path(
+    path: pathlib.Path,
+    *,
+    deadline: float | None = None,
+) -> pathlib.Path | None:
+    deadline_error = "repository discovery exceeded its shared deadline"
     while not path.exists():
+        _check_deadline(deadline, deadline_error)
         parent = path.parent
         if parent == path:
             return None
         path = parent
     try:
-        result = _run_git(path, "rev-parse", "--show-toplevel")
+        result = _run_git(
+            path,
+            "rev-parse",
+            "--show-toplevel",
+            deadline=deadline,
+            deadline_error=deadline_error,
+            operation="Git repository discovery",
+        )
     except UnsupportedGitVersion:
         return _filesystem_repo_root(path)
     if result.returncode != 0:
         return None
-    return pathlib.Path(result.stdout.strip()).resolve()
+    return _lexical_absolute_path(pathlib.Path(result.stdout.strip()))
 
 
 def _repo_root_for_path(
-    path_text: str, *, codex_home: pathlib.Path | None = None
+    path_text: str,
+    *,
+    codex_home: pathlib.Path | None = None,
+    deadline: float | None = None,
 ) -> pathlib.Path | None:
     path = pathlib.Path(path_text).expanduser()
     if not path.is_absolute():
         return None
     source = _known_source_root_from_temp_path(path)
     if source is not None:
-        source_root = _repo_root_for_existing_path(source)
+        source_root = _repo_root_for_existing_path(source, deadline=deadline)
         if source_root is not None:
             return source_root
-    root = _repo_root_for_existing_path(path)
+    root = _repo_root_for_existing_path(path, deadline=deadline)
     if root is None:
         return None
     if codex_home is not None and _is_relative_to(root, codex_home / "worktrees"):
-        source_root = _source_root_from_linked_worktree(root)
+        source_root = _source_root_from_linked_worktree(root, deadline=deadline)
         if source_root is not None:
             return source_root
     return root
@@ -3708,8 +3884,13 @@ def _is_excluded(repo: pathlib.Path, rel: str) -> bool | None:
     return rel in exclude.read_text(encoding="utf-8", errors="replace").splitlines()
 
 
-def _discover_adoption_status(repo: pathlib.Path) -> dict[str, Any]:
-    deadline = time.monotonic() + GIT_ADOPTION_VALIDATION_TIMEOUT_SECONDS
+def _discover_adoption_status(
+    repo: pathlib.Path,
+    *,
+    deadline: float | None = None,
+) -> dict[str, Any]:
+    if deadline is None:
+        deadline = time.monotonic() + GIT_ADOPTION_VALIDATION_TIMEOUT_SECONDS
     try:
         adoption = _tracked_journal_adoption(repo, deadline=deadline)
     except UserError as exc:
@@ -3743,10 +3924,12 @@ def _enrich_discovered_repo(
     root: pathlib.Path,
     row: dict[str, Any],
     script: pathlib.Path,
+    *,
+    deadline: float | None = None,
 ) -> None:
     journal_root = root / JOURNAL_ROOT
     index_rel = DEFAULT_INDEX.as_posix()
-    adoption = _discover_adoption_status(root)
+    adoption = _discover_adoption_status(root, deadline=deadline)
     try:
         journal_count = len(_journal_paths(root))
         index_ignored = _is_excluded(root, index_rel)
@@ -3790,6 +3973,7 @@ def _discover_repos(codex_home: pathlib.Path, since_days: int) -> list[dict[str,
     cutoff = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=since_days)).date()
     seen: dict[pathlib.Path, dict[str, Any]] = {}
     resolved_roots: dict[str, pathlib.Path | None] = {}
+    resolution_deadlines: dict[str, float] = {}
     script = pathlib.Path(__file__).resolve()
 
     for rollout in sorted(sessions.rglob("rollout-*.jsonl")):
@@ -3799,34 +3983,47 @@ def _discover_repos(codex_home: pathlib.Path, since_days: int) -> list[dict[str,
         roots_for_rollout: set[pathlib.Path] = set()
         for cwd in _unique_preserving_order(_extract_cwds(rollout)):
             if cwd not in resolved_roots:
+                resolution_deadline = (
+                    time.monotonic() + GIT_ADOPTION_VALIDATION_TIMEOUT_SECONDS
+                )
+                resolution_deadlines[cwd] = resolution_deadline
                 try:
                     resolved_roots[cwd] = _repo_root_for_path(
                         cwd,
                         codex_home=codex_home,
+                        deadline=resolution_deadline,
                     )
                 except (OSError, UserError):
                     resolved_roots[cwd] = None
             root = resolved_roots[cwd]
             if root is None:
                 continue
-            roots_for_rollout.add(root)
-        for root in roots_for_rollout:
-            row = seen.setdefault(
-                root,
-                {
+            if root not in seen:
+                row: dict[str, Any] = {
                     "repo": str(root),
                     "last_seen": last_seen,
                     "rollout_count": 0,
-                },
-            )
+                }
+                seen[root] = row
+                _enrich_discovered_repo(
+                    root,
+                    row,
+                    script,
+                    deadline=resolution_deadlines[cwd],
+                )
+            roots_for_rollout.add(root)
+        for root in roots_for_rollout:
+            row = seen[root]
             row["last_seen"] = max(str(row["last_seen"]), last_seen)
             row["rollout_count"] = int(row["rollout_count"]) + 1
 
-    results: list[dict[str, Any]] = []
-    for root, row in sorted(seen.items(), key=lambda item: item[0].as_posix()):
-        _enrich_discovered_repo(root, row, script)
-        results.append(row)
-    return results
+    return [
+        row
+        for _root, row in sorted(
+            seen.items(),
+            key=lambda item: item[0].as_posix(),
+        )
+    ]
 
 
 def command_discover_repos(args: argparse.Namespace) -> int:

@@ -424,6 +424,261 @@ class ProjectJournalTests(unittest.TestCase):
             project_journal._GIT_RUNTIME = old_runtime
             project_journal._GIT_RUNTIME_ERROR = old_error
 
+    def test_git_runtime_snapshot_rejects_regular_path_replacement(self) -> None:
+        old_runtime = project_journal._GIT_RUNTIME
+        old_error = project_journal._GIT_RUNTIME_ERROR
+        actual_open = os.open
+
+        try:
+            for phase in ("before-open", "after-open"):
+                with self.subTest(phase=phase):
+                    fake_git = self.root / f"git-{phase}"
+                    fake_git.write_text(
+                        "#!/bin/sh\nprintf 'git version 2.45.1\\n'\n",
+                        encoding="utf-8",
+                    )
+                    fake_git.chmod(0o755)
+                    resolved_fake_git = fake_git.resolve()
+                    attacker = self.root / f"attacker-{phase}"
+                    attacker.write_text(
+                        "#!/bin/sh\nprintf 'attacker executed\\n'\n",
+                        encoding="utf-8",
+                    )
+                    attacker.chmod(0o755)
+                    replaced = False
+
+                    def replace_during_open(
+                        path: os.PathLike[str] | str,
+                        flags: int,
+                        mode: int = 0o777,
+                        *,
+                        dir_fd: int | None = None,
+                    ) -> int:
+                        nonlocal replaced
+                        if pathlib.Path(path) == resolved_fake_git and not replaced:
+                            replaced = True
+                            if phase == "before-open":
+                                os.replace(attacker, fake_git)
+                                return actual_open(
+                                    path,
+                                    flags,
+                                    mode,
+                                    dir_fd=dir_fd,
+                                )
+                            source_fd = actual_open(
+                                path,
+                                flags,
+                                mode,
+                                dir_fd=dir_fd,
+                            )
+                            os.replace(attacker, fake_git)
+                            return source_fd
+                        return actual_open(path, flags, mode, dir_fd=dir_fd)
+
+                    project_journal._GIT_RUNTIME = None
+                    project_journal._GIT_RUNTIME_ERROR = None
+                    with mock.patch.object(
+                        project_journal.shutil,
+                        "which",
+                        return_value=str(fake_git),
+                    ):
+                        with mock.patch.object(
+                            project_journal.os,
+                            "open",
+                            side_effect=replace_during_open,
+                        ):
+                            with mock.patch.object(
+                                project_journal,
+                                "_capture_bounded_process",
+                            ) as capture:
+                                project_journal._initialize_git_runtime()
+
+                    self.assertTrue(replaced)
+                    self.assertIsNone(project_journal._GIT_RUNTIME)
+                    self.assertIsNotNone(project_journal._GIT_RUNTIME_ERROR)
+                    self.assertIn(
+                        "identity changed",
+                        str(project_journal._GIT_RUNTIME_ERROR),
+                    )
+                    capture.assert_not_called()
+        finally:
+            runtime = project_journal._GIT_RUNTIME
+            if runtime is not None and runtime is not old_runtime:
+                runtime.snapshot_owner.cleanup()
+            project_journal._GIT_RUNTIME = old_runtime
+            project_journal._GIT_RUNTIME_ERROR = old_error
+
+    def test_git_runtime_snapshot_rejects_fifo_replacement_without_blocking(
+        self,
+    ) -> None:
+        old_runtime = project_journal._GIT_RUNTIME
+        old_error = project_journal._GIT_RUNTIME_ERROR
+        fake_git = self.root / "git-fifo-race"
+        fake_git.write_text(
+            "#!/bin/sh\nprintf 'git version 2.45.1\\n'\n",
+            encoding="utf-8",
+        )
+        fake_git.chmod(0o755)
+        resolved_fake_git = fake_git.resolve()
+        fifo = self.root / "git-fifo-replacement"
+        os.mkfifo(fifo)
+        actual_open = os.open
+        replaced = False
+
+        def replace_with_fifo(
+            path: os.PathLike[str] | str,
+            flags: int,
+            mode: int = 0o777,
+            *,
+            dir_fd: int | None = None,
+        ) -> int:
+            nonlocal replaced
+            if pathlib.Path(path) == resolved_fake_git and not replaced:
+                replaced = True
+                self.assertTrue(flags & project_journal.os.O_NONBLOCK)
+                self.assertTrue(flags & project_journal.os.O_NOFOLLOW)
+                os.replace(fifo, fake_git)
+            return actual_open(path, flags, mode, dir_fd=dir_fd)
+
+        try:
+            project_journal._GIT_RUNTIME = None
+            project_journal._GIT_RUNTIME_ERROR = None
+            started = time.monotonic()
+            with mock.patch.object(
+                project_journal.shutil,
+                "which",
+                return_value=str(fake_git),
+            ):
+                with mock.patch.object(
+                    project_journal.os,
+                    "open",
+                    side_effect=replace_with_fifo,
+                ):
+                    with mock.patch.object(
+                        project_journal,
+                        "_capture_bounded_process",
+                    ) as capture:
+                        project_journal._initialize_git_runtime()
+
+            self.assertLess(time.monotonic() - started, 1.0)
+            self.assertTrue(replaced)
+            self.assertIsNone(project_journal._GIT_RUNTIME)
+            self.assertIn(
+                "not a regular file",
+                str(project_journal._GIT_RUNTIME_ERROR),
+            )
+            capture.assert_not_called()
+        finally:
+            runtime = project_journal._GIT_RUNTIME
+            if runtime is not None and runtime is not old_runtime:
+                runtime.snapshot_owner.cleanup()
+            project_journal._GIT_RUNTIME = old_runtime
+            project_journal._GIT_RUNTIME_ERROR = old_error
+
+    def test_git_runtime_snapshot_requires_secure_open_primitives(self) -> None:
+        source = self.root / "git-primitives"
+        source.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        source.chmod(0o755)
+        expected = project_journal._git_source_identity(source.stat())
+
+        for primitive in ("O_NOFOLLOW", "O_NONBLOCK"):
+            with self.subTest(primitive=primitive):
+                with mock.patch.object(project_journal.os, primitive, 0):
+                    with self.assertRaisesRegex(
+                        project_journal.UnsupportedPlatform,
+                        primitive,
+                    ):
+                        project_journal._snapshot_git_executable(
+                            source,
+                            expected_source_identity=expected,
+                            deadline=time.monotonic() + 5,
+                        )
+
+    def test_git_runtime_snapshot_enforces_size_and_deadline_bounds(self) -> None:
+        source = self.root / "git-bounds"
+        source.write_bytes(b"0123456789")
+        source.chmod(0o755)
+        expected = project_journal._git_source_identity(source.stat())
+
+        with mock.patch.object(project_journal, "MAX_GIT_EXECUTABLE_BYTES", 5):
+            with self.assertRaisesRegex(OSError, "exceeds 5 bytes"):
+                project_journal._snapshot_git_executable(
+                    source,
+                    expected_source_identity=expected,
+                    deadline=time.monotonic() + 5,
+                )
+
+        actual_read = os.read
+        grew = False
+
+        def grow_after_first_read(fd: int, size: int) -> bytes:
+            nonlocal grew
+            chunk = actual_read(fd, size)
+            if chunk and not grew:
+                grew = True
+                with source.open("ab") as handle:
+                    handle.write(b"x")
+            return chunk
+
+        with mock.patch.object(project_journal, "MAX_GIT_EXECUTABLE_BYTES", 10):
+            with mock.patch.object(
+                project_journal.os,
+                "read",
+                side_effect=grow_after_first_read,
+            ):
+                with self.assertRaisesRegex(OSError, "exceeds 10 bytes"):
+                    project_journal._snapshot_git_executable(
+                        source,
+                        expected_source_identity=expected,
+                        deadline=time.monotonic() + 5,
+                    )
+        self.assertTrue(grew)
+
+        source.write_bytes(b"0123456789")
+        source.chmod(0o755)
+        expected = project_journal._git_source_identity(source.stat())
+        clock = {"now": 100.0}
+        advanced = False
+
+        def advance_after_first_read(fd: int, size: int) -> bytes:
+            nonlocal advanced
+            chunk = actual_read(fd, size)
+            if chunk and not advanced:
+                advanced = True
+                clock["now"] = 102.0
+            return chunk
+
+        with mock.patch.object(
+            project_journal.time,
+            "monotonic",
+            side_effect=lambda: clock["now"],
+        ):
+            with mock.patch.object(
+                project_journal.os,
+                "read",
+                side_effect=advance_after_first_read,
+            ):
+                with self.assertRaisesRegex(
+                    project_journal.UserError,
+                    "exceeded its shared deadline",
+                ):
+                    project_journal._snapshot_git_executable(
+                        source,
+                        expected_source_identity=expected,
+                        deadline=101.0,
+                    )
+        self.assertTrue(advanced)
+
+        with self.assertRaisesRegex(
+            project_journal.UserError,
+            "exceeded its shared deadline",
+        ):
+            project_journal._snapshot_git_executable(
+                source,
+                expected_source_identity=expected,
+                deadline=time.monotonic() - 1,
+            )
+
     def test_old_git_fails_closed_and_discovery_reports_inconclusive(
         self,
     ) -> None:
@@ -474,7 +729,10 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         rows = json.loads(result.stdout)
         self.assertEqual(len(rows), 1)
-        self.assertEqual(pathlib.Path(rows[0]["repo"]), repo.resolve())
+        self.assertEqual(
+            pathlib.Path(rows[0]["repo"]),
+            project_journal._lexical_absolute_path(repo),
+        )
         self.assertEqual(rows[0]["adoption_status"], "inconclusive")
         self.assertEqual(
             rows[0]["adoption_error"]["code"],
@@ -951,13 +1209,48 @@ class ProjectJournalTests(unittest.TestCase):
                 deadline_error="shared deadline",
             )
 
-        self.assertEqual(resolved, repo)
+        self.assertEqual(resolved, repo.resolve())
         self.assertEqual(capture.call_args.kwargs["deadline"], 123.0)
         self.assertEqual(capture.call_args.kwargs["timeout_error"], "shared deadline")
         self.assertEqual(
             capture.call_args.kwargs["operation"],
             "Git repository resolution",
         )
+
+    def test_repo_resolution_avoids_synchronous_path_canonicalization(self) -> None:
+        repo = self.init_repo().resolve()
+
+        with mock.patch.object(
+            pathlib.Path,
+            "resolve",
+            side_effect=AssertionError("synchronous resolve must not run"),
+        ):
+            resolved = project_journal._resolve_repo(
+                str(repo),
+                deadline=time.monotonic() + 5,
+                deadline_error="shared deadline",
+            )
+
+        self.assertEqual(resolved, repo)
+
+    def test_repo_resolution_preserves_symlink_dotdot_semantics(self) -> None:
+        physical = self.root / "physical"
+        nested = physical / "nested"
+        nested.mkdir(parents=True)
+        repo = physical / "repo"
+        repo.mkdir()
+        initialized = run_git(repo, "init")
+        self.assertEqual(initialized.returncode, 0, initialized.stderr)
+        link = self.root / "linked-nested"
+        link.symlink_to(nested, target_is_directory=True)
+
+        resolved = project_journal._resolve_repo(
+            str(link / ".." / "repo"),
+            deadline=time.monotonic() + 5,
+            deadline_error="shared deadline",
+        )
+
+        self.assertEqual(resolved, repo.resolve())
 
     def test_frontmatter_and_validation_semantic_caps_fail_closed(self) -> None:
         base_fields = {
@@ -3296,6 +3589,80 @@ class ProjectJournalTests(unittest.TestCase):
             "racing installer\n",
         )
 
+    def test_install_hooks_preserves_displaced_hook_on_rename_then_interrupt(
+        self,
+    ) -> None:
+        repo = self.init_repo()
+        configured = run_git(
+            repo,
+            "config",
+            "--local",
+            "core.hooksPath",
+            ".githooks",
+        )
+        self.assertEqual(configured.returncode, 0, configured.stderr)
+        first = self.run_cli("install-hooks", "--repo", str(repo))
+        self.assertEqual(first.returncode, 0, first.stderr)
+        hook = repo / ".githooks/post-merge"
+        old_content = hook.read_bytes().replace(
+            project_journal.HOOK_BEGIN.encode(),
+            (
+                project_journal.HOOK_BEGIN + "\n# transaction-owned previous hook"
+            ).encode(),
+            1,
+        )
+        hook.write_bytes(old_content)
+        old_stat = hook.stat()
+        actual_rename = project_journal._rename_hook_entry_with_flag
+        interrupted = False
+
+        def rename_then_interrupt(
+            directory_fd: int,
+            source: str,
+            destination: str,
+            *,
+            exchange: bool,
+        ) -> None:
+            nonlocal interrupted
+            actual_rename(
+                directory_fd,
+                source,
+                destination,
+                exchange=exchange,
+            )
+            if destination == "post-merge" and exchange and not interrupted:
+                interrupted = True
+                raise KeyboardInterrupt("injected after committed exchange")
+
+        args = mock.Mock(repo=str(repo))
+        with mock.patch.object(
+            project_journal,
+            "_rename_hook_entry_with_flag",
+            side_effect=rename_then_interrupt,
+        ):
+            with self.assertRaises(KeyboardInterrupt) as raised:
+                project_journal.command_install_hooks(args)
+
+        self.assertTrue(interrupted)
+        self.assertNotEqual(hook.read_bytes(), old_content)
+        self.assertIn(project_journal.HOOK_BEGIN.encode(), hook.read_bytes())
+        recoveries = list(
+            (repo / ".githooks").glob(".project-journal-post-merge-*.tmp")
+        )
+        self.assertEqual(len(recoveries), 1)
+        self.assertEqual(recoveries[0].read_bytes(), old_content)
+        recovery_stat = recoveries[0].stat()
+        self.assertEqual(
+            (recovery_stat.st_dev, recovery_stat.st_ino),
+            (old_stat.st_dev, old_stat.st_ino),
+        )
+        self.assertTrue(
+            any(
+                "preserved recovery locator" in note
+                for note in getattr(raised.exception, "__notes__", ())
+            )
+        )
+
     def test_hook_target_fifo_is_rejected_without_blocking(self) -> None:
         repo = self.init_repo()
         fifo = repo / ".git/hooks/post-checkout"
@@ -3329,18 +3696,23 @@ class ProjectJournalTests(unittest.TestCase):
 
     def test_hook_installers_are_serialized_by_owner_private_lock(self) -> None:
         repo = self.init_repo().resolve()
-        first = project_journal._preflight_hook_targets(repo)
-        try:
-            with self.assertRaisesRegex(
-                project_journal.UserError,
-                "another project journal hook installation is active",
-            ):
-                project_journal._preflight_hook_targets(repo)
-        finally:
-            project_journal._close_hook_binding(first)
+        with mock.patch.dict(
+            os.environ,
+            {"GIT_CONFIG_NOSYSTEM": "1"},
+            clear=False,
+        ):
+            first = project_journal._preflight_hook_targets(repo)
+            try:
+                with self.assertRaisesRegex(
+                    project_journal.UserError,
+                    "another project journal hook installation is active",
+                ):
+                    project_journal._preflight_hook_targets(repo)
+            finally:
+                project_journal._close_hook_binding(first)
 
-        second = project_journal._preflight_hook_targets(repo)
-        project_journal._close_hook_binding(second)
+            second = project_journal._preflight_hook_targets(repo)
+            project_journal._close_hook_binding(second)
 
     def test_install_hooks_refuses_intermediate_component_symlink(self) -> None:
         repo = self.init_repo()
@@ -3938,6 +4310,68 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertEqual(installed.returncode, 0, installed.stderr)
         self.assertTrue((repo / ".githooks/post-merge").exists())
 
+    def test_install_hooks_fails_closed_for_implicit_system_config(self) -> None:
+        repo = self.init_repo()
+
+        result = self.run_cli(
+            "install-hooks",
+            "--repo",
+            str(repo),
+            env={"GIT_CONFIG_NOSYSTEM": "0"},
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "implicit system Git config path cannot be proved safely",
+            result.stderr,
+        )
+        self.assertIn("GIT_CONFIG_SYSTEM", result.stderr)
+        self.assertIn("GIT_CONFIG_NOSYSTEM=1", result.stderr)
+        self.assertFalse((repo / ".git/hooks/post-merge").exists())
+
+    def test_system_config_requires_raw_absolute_path(self) -> None:
+        for configured in ("relative-gitconfig", "~/gitconfig", ""):
+            with self.subTest(configured=configured):
+                with mock.patch.dict(
+                    os.environ,
+                    {
+                        "GIT_CONFIG_NOSYSTEM": "0",
+                        "GIT_CONFIG_SYSTEM": configured,
+                    },
+                    clear=False,
+                ):
+                    with self.assertRaises(project_journal.UserError):
+                        project_journal._system_git_config_entries()
+
+    def test_explicit_system_config_fifo_and_symlink_are_not_followed(self) -> None:
+        regular = self.root / "system-config-regular"
+        regular.write_text("[core]\n", encoding="utf-8")
+        fifo = self.root / "system-config-fifo"
+        os.mkfifo(fifo)
+        symlink = self.root / "system-config-symlink"
+        symlink.symlink_to(regular)
+
+        for name, path, expected in (
+            ("fifo", fifo, "not a regular file"),
+            ("symlink", symlink, "symlink|without following links"),
+        ):
+            with self.subTest(name=name):
+                with mock.patch.dict(
+                    os.environ,
+                    {
+                        "GIT_CONFIG_NOSYSTEM": "0",
+                        "GIT_CONFIG_SYSTEM": str(path),
+                    },
+                    clear=False,
+                ):
+                    started = time.monotonic()
+                    with self.assertRaisesRegex(
+                        project_journal.UserError,
+                        expected,
+                    ):
+                        project_journal._system_git_config_entries()
+                    self.assertLess(time.monotonic() - started, 1.0)
+
     def test_install_hooks_refuses_unfollowed_system_include(self) -> None:
         repo = self.init_repo()
         system_config = self.root / "system-gitconfig"
@@ -4151,8 +4585,10 @@ class ProjectJournalTests(unittest.TestCase):
             path_text: str,
             *,
             codex_home: pathlib.Path | None = None,
+            deadline: float | None = None,
         ) -> pathlib.Path | None:
             del codex_home
+            self.assertIsNotNone(deadline)
             if pathlib.Path(path_text) == stalled:
                 raise project_journal.UserError(
                     "Git repository resolution timed out after 10 seconds"
@@ -4168,6 +4604,77 @@ class ProjectJournalTests(unittest.TestCase):
 
         self.assertEqual(len(rows), 1)
         self.assertEqual(pathlib.Path(rows[0]["repo"]), healthy)
+
+    def test_discover_repos_shares_resolution_budget_with_adoption(self) -> None:
+        repo = self.init_repo("healthy").resolve()
+        codex_home = self.root / "codex-home"
+        rollout_dir = codex_home / "sessions/2026/05/05"
+        rollout_dir.mkdir(parents=True)
+        (rollout_dir / "rollout-shared-budget.jsonl").write_text(
+            json.dumps({"payload": {"cwd": str(repo)}}) + "\n",
+            encoding="utf-8",
+        )
+        observed: dict[str, float | None] = {}
+        clock = {"now": 100.0}
+
+        def resolve_candidate(
+            path_text: str,
+            *,
+            codex_home: pathlib.Path | None = None,
+            deadline: float | None = None,
+        ) -> pathlib.Path | None:
+            del path_text, codex_home
+            observed["resolution"] = deadline
+            clock["now"] = 106.0
+            return repo
+
+        def tracked_adoption(
+            root: pathlib.Path,
+            *,
+            deadline: float | None = None,
+        ) -> dict[str, object]:
+            self.assertEqual(root, repo)
+            observed["adoption"] = deadline
+            return {
+                "tracked_journal_adopted": False,
+                "tracked_non_generated_journal_count": 0,
+                "valid_tracked_journal_count": 0,
+            }
+
+        with mock.patch.object(
+            project_journal.time,
+            "monotonic",
+            side_effect=lambda: clock["now"],
+        ):
+            with mock.patch.object(
+                project_journal,
+                "_repo_root_for_path",
+                side_effect=resolve_candidate,
+            ):
+                with mock.patch.object(
+                    project_journal,
+                    "_tracked_journal_adoption",
+                    side_effect=tracked_adoption,
+                ):
+                    with mock.patch.object(
+                        project_journal,
+                        "_journal_paths",
+                        return_value=[],
+                    ):
+                        with mock.patch.object(
+                            project_journal,
+                            "_is_excluded",
+                            return_value=False,
+                        ):
+                            with mock.patch.object(
+                                project_journal,
+                                "_has_hook_marker",
+                                return_value=False,
+                            ):
+                                project_journal._discover_repos(codex_home, 9999)
+
+        expected = 100.0 + project_journal.GIT_ADOPTION_VALIDATION_TIMEOUT_SECONDS
+        self.assertEqual(observed, {"resolution": expected, "adoption": expected})
 
     def test_discover_repos_isolates_worktree_journal_count_limit(self) -> None:
         healthy = self.init_repo("healthy")
@@ -4425,9 +4932,13 @@ class ProjectJournalTests(unittest.TestCase):
         original = project_journal._repo_root_for_path
 
         def fake_repo_root_for_path(
-            path_text: str, *, codex_home: pathlib.Path | None = None
+            path_text: str,
+            *,
+            codex_home: pathlib.Path | None = None,
+            deadline: float | None = None,
         ) -> pathlib.Path | None:
             self.assertIsNotNone(codex_home)
+            self.assertIsNotNone(deadline)
             calls.append(path_text)
             return repo.resolve()
 
