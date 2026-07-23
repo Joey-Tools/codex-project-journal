@@ -623,6 +623,46 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertEqual(status["tracked_non_generated_journal_count"], 1)
         self.assertEqual(status["valid_tracked_journal_count"], 0)
 
+    def test_adoption_status_invalidates_every_entry_in_duplicate_id_group(
+        self,
+    ) -> None:
+        repo = self.init_repo()
+        first = self.write_journal(
+            repo,
+            "docs/project_journal/2026/05/2026-05-05-first-a1b2c3.md",
+            entry_id="20260505-a1b2c3",
+            title="First Duplicate",
+            status="active",
+            updated="2026-05-05",
+        )
+        second = self.write_journal(
+            repo,
+            "docs/project_journal/2026/05/2026-05-06-second-d4e5f6.md",
+            entry_id="20260505-a1b2c3",
+            title="Second Duplicate",
+            status="active",
+            updated="2026-05-06",
+        )
+        add = run_git(
+            repo,
+            "add",
+            "--",
+            str(first.relative_to(repo)),
+            str(second.relative_to(repo)),
+        )
+        self.assertEqual(add.returncode, 0, add.stderr)
+
+        status = self.adoption_status(repo)
+        _entries, issues, _count = project_journal._load_entries_from_index(repo)
+
+        self.assertFalse(status["tracked_journal_adopted"])
+        self.assertEqual(status["tracked_non_generated_journal_count"], 2)
+        self.assertEqual(status["valid_tracked_journal_count"], 0)
+        duplicate_issues = [issue for issue in issues if "duplicate id" in issue]
+        self.assertEqual(len(duplicate_issues), 2)
+        self.assertTrue(any(first.name in issue for issue in duplicate_issues))
+        self.assertTrue(any(second.name in issue for issue in duplicate_issues))
+
     def test_adoption_status_uses_staged_invalid_blob_not_valid_worktree(
         self,
     ) -> None:
@@ -2379,6 +2419,10 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertIn("frontmatter field/list, validation-issue", skill)
         self.assertIn("Per-path validation state is structured", skill)
         self.assertIn(
+            "invalidates every member of a duplicate-ID group",
+            skill,
+        )
+        self.assertIn(
             "index, entry, frontmatter field/list, validation-issue, byte, record, and stderr limits",
             skill,
         )
@@ -2401,6 +2445,12 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertIn("explicit repo-local `core.hooksPath`", skill)
         self.assertIn("revalidates the snapshot identity and SHA-256", skill)
         self.assertIn("atomically replaces targets relative to the descriptor", skill)
+        self.assertIn("every ancestor identity/access policy", skill)
+        self.assertIn("allowing timestamp-only transitions", skill)
+        self.assertIn(
+            "do not overwrite authoritative index adoption",
+            skill,
+        )
         self.assertIn(
             "leave `docs/PROJECT_STATE.md`, `docs/PROJECT_TODO.md`, and `docs/project_journal/` unchanged",
             skill,
@@ -2486,6 +2536,8 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertIn("system and global Git configuration", readme)
         self.assertIn("descriptor-relative atomic replacement", readme)
         self.assertIn("structured `discovery_error`", readme)
+        self.assertIn("duplicate-ID group invalidation", readme)
+        self.assertIn("without erasing authoritative index adoption", readme)
         self.assertIn("`adopted`, `unadopted`, or `inconclusive`", readme)
         self.assertIn(
             "explicit product need justifies first adoption",
@@ -2834,6 +2886,85 @@ class ProjectJournalTests(unittest.TestCase):
         )
         self.assertEqual(outside.read_text(encoding="utf-8"), "keep-me\n")
 
+    def test_install_hooks_refuses_intermediate_component_symlink(self) -> None:
+        repo = self.init_repo()
+        outside = self.root / "outside-hook-tree"
+        outside.mkdir()
+        (repo / ".hook-parent").symlink_to(outside, target_is_directory=True)
+        configured = run_git(
+            repo,
+            "config",
+            "--local",
+            "core.hooksPath",
+            ".hook-parent/hooks",
+        )
+        self.assertEqual(configured.returncode, 0, configured.stderr)
+
+        result = self.run_cli("install-hooks", "--repo", str(repo))
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("descriptor-relative hook path traversal", result.stderr)
+        self.assertFalse((outside / "hooks").exists())
+        exclude = (repo / ".git/info/exclude").read_text(encoding="utf-8")
+        self.assertNotIn("docs/project_journal/INDEX.md", exclude.splitlines())
+
+    def test_install_hooks_detects_racing_intermediate_component_replacement(
+        self,
+    ) -> None:
+        repo = self.init_repo()
+        configured = run_git(
+            repo,
+            "config",
+            "--local",
+            "core.hooksPath",
+            ".hook-parent/hooks",
+        )
+        self.assertEqual(configured.returncode, 0, configured.stderr)
+        first = self.run_cli("install-hooks", "--repo", str(repo))
+        self.assertEqual(first.returncode, 0, first.stderr)
+        parent = repo / ".hook-parent"
+        moved_parent = repo / ".hook-parent-validated-object"
+        actual_replace = os.replace
+        raced = False
+
+        def replace_with_intermediate_race(
+            source: str,
+            destination: str,
+            *,
+            src_dir_fd: int,
+            dst_dir_fd: int,
+        ) -> None:
+            nonlocal raced
+            if destination == "post-merge" and not raced:
+                raced = True
+                parent.rename(moved_parent)
+                (parent / "hooks").mkdir(parents=True)
+            actual_replace(
+                source,
+                destination,
+                src_dir_fd=src_dir_fd,
+                dst_dir_fd=dst_dir_fd,
+            )
+
+        args = mock.Mock(repo=str(repo))
+        with mock.patch.object(
+            project_journal.os,
+            "replace",
+            side_effect=replace_with_intermediate_race,
+        ):
+            with self.assertRaisesRegex(
+                project_journal.UserError,
+                "ancestor identity or access policy changed",
+            ):
+                project_journal.command_install_hooks(args)
+
+        self.assertTrue(raced)
+        self.assertFalse((parent / "hooks/post-merge").exists())
+        self.assertIn(
+            project_journal.HOOK_BEGIN,
+            (moved_parent / "hooks/post-merge").read_text(encoding="utf-8"),
+        )
+
     def test_install_hooks_detects_racing_parent_replacement(self) -> None:
         repo = self.init_repo()
         configured = run_git(
@@ -2889,6 +3020,72 @@ class ProjectJournalTests(unittest.TestCase):
             (moved_hooks / "post-merge").read_text(encoding="utf-8"),
         )
 
+    def test_hook_target_timestamp_only_transition_preserves_identity(self) -> None:
+        repo = self.init_repo()
+        configured = run_git(
+            repo,
+            "config",
+            "--local",
+            "core.hooksPath",
+            ".githooks",
+        )
+        self.assertEqual(configured.returncode, 0, configured.stderr)
+        installed = self.run_cli("install-hooks", "--repo", str(repo))
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        binding = project_journal._preflight_hook_targets(repo)
+        try:
+            target = next(item for item in binding.targets if item.name == "post-merge")
+            hook = repo / ".githooks/post-merge"
+            hook_stat = hook.stat()
+            os.utime(
+                hook,
+                ns=(hook_stat.st_atime_ns, hook_stat.st_mtime_ns + 1_000_000_000),
+            )
+
+            project_journal._revalidate_hook_target(binding, target)
+        finally:
+            project_journal._close_hook_binding(binding)
+
+    def test_hook_target_revalidation_rejects_object_content_and_access_changes(
+        self,
+    ) -> None:
+        for mutation in ("object", "content", "access"):
+            with self.subTest(mutation=mutation):
+                repo = self.init_repo(f"repo-target-{mutation}")
+                configured = run_git(
+                    repo,
+                    "config",
+                    "--local",
+                    "core.hooksPath",
+                    ".githooks",
+                )
+                self.assertEqual(configured.returncode, 0, configured.stderr)
+                installed = self.run_cli("install-hooks", "--repo", str(repo))
+                self.assertEqual(installed.returncode, 0, installed.stderr)
+                binding = project_journal._preflight_hook_targets(repo)
+                try:
+                    target = next(
+                        item for item in binding.targets if item.name == "post-merge"
+                    )
+                    hook = repo / ".githooks/post-merge"
+                    if mutation == "object":
+                        replacement = repo / ".githooks/replacement"
+                        replacement.write_bytes(hook.read_bytes())
+                        replacement.chmod(0o755)
+                        os.replace(replacement, hook)
+                    elif mutation == "content":
+                        hook.write_bytes(hook.read_bytes() + b"# changed\n")
+                    else:
+                        hook.chmod(0o700)
+
+                    with self.assertRaisesRegex(
+                        project_journal.UserError,
+                        "hook target changed after preflight",
+                    ):
+                        project_journal._revalidate_hook_target(binding, target)
+                finally:
+                    project_journal._close_hook_binding(binding)
+
     def test_install_hooks_refuses_symlinked_default_hooks_dir(self) -> None:
         repo = self.init_repo()
         hooks_dir = repo / ".git/hooks"
@@ -2900,7 +3097,7 @@ class ProjectJournalTests(unittest.TestCase):
         result = self.run_cli("install-hooks", "--repo", str(repo))
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("hook directory links", result.stderr)
+        self.assertIn("descriptor-relative hook path traversal", result.stderr)
         for hook_name in project_journal.HOOK_NAMES:
             self.assertFalse((shared_hooks / hook_name).exists())
         exclude = (repo / ".git/info/exclude").read_text(encoding="utf-8")
@@ -3332,9 +3529,23 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertEqual(add.returncode, 0, add.stderr)
 
         oversized = self.init_repo("oversized")
+        oversized_journal = self.write_journal(
+            oversized,
+            "docs/project_journal/2026/05/2026-05-05-oversized-d4e5f6.md",
+            entry_id="20260505-d4e5f6",
+            title="Oversized",
+            status="active",
+            updated="2026-05-05",
+        )
+        oversized_add = run_git(
+            oversized,
+            "add",
+            "--",
+            str(oversized_journal.relative_to(oversized)),
+        )
+        self.assertEqual(oversized_add.returncode, 0, oversized_add.stderr)
         journal_dir = oversized / "docs/project_journal/2026/05"
-        journal_dir.mkdir(parents=True)
-        for index in range(project_journal.MAX_JOURNAL_ENTRIES + 1):
+        for index in range(project_journal.MAX_JOURNAL_ENTRIES):
             (journal_dir / f"entry-{index:04d}.md").touch()
 
         codex_home = self.root / "codex-home"
@@ -3370,7 +3581,10 @@ class ProjectJournalTests(unittest.TestCase):
             rows["oversized"]["discovery_error"]["code"],
             "journal_semantic_limit_exceeded",
         )
-        self.assertEqual(rows["oversized"]["adoption_status"], "inconclusive")
+        self.assertEqual(rows["oversized"]["adoption_status"], "adopted")
+        self.assertIsNone(rows["oversized"]["adoption_error"])
+        self.assertTrue(rows["oversized"]["tracked_journal_adopted"])
+        self.assertEqual(rows["oversized"]["valid_tracked_journal_count"], 1)
         self.assertIsNone(rows["oversized"]["journal_count"])
         self.assertIsNone(rows["oversized"]["hooks_installed"])
 

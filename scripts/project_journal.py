@@ -208,8 +208,27 @@ class _GitRuntime:
 class _HookTargetSnapshot:
     name: str
     exists: bool
-    identity: tuple[int, int, int, int, int] | None = None
+    identity: tuple[int, int, int, int, int, int] | None = None
     digest: str | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class _HookPathPlan:
+    root: pathlib.Path
+    components: tuple[str, ...]
+
+    @property
+    def path(self) -> pathlib.Path:
+        return self.root.joinpath(*self.components)
+
+
+@dataclasses.dataclass(frozen=True)
+class _BoundHookDirectory:
+    path: pathlib.Path
+    fd: int
+    identity: tuple[int, int, int, int]
+    parent_fd: int | None
+    component: str | None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -217,6 +236,7 @@ class _HookDirectoryBinding:
     path: pathlib.Path
     fd: int
     identity: tuple[int, int, int, int]
+    ancestors: tuple[_BoundHookDirectory, ...]
     targets: tuple[_HookTargetSnapshot, ...]
 
 
@@ -2031,7 +2051,16 @@ def _validate_entries(
         raise JournalLimitExceeded(f"journal entry count exceeds {MAX_JOURNAL_ENTRIES}")
     if collector is None:
         collector = _IssueCollector()
-    ids: dict[str, JournalEntry] = {}
+    id_groups: dict[str, list[JournalEntry]] = {}
+    for entry in entries:
+        _check_deadline(deadline, deadline_error)
+        if entry.entry_id:
+            id_groups.setdefault(entry.entry_id, []).append(entry)
+    ids = {
+        entry_id: grouped[0]
+        for entry_id, grouped in id_groups.items()
+        if len(grouped) == 1
+    }
     rel_paths = {entry.rel_path for entry in entries}
 
     for entry in entries:
@@ -2044,10 +2073,8 @@ def _validate_entries(
 
         if not entry.entry_id:
             collector.add(label, "field 'id' must not be empty")
-        elif entry.entry_id in ids:
+        elif len(id_groups[entry.entry_id]) > 1:
             collector.add(label, f"duplicate id {entry.entry_id!r}")
-        else:
-            ids[entry.entry_id] = entry
 
         if not entry.title:
             collector.add(label, "field 'title' must not be empty")
@@ -2256,7 +2283,47 @@ exit 0
 """
 
 
-def _hooks_dir_from_config(repo: pathlib.Path, raw_path: str) -> pathlib.Path:
+def _lexical_absolute_path(
+    path: pathlib.Path,
+    *,
+    base: pathlib.Path | None = None,
+) -> pathlib.Path:
+    if not path.is_absolute():
+        if base is None:
+            raise UserError(f"relative path has no trusted base: {path}")
+        path = base / path
+    return pathlib.Path(os.path.abspath(os.path.normpath(os.fspath(path))))
+
+
+def _git_common_directory(repo: pathlib.Path) -> pathlib.Path:
+    common_dir = _run_git(repo, "rev-parse", "--git-common-dir")
+    if common_dir.returncode != 0 or not common_dir.stdout.strip():
+        detail = (
+            common_dir.stderr.strip()
+            or common_dir.stdout.strip()
+            or "Git common directory lookup failed"
+        )
+        raise UserError(f"failed to resolve Git common directory: {detail}")
+    return _lexical_absolute_path(
+        pathlib.Path(common_dir.stdout.strip()),
+        base=repo,
+    )
+
+
+def _allowed_hook_roots(repo: pathlib.Path) -> list[pathlib.Path]:
+    roots = [
+        _lexical_absolute_path(repo),
+        _lexical_absolute_path(_git_path(repo, "."), base=repo),
+        _git_common_directory(repo),
+    ]
+    unique: list[pathlib.Path] = []
+    for root in roots:
+        if root not in unique:
+            unique.append(root)
+    return unique
+
+
+def _hook_path_plan_from_config(repo: pathlib.Path, raw_path: str) -> _HookPathPlan:
     if not raw_path.strip():
         raise UserError(
             "core.hooksPath is empty; unset it or set a non-empty hook directory before installing"
@@ -2266,42 +2333,31 @@ def _hooks_dir_from_config(repo: pathlib.Path, raw_path: str) -> pathlib.Path:
             "core.hooksPath points at os.devnull; cannot install project journal hooks"
         )
     hooks_dir = pathlib.Path(raw_path).expanduser()
-    if not hooks_dir.is_absolute():
-        hooks_dir = repo / hooks_dir
-    hooks_dir = hooks_dir.resolve()
-    allowed_roots = [repo.resolve(), _git_path(repo, ".").resolve()]
-    common_dir = _run_git(repo, "rev-parse", "--git-common-dir")
-    if common_dir.returncode == 0 and common_dir.stdout.strip():
-        common_path = pathlib.Path(common_dir.stdout.strip())
-        if not common_path.is_absolute():
-            common_path = repo / common_path
-        allowed_roots.append(common_path.resolve())
-    if not any(_is_relative_to(hooks_dir, root) for root in allowed_roots):
+    hooks_dir = _lexical_absolute_path(hooks_dir, base=repo)
+    candidates: list[tuple[pathlib.Path, tuple[str, ...]]] = []
+    for root in _allowed_hook_roots(repo):
+        try:
+            relative = hooks_dir.relative_to(root)
+        except ValueError:
+            continue
+        components = tuple(relative.parts)
+        if any(component in {"", ".", ".."} for component in components):
+            continue
+        candidates.append((root, components))
+    if not candidates:
         raise UserError(
-            "core.hooksPath resolves outside the repository or git directory; "
+            "core.hooksPath is outside the repository or Git directories; "
             "set a repo-local hook directory before installing"
         )
-    return hooks_dir
+    root, components = max(candidates, key=lambda candidate: len(candidate[0].parts))
+    return _HookPathPlan(root=root, components=components)
 
 
-def _default_hooks_dir(repo: pathlib.Path) -> pathlib.Path:
-    common_dir = _run_git(repo, "rev-parse", "--git-common-dir")
-    if common_dir.returncode != 0 or not common_dir.stdout.strip():
-        detail = (
-            common_dir.stderr.strip()
-            or common_dir.stdout.strip()
-            or "Git common directory lookup failed"
-        )
-        raise UserError(f"failed to resolve default hook directory: {detail}")
-    common_path = pathlib.Path(common_dir.stdout.strip())
-    if not common_path.is_absolute():
-        common_path = repo / common_path
-    hooks_dir = common_path.resolve() / "hooks"
-    if hooks_dir.is_symlink():
-        raise UserError(
-            f"{hooks_dir} is a symlink; refusing to install hooks through hook directory links"
-        )
-    return hooks_dir.resolve()
+def _default_hook_path_plan(repo: pathlib.Path) -> _HookPathPlan:
+    return _HookPathPlan(
+        root=_git_common_directory(repo),
+        components=("hooks",),
+    )
 
 
 def _global_git_config_paths() -> list[pathlib.Path]:
@@ -2561,7 +2617,7 @@ def _preflight_global_hooks_config(repo: pathlib.Path) -> None:
     )
 
 
-def _hooks_dir(repo: pathlib.Path) -> pathlib.Path:
+def _hook_path_plan(repo: pathlib.Path) -> _HookPathPlan:
     for scope in ("--worktree", "--local"):
         configured = _run_git(
             repo,
@@ -2572,13 +2628,13 @@ def _hooks_dir(repo: pathlib.Path) -> pathlib.Path:
             "core.hooksPath",
         )
         if configured.returncode == 0:
-            return _hooks_dir_from_config(repo, configured.stdout.strip())
+            return _hook_path_plan_from_config(repo, configured.stdout.strip())
     _preflight_global_hooks_config(repo)
-    return _default_hooks_dir(repo)
+    return _default_hook_path_plan(repo)
 
 
 def _hook_path(repo: pathlib.Path, name: str) -> pathlib.Path:
-    return _hooks_dir(repo) / name
+    return _hook_path_plan(repo).path / name
 
 
 def _validate_hook_directory_stat(
@@ -2597,34 +2653,49 @@ def _validate_hook_directory_stat(
 
 
 def _revalidate_hook_directory(binding: _HookDirectoryBinding) -> None:
-    try:
-        descriptor_stat = os.fstat(binding.fd)
-        path_stat = os.stat(binding.path, follow_symlinks=False)
-    except OSError as exc:
-        raise UserError(
-            f"hook directory became unavailable during installation: {exc}"
-        ) from exc
-    descriptor_identity = _validate_hook_directory_stat(
-        binding.path,
-        descriptor_stat,
-    )
-    path_identity = _validate_hook_directory_stat(binding.path, path_stat)
-    if descriptor_identity != binding.identity or path_identity != binding.identity:
-        raise UserError(
-            f"hook directory identity or access policy changed during "
-            f"installation: {binding.path}"
-        )
+    for ancestor in binding.ancestors:
+        try:
+            descriptor_stat = os.fstat(ancestor.fd)
+            descriptor_identity = _validate_hook_directory_stat(
+                ancestor.path,
+                descriptor_stat,
+            )
+            if ancestor.parent_fd is None:
+                path_identity = descriptor_identity
+            else:
+                assert ancestor.component is not None
+                path_stat = os.stat(
+                    ancestor.component,
+                    dir_fd=ancestor.parent_fd,
+                    follow_symlinks=False,
+                )
+                path_identity = _validate_hook_directory_stat(
+                    ancestor.path,
+                    path_stat,
+                )
+        except OSError as exc:
+            raise UserError(
+                f"hook path ancestor became unavailable during installation: "
+                f"{ancestor.path}: {exc}"
+            ) from exc
+        if (
+            descriptor_identity != ancestor.identity
+            or path_identity != ancestor.identity
+        ):
+            raise UserError(
+                f"hook path ancestor identity or access policy changed during "
+                f"installation: {ancestor.path}"
+            )
 
 
 def _hook_target_identity(value: os.stat_result) -> tuple[int, ...]:
     return (
         value.st_dev,
         value.st_ino,
+        stat.S_IFMT(value.st_mode),
         value.st_uid,
         stat.S_IMODE(value.st_mode),
         value.st_size,
-        value.st_mtime_ns,
-        value.st_ctime_ns,
     )
 
 
@@ -2719,44 +2790,127 @@ def _revalidate_hook_target(
         )
 
 
-def _preflight_hook_targets(repo: pathlib.Path) -> _HookDirectoryBinding:
-    hooks_dir = _hooks_dir(repo)
-    hooks_dir.mkdir(parents=True, exist_ok=True)
+def _bind_hook_directory(plan: _HookPathPlan) -> _HookDirectoryBinding:
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
     flags |= getattr(os, "O_CLOEXEC", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0)
+    opened: list[_BoundHookDirectory] = []
     try:
-        fd = os.open(hooks_dir, flags)
-    except OSError as exc:
-        raise UserError(f"failed to bind hook directory {hooks_dir}: {exc}") from exc
-    binding: _HookDirectoryBinding | None = None
-    try:
-        descriptor_stat = os.fstat(fd)
-        path_stat = os.stat(hooks_dir, follow_symlinks=False)
-        descriptor_identity = _validate_hook_directory_stat(
-            hooks_dir,
-            descriptor_stat,
+        root_fd = os.open(plan.root, flags)
+        root_identity = _validate_hook_directory_stat(
+            plan.root,
+            os.fstat(root_fd),
         )
-        path_identity = _validate_hook_directory_stat(hooks_dir, path_stat)
-        if descriptor_identity != path_identity:
-            raise UserError(f"hook directory changed while being bound: {hooks_dir}")
-        provisional = _HookDirectoryBinding(
-            path=hooks_dir,
-            fd=fd,
-            identity=descriptor_identity,
+        root_path_identity = _validate_hook_directory_stat(
+            plan.root,
+            os.stat(plan.root, follow_symlinks=False),
+        )
+        if root_identity != root_path_identity:
+            os.close(root_fd)
+            raise UserError(f"allowed hook root changed while being bound: {plan.root}")
+        opened.append(
+            _BoundHookDirectory(
+                path=plan.root,
+                fd=root_fd,
+                identity=root_identity,
+                parent_fd=None,
+                component=None,
+            )
+        )
+        current = opened[0]
+        for component in plan.components:
+            component_path = current.path / component
+            child_fd: int | None = None
+            try:
+                child_fd = os.open(component, flags, dir_fd=current.fd)
+            except FileNotFoundError:
+                try:
+                    os.mkdir(component, 0o755, dir_fd=current.fd)
+                except FileExistsError:
+                    pass
+                child_fd = os.open(component, flags, dir_fd=current.fd)
+            try:
+                child_identity = _validate_hook_directory_stat(
+                    component_path,
+                    os.fstat(child_fd),
+                )
+                linked_identity = _validate_hook_directory_stat(
+                    component_path,
+                    os.stat(
+                        component,
+                        dir_fd=current.fd,
+                        follow_symlinks=False,
+                    ),
+                )
+                if child_identity != linked_identity:
+                    raise UserError(
+                        f"hook path component changed while being bound: "
+                        f"{component_path}"
+                    )
+            except BaseException:
+                os.close(child_fd)
+                raise
+            current = _BoundHookDirectory(
+                path=component_path,
+                fd=child_fd,
+                identity=child_identity,
+                parent_fd=current.fd,
+                component=component,
+            )
+            opened.append(current)
+    except OSError as exc:
+        for ancestor in reversed(opened):
+            os.close(ancestor.fd)
+        raise UserError(
+            f"failed descriptor-relative hook path traversal under {plan.root}: {exc}"
+        ) from exc
+    except BaseException:
+        for ancestor in reversed(opened):
+            os.close(ancestor.fd)
+        raise
+
+    final = opened[-1]
+    binding = _HookDirectoryBinding(
+        path=final.path,
+        fd=final.fd,
+        identity=final.identity,
+        ancestors=tuple(opened),
+        targets=(),
+    )
+    try:
+        _revalidate_hook_directory(binding)
+    except BaseException:
+        _close_hook_binding(binding)
+        raise
+    return binding
+
+
+def _close_hook_binding(binding: _HookDirectoryBinding) -> None:
+    for ancestor in reversed(binding.ancestors):
+        try:
+            os.close(ancestor.fd)
+        except OSError:
+            pass
+
+
+def _preflight_hook_targets(repo: pathlib.Path) -> _HookDirectoryBinding:
+    binding = _bind_hook_directory(_hook_path_plan(repo))
+    try:
+        provisional = dataclasses.replace(
+            binding,
             targets=(),
         )
         targets: list[_HookTargetSnapshot] = []
         for name in HOOK_NAMES:
             target, content = _snapshot_hook_target(provisional, name)
             if content is not None:
-                _validate_managed_hook(hooks_dir / name, content)
+                _validate_managed_hook(binding.path / name, content)
             targets.append(target)
         binding = dataclasses.replace(provisional, targets=tuple(targets))
         _revalidate_hook_directory(binding)
         return binding
     except BaseException:
-        os.close(fd)
+        _close_hook_binding(binding)
         raise
 
 
@@ -2807,7 +2961,7 @@ def _install_hook(
             not installed.exists
             or installed_content != content
             or installed.identity is None
-            or installed.identity[3] != 0o755
+            or installed.identity[4] != 0o755
         ):
             raise UserError(
                 f"hook target failed post-write verification: "
@@ -2834,7 +2988,7 @@ def command_install_hooks(args: argparse.Namespace) -> int:
         _revalidate_hook_directory(binding)
         installed = [_install_hook(binding, target) for target in binding.targets]
     finally:
-        os.close(binding.fd)
+        _close_hook_binding(binding)
     for path in installed:
         print(path)
     return 0
@@ -3086,13 +3240,6 @@ def _enrich_discovered_repo(
         hooks_installed = _has_hook_marker(root)
     except (OSError, UserError) as exc:
         error = _discovery_error(exc)
-        adoption = {
-            "adoption_status": "inconclusive",
-            "adoption_error": error,
-            "tracked_journal_adopted": None,
-            "tracked_non_generated_journal_count": None,
-            "valid_tracked_journal_count": None,
-        }
         journal_count = None
         index_ignored = None
         hooks_installed = None
