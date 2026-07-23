@@ -74,9 +74,11 @@ MAX_GIT_VERSION_OUTPUT_BYTES = 4096
 MAX_GLOBAL_GIT_CONFIG_OUTPUT_BYTES = 16 * 1024
 MAX_GLOBAL_GIT_CONFIG_SOURCE_BYTES = 1024 * 1024
 MAX_EXISTING_HOOK_BYTES = 1024 * 1024
+MAX_GENERIC_GIT_STDOUT_BYTES = 4 * 1024 * 1024
 GIT_INDEX_SNAPSHOT_TIMEOUT_SECONDS = 10.0
 GIT_CAT_FILE_BATCH_TIMEOUT_SECONDS = 10.0
 GIT_ADOPTION_VALIDATION_TIMEOUT_SECONDS = 10.0
+GIT_COMMAND_TIMEOUT_SECONDS = 10.0
 GIT_VERSION_TIMEOUT_SECONDS = 2.0
 GIT_CONFIG_QUERY_TIMEOUT_SECONDS = 5.0
 GIT_PROCESS_TERMINATE_GRACE_SECONDS = 0.25
@@ -157,6 +159,14 @@ class JournalLimitExceeded(UserError):
 
 class _ProcessIdentityLost(UserError):
     """The direct child was reaped before group cleanup could finish."""
+
+
+class _HookExchangeRecoveryRequired(UserError):
+    """A hook exchange could not be safely rolled back."""
+
+    def __init__(self, message: str, recovery_name: str) -> None:
+        super().__init__(message)
+        self.recovery_name = recovery_name
 
 
 @dataclasses.dataclass(frozen=True)
@@ -246,6 +256,8 @@ class _HookDirectoryBinding:
     identity: tuple[int, int, int, int]
     ancestors: tuple[_BoundHookDirectory, ...]
     targets: tuple[_HookTargetSnapshot, ...]
+    install_lock_fd: int | None = None
+    install_lock_identity: tuple[int, int, int, int, int] | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -354,6 +366,101 @@ def _directory_identity(value: os.stat_result) -> tuple[int, int, int, int]:
         value.st_uid,
         stat.S_IMODE(value.st_mode),
     )
+
+
+def _required_open_flag(name: str) -> int:
+    if os.name != "posix":
+        raise UnsupportedPlatform("secure descriptor reads require POSIX open flags")
+    value = getattr(os, name, None)
+    if not isinstance(value, int) or value == 0:
+        raise UnsupportedPlatform(
+            f"secure descriptor reads require the {name} open flag"
+        )
+    return value
+
+
+def _secure_read_regular_path(
+    path: pathlib.Path,
+    *,
+    label: str,
+    byte_limit: int,
+    missing_ok: bool = False,
+) -> bytes | None:
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | _required_open_flag("O_NOFOLLOW")
+        | _required_open_flag("O_NONBLOCK")
+    )
+    try:
+        fd = os.open(path, flags)
+    except FileNotFoundError:
+        if missing_ok:
+            return None
+        raise UserError(f"{label} does not exist: {path}") from None
+    except OSError as exc:
+        detail = (
+            "path is a symlink or could not be opened without following links"
+            if exc.errno in {errno.ELOOP, errno.EMLINK}
+            else str(exc)
+        )
+        raise UserError(f"failed to open {label} {path}: {detail}") from exc
+
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode):
+            raise UserError(f"{label} is not a regular file: {path}")
+        if before.st_size > byte_limit:
+            raise UserError(f"{label} exceeds {byte_limit} bytes: {path}")
+        try:
+            path_before = os.stat(path, follow_symlinks=False)
+        except OSError as exc:
+            raise UserError(
+                f"{label} path became unavailable while being bound: {path}: {exc}"
+            ) from exc
+        identity = _file_identity(before)
+        if _file_identity(path_before) != identity or not stat.S_ISREG(
+            path_before.st_mode
+        ):
+            raise UserError(f"{label} path changed while being bound: {path}")
+
+        def read_once() -> bytes:
+            os.lseek(fd, 0, os.SEEK_SET)
+            content = bytearray()
+            while len(content) <= byte_limit:
+                chunk = os.read(
+                    fd,
+                    min(PROCESS_READ_CHUNK_BYTES, byte_limit + 1 - len(content)),
+                )
+                if not chunk:
+                    break
+                content.extend(chunk)
+            if len(content) > byte_limit:
+                raise UserError(f"{label} exceeds {byte_limit} bytes: {path}")
+            return bytes(content)
+
+        first = read_once()
+        between = os.fstat(fd)
+        second = read_once()
+        after = os.fstat(fd)
+        try:
+            path_after = os.stat(path, follow_symlinks=False)
+        except OSError as exc:
+            raise UserError(
+                f"{label} path became unavailable while being read: {path}: {exc}"
+            ) from exc
+        if (
+            _file_identity(between) != identity
+            or _file_identity(after) != identity
+            or _file_identity(path_after) != identity
+            or not stat.S_ISREG(path_after.st_mode)
+        ):
+            raise UserError(f"{label} object identity changed while being read: {path}")
+        if first != second:
+            raise UserError(f"{label} content changed while being read: {path}")
+        return first
+    finally:
+        os.close(fd)
 
 
 def _hash_open_file(fd: int) -> str:
@@ -467,21 +574,57 @@ def _git_command(repo: pathlib.Path, *args: str) -> list[str]:
     ]
 
 
-def _run_git(repo: pathlib.Path, *args: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        _git_command(repo, *args),
-        check=False,
+def _run_git(
+    repo: pathlib.Path,
+    *args: str,
+    deadline: float | None = None,
+    deadline_error: str = "Git command exceeded its shared deadline",
+    operation: str = "Git command",
+) -> subprocess.CompletedProcess[str]:
+    command = _git_command(repo, *args)
+    result = _capture_bounded_process(
+        command,
         env=_git_environment(),
-        stdin=subprocess.DEVNULL,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        timeout_seconds=GIT_COMMAND_TIMEOUT_SECONDS,
+        stdout_limit=MAX_GENERIC_GIT_STDOUT_BYTES,
+        stderr_limit=MAX_GIT_STDERR_BYTES,
+        stdout_overflow_error=(
+            f"{operation} stdout exceeds {MAX_GENERIC_GIT_STDOUT_BYTES} bytes"
+        ),
+        stderr_overflow_error=(
+            f"{operation} stderr exceeds {MAX_GIT_STDERR_BYTES} bytes"
+        ),
+        timeout_error=(
+            deadline_error
+            if deadline is not None
+            else f"{operation} timed out after {GIT_COMMAND_TIMEOUT_SECONDS:g} seconds"
+        ),
+        operation=operation,
+        deadline=deadline,
+    )
+    return subprocess.CompletedProcess(
+        command,
+        result.returncode,
+        result.stdout.decode("utf-8", errors="replace"),
+        result.stderr.decode("utf-8", errors="replace"),
     )
 
 
-def _resolve_repo(repo_arg: str) -> pathlib.Path:
+def _resolve_repo(
+    repo_arg: str,
+    *,
+    deadline: float | None = None,
+    deadline_error: str = "repository resolution exceeded its shared deadline",
+) -> pathlib.Path:
     candidate = pathlib.Path(repo_arg).expanduser().resolve()
-    result = _run_git(candidate, "rev-parse", "--show-toplevel")
+    result = _run_git(
+        candidate,
+        "rev-parse",
+        "--show-toplevel",
+        deadline=deadline,
+        deadline_error=deadline_error,
+        operation="Git repository resolution",
+    )
     if result.returncode != 0:
         detail = (
             result.stderr.strip() or result.stdout.strip() or "not a git repository"
@@ -1950,13 +2093,17 @@ def _load_entries_from_index_report(
     repo: pathlib.Path,
     *,
     timeout_seconds: float = GIT_ADOPTION_VALIDATION_TIMEOUT_SECONDS,
+    deadline: float | None = None,
 ) -> _IndexedJournalLoad:
     if timeout_seconds <= 0:
         raise ValueError("timeout_seconds must be positive")
     entries: list[JournalEntry] = []
     collector = _IssueCollector()
     non_generated_count = 0
-    validation_deadline = time.monotonic() + timeout_seconds
+    local_deadline = time.monotonic() + timeout_seconds
+    validation_deadline = (
+        local_deadline if deadline is None else min(local_deadline, deadline)
+    )
     deadline_error = "tracked journal adoption validation exceeded its shared deadline"
     initial_index, blobs = _tracked_index_journal_snapshot(
         repo,
@@ -2030,8 +2177,12 @@ def _load_entries_from_index_report(
     )
 
 
-def _tracked_journal_adoption(repo: pathlib.Path) -> dict[str, Any]:
-    loaded = _load_entries_from_index_report(repo)
+def _tracked_journal_adoption(
+    repo: pathlib.Path,
+    *,
+    deadline: float | None = None,
+) -> dict[str, Any]:
+    loaded = _load_entries_from_index_report(repo, deadline=deadline)
     return {
         "tracked_journal_adopted": loaded.valid_count > 0,
         "tracked_non_generated_journal_count": loaded.non_generated_count,
@@ -2236,8 +2387,17 @@ def command_validate(args: argparse.Namespace) -> int:
 
 
 def command_adoption_status(args: argparse.Namespace) -> int:
-    repo = _resolve_repo(args.repo)
-    status = {"repo": str(repo), **_tracked_journal_adoption(repo)}
+    deadline = time.monotonic() + GIT_ADOPTION_VALIDATION_TIMEOUT_SECONDS
+    deadline_error = "tracked journal adoption validation exceeded its shared deadline"
+    repo = _resolve_repo(
+        args.repo,
+        deadline=deadline,
+        deadline_error=deadline_error,
+    )
+    status = {
+        "repo": str(repo),
+        **_tracked_journal_adoption(repo, deadline=deadline),
+    }
     print(json.dumps(status, ensure_ascii=False, indent=2, sort_keys=True))
     return 0
 
@@ -2382,7 +2542,7 @@ def _global_git_config_paths() -> list[pathlib.Path]:
         path = pathlib.Path(override).expanduser()
         if not path.is_absolute():
             path = pathlib.Path.cwd() / path
-        return [path.resolve()]
+        return [_lexical_absolute_path(path)]
 
     home_text = os.environ.get("HOME")
     home = (
@@ -2398,8 +2558,8 @@ def _global_git_config_paths() -> list[pathlib.Path]:
             "core.hooksPath configuration safely"
         )
     return [
-        (xdg / "git/config").resolve(),
-        (home / ".gitconfig").resolve(),
+        _lexical_absolute_path(xdg / "git/config"),
+        _lexical_absolute_path(home / ".gitconfig"),
     ]
 
 
@@ -2419,30 +2579,20 @@ def _parse_git_config_records(output: bytes, label: str) -> list[tuple[str, str]
     return entries
 
 
-def _global_git_config_entries(config_path: pathlib.Path) -> list[tuple[str, str]]:
-    try:
-        with config_path.open("rb") as source:
-            before = os.fstat(source.fileno())
-            content = source.read(MAX_GLOBAL_GIT_CONFIG_SOURCE_BYTES + 1)
-            after = os.fstat(source.fileno())
-    except OSError as exc:
-        raise UserError(
-            f"failed to snapshot global Git config {config_path}: {exc}"
-        ) from exc
-    if len(content) > MAX_GLOBAL_GIT_CONFIG_SOURCE_BYTES:
-        raise UserError(
-            "global Git config source exceeds "
-            f"{MAX_GLOBAL_GIT_CONFIG_SOURCE_BYTES} bytes"
-        )
-    stable_signals = (
-        "st_dev",
-        "st_ino",
-        "st_mode",
-        "st_size",
-        "st_mtime_ns",
+def _global_git_config_entries(
+    config_path: pathlib.Path,
+    *,
+    missing_ok: bool = False,
+    label: str = "global Git config",
+) -> list[tuple[str, str]]:
+    content = _secure_read_regular_path(
+        config_path,
+        label=label,
+        byte_limit=MAX_GLOBAL_GIT_CONFIG_SOURCE_BYTES,
+        missing_ok=missing_ok,
     )
-    if any(getattr(before, name) != getattr(after, name) for name in stable_signals):
-        raise UserError("global Git config changed while it was being snapshotted")
+    if content is None:
+        return []
 
     with tempfile.NamedTemporaryFile(
         prefix="project-journal-global-config-",
@@ -2468,25 +2618,25 @@ def _global_git_config_entries(config_path: pathlib.Path) -> list[tuple[str, str
             stdout_limit=MAX_GLOBAL_GIT_CONFIG_OUTPUT_BYTES,
             stderr_limit=MAX_GIT_STDERR_BYTES,
             stdout_overflow_error=(
-                "global Git config query stdout exceeds "
+                f"{label} query stdout exceeds "
                 f"{MAX_GLOBAL_GIT_CONFIG_OUTPUT_BYTES} bytes"
             ),
             stderr_overflow_error=(
-                f"global Git config query stderr exceeds {MAX_GIT_STDERR_BYTES} bytes"
+                f"{label} query stderr exceeds {MAX_GIT_STDERR_BYTES} bytes"
             ),
             timeout_error=(
-                f"global Git config query timed out after "
+                f"{label} query timed out after "
                 f"{GIT_CONFIG_QUERY_TIMEOUT_SECONDS:g} seconds"
             ),
-            operation="global Git config query",
+            operation=f"{label} query",
         )
     if result.returncode != 0:
         detail = (
             result.stderr.decode("utf-8", errors="replace").strip()
             or f"exit {result.returncode}"
         )
-        raise UserError(f"failed to inspect global Git config safely: {detail}")
-    return _parse_git_config_records(result.stdout, "global Git config query")
+        raise UserError(f"failed to inspect {label} safely: {detail}")
+    return _parse_git_config_records(result.stdout, f"{label} query")
 
 
 def _git_env_flag_enabled(name: str) -> bool:
@@ -2510,18 +2660,10 @@ def _system_git_config_entries() -> list[tuple[str, str]]:
         path = pathlib.Path(configured_path).expanduser()
         if not path.is_absolute():
             path = pathlib.Path.cwd() / path
-        path = path.resolve()
-        if path == pathlib.Path(os.devnull).resolve():
+        path = _lexical_absolute_path(path)
+        if path == _lexical_absolute_path(pathlib.Path(os.devnull)):
             return []
-        try:
-            path_stat = path.stat()
-        except OSError as exc:
-            raise UserError(
-                f"failed to inspect system Git config {path}: {exc}"
-            ) from exc
-        if not stat.S_ISREG(path_stat.st_mode):
-            raise UserError(f"system Git config is not a regular file: {path}")
-        return _global_git_config_entries(path)
+        return _global_git_config_entries(path, label="system Git config")
 
     command = [
         str(_fixed_git_executable()),
@@ -2591,17 +2733,7 @@ def _preflight_global_hooks_config(repo: pathlib.Path) -> None:
 
     entries: list[tuple[str, str]] = []
     for config_path in _global_git_config_paths():
-        if not config_path.exists():
-            continue
-        try:
-            config_stat = config_path.stat()
-        except OSError as exc:
-            raise UserError(
-                f"failed to inspect global Git config {config_path}: {exc}"
-            ) from exc
-        if not stat.S_ISREG(config_stat.st_mode):
-            raise UserError(f"global Git config is not a regular file: {config_path}")
-        entries.extend(_global_git_config_entries(config_path))
+        entries.extend(_global_git_config_entries(config_path, missing_ok=True))
     hooks_values = [value for key, value in entries if key == "core.hookspath"]
     include_keys = [
         key
@@ -2704,6 +2836,7 @@ def _revalidate_hook_directory(binding: _HookDirectoryBinding) -> None:
                 f"hook path ancestor identity or access policy changed during "
                 f"installation: {ancestor.path}"
             )
+    _revalidate_hook_install_lock(binding)
 
 
 def _hook_target_identity(value: os.stat_result) -> tuple[int, ...]:
@@ -2721,8 +2854,12 @@ def _snapshot_hook_target(
     binding: _HookDirectoryBinding,
     name: str,
 ) -> tuple[_HookTargetSnapshot, bytes | None]:
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
-    flags |= getattr(os, "O_NOFOLLOW", 0)
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | _required_open_flag("O_NOFOLLOW")
+        | _required_open_flag("O_NONBLOCK")
+    )
     try:
         fd = os.open(name, flags, dir_fd=binding.fd)
     except FileNotFoundError:
@@ -2814,9 +2951,12 @@ def _bind_hook_directory(plan: _HookPathPlan) -> _HookDirectoryBinding:
             "project journal hook installation requires POSIX descriptor-relative "
             "filesystem primitives"
         )
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-    flags |= getattr(os, "O_CLOEXEC", 0)
-    flags |= getattr(os, "O_NOFOLLOW", 0)
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | _required_open_flag("O_NOFOLLOW")
+    )
     opened: list[_BoundHookDirectory] = []
     try:
         if not plan.root.is_absolute() or plan.root.anchor != os.sep:
@@ -2933,6 +3073,11 @@ def _bind_hook_directory(plan: _HookPathPlan) -> _HookDirectoryBinding:
 
 
 def _close_hook_binding(binding: _HookDirectoryBinding) -> None:
+    if binding.install_lock_fd is not None:
+        try:
+            os.close(binding.install_lock_fd)
+        except OSError:
+            pass
     for ancestor in reversed(binding.ancestors):
         try:
             os.close(ancestor.fd)
@@ -2940,9 +3085,100 @@ def _close_hook_binding(binding: _HookDirectoryBinding) -> None:
             pass
 
 
+def _revalidate_hook_install_lock(binding: _HookDirectoryBinding) -> None:
+    if binding.install_lock_fd is None:
+        return
+    if binding.install_lock_identity is None:
+        raise UserError("hook installation lock identity is missing")
+    name = ".project-journal-install.lock"
+    try:
+        descriptor_stat = os.fstat(binding.install_lock_fd)
+        path_stat = os.stat(name, dir_fd=binding.fd, follow_symlinks=False)
+    except OSError as exc:
+        raise UserError(
+            f"hook installation lock became unavailable: {binding.path / name}: {exc}"
+        ) from exc
+    if (
+        not stat.S_ISREG(descriptor_stat.st_mode)
+        or _file_identity(descriptor_stat) != binding.install_lock_identity
+        or _file_identity(path_stat) != binding.install_lock_identity
+        or descriptor_stat.st_uid != os.geteuid()
+        or stat.S_IMODE(descriptor_stat.st_mode) != 0o600
+    ):
+        raise UserError(
+            f"hook installation lock identity or access policy changed: "
+            f"{binding.path / name}"
+        )
+
+
+def _acquire_hook_install_lock(
+    binding: _HookDirectoryBinding,
+) -> _HookDirectoryBinding:
+    try:
+        import fcntl
+    except ImportError as exc:
+        raise UnsupportedPlatform(
+            "hook installation requires POSIX advisory file locking"
+        ) from exc
+
+    name = ".project-journal-install.lock"
+    flags = (
+        os.O_RDWR
+        | os.O_CREAT
+        | getattr(os, "O_CLOEXEC", 0)
+        | _required_open_flag("O_NOFOLLOW")
+        | _required_open_flag("O_NONBLOCK")
+    )
+    try:
+        fd = os.open(name, flags, 0o600, dir_fd=binding.fd)
+    except OSError as exc:
+        raise UserError(
+            f"failed to open hook installation lock {binding.path / name}: {exc}"
+        ) from exc
+    try:
+        descriptor_stat = os.fstat(fd)
+        path_stat = os.stat(name, dir_fd=binding.fd, follow_symlinks=False)
+        descriptor_identity = _file_identity(descriptor_stat)
+        if (
+            not stat.S_ISREG(descriptor_stat.st_mode)
+            or descriptor_identity != _file_identity(path_stat)
+            or descriptor_stat.st_uid != os.geteuid()
+            or stat.S_IMODE(descriptor_stat.st_mode) != 0o600
+        ):
+            raise UserError(
+                f"hook installation lock is not an owner-private regular file: "
+                f"{binding.path / name}"
+            )
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise UserError(
+                f"another project journal hook installation is active: {binding.path}"
+            ) from exc
+        descriptor_after = os.fstat(fd)
+        path_after = os.stat(name, dir_fd=binding.fd, follow_symlinks=False)
+        if (
+            _file_identity(descriptor_after) != descriptor_identity
+            or _file_identity(path_after) != descriptor_identity
+        ):
+            raise UserError(
+                f"hook installation lock identity changed while being acquired: "
+                f"{binding.path / name}"
+            )
+    except BaseException:
+        os.close(fd)
+        raise
+    return dataclasses.replace(
+        binding,
+        install_lock_fd=fd,
+        install_lock_identity=descriptor_identity,
+    )
+
+
 def _preflight_hook_targets(repo: pathlib.Path) -> _HookDirectoryBinding:
     binding = _bind_hook_directory(_hook_path_plan(repo))
     try:
+        binding = _acquire_hook_install_lock(binding)
         provisional = dataclasses.replace(
             binding,
             targets=(),
@@ -3051,10 +3287,29 @@ def _rollback_hook_exchange(
     return None
 
 
+def _recovery_error(
+    binding: _HookDirectoryBinding,
+    temporary_name: str,
+    detail: str,
+) -> _HookExchangeRecoveryRequired:
+    recovery_path = binding.path / temporary_name
+    try:
+        os.fsync(binding.fd)
+    except OSError as exc:
+        detail = f"{detail}; directory fsync failed: {exc}"
+    return _HookExchangeRecoveryRequired(
+        f"hook target changed at atomic commit and rollback is "
+        f"cleanup-incomplete: {detail}; preserved recovery locator: "
+        f"{recovery_path}",
+        temporary_name,
+    )
+
+
 def _commit_hook_target_atomically(
     binding: _HookDirectoryBinding,
     target: _HookTargetSnapshot,
     temporary_name: str,
+    staged: _HookTargetSnapshot,
 ) -> None:
     if not target.exists:
         try:
@@ -3093,27 +3348,73 @@ def _commit_hook_target_atomically(
 
     try:
         displaced, _content = _snapshot_hook_target(binding, temporary_name)
-        expected_displaced = dataclasses.replace(target, name=temporary_name)
-        if displaced != expected_displaced:
-            raise UserError(
-                f"hook target changed at atomic commit: {binding.path / target.name}"
-            )
     except BaseException as exc:
-        rollback_error = _rollback_hook_exchange(
+        raise _recovery_error(
             binding,
             temporary_name,
-            target.name,
-        )
-        if rollback_error is not None:
-            raise UserError(
-                f"hook target changed at atomic commit and rollback was "
-                f"cleanup-incomplete: {rollback_error}"
-            ) from exc
-        raise UserError(
-            f"hook target changed at atomic commit: {binding.path / target.name}"
+            f"the displaced entry could not be inspected: {exc}",
         ) from exc
 
-    os.unlink(temporary_name, dir_fd=binding.fd)
+    expected_displaced = dataclasses.replace(target, name=temporary_name)
+    if displaced == expected_displaced:
+        os.unlink(temporary_name, dir_fd=binding.fd)
+        return
+
+    mismatch = UserError(
+        f"hook target changed at atomic commit: {binding.path / target.name}"
+    )
+    try:
+        installed, _installed_content = _snapshot_hook_target(
+            binding,
+            target.name,
+        )
+    except BaseException as ownership_exc:
+        raise _recovery_error(
+            binding,
+            temporary_name,
+            f"the installed target could not be rebound: {ownership_exc}",
+        ) from mismatch
+    expected_installed = dataclasses.replace(staged, name=target.name)
+    if installed != expected_installed:
+        raise _recovery_error(
+            binding,
+            temporary_name,
+            "the installed target is no longer owned by this transaction",
+        ) from mismatch
+    rollback_error = _rollback_hook_exchange(
+        binding,
+        temporary_name,
+        target.name,
+    )
+    if rollback_error is not None:
+        raise _recovery_error(
+            binding,
+            temporary_name,
+            rollback_error,
+        ) from mismatch
+    try:
+        rollback_staged, _rollback_content = _snapshot_hook_target(
+            binding,
+            temporary_name,
+        )
+        restored, _restored_content = _snapshot_hook_target(
+            binding,
+            target.name,
+        )
+    except BaseException as verification_exc:
+        raise _recovery_error(
+            binding,
+            temporary_name,
+            f"rollback result could not be inspected: {verification_exc}",
+        ) from mismatch
+    expected_restored = dataclasses.replace(displaced, name=target.name)
+    if rollback_staged != staged or restored != expected_restored:
+        raise _recovery_error(
+            binding,
+            temporary_name,
+            "rollback result could not be bound to the staged and displaced objects",
+        ) from mismatch
+    raise mismatch
 
 
 def _install_hook(
@@ -3124,9 +3425,14 @@ def _install_hook(
     _revalidate_hook_target(binding, target)
     content = _hook_body().encode("utf-8")
     temporary_name = f".project-journal-{target.name}-{secrets.token_hex(12)}.tmp"
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    flags |= getattr(os, "O_CLOEXEC", 0)
-    flags |= getattr(os, "O_NOFOLLOW", 0)
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | _required_open_flag("O_NOFOLLOW")
+        | _required_open_flag("O_NONBLOCK")
+    )
     temporary_created = False
     try:
         temporary_fd = os.open(temporary_name, flags, 0o600, dir_fd=binding.fd)
@@ -3138,9 +3444,24 @@ def _install_hook(
             os.fsync(temporary_fd)
         finally:
             os.close(temporary_fd)
+        staged, staged_content = _snapshot_hook_target(binding, temporary_name)
+        if (
+            not staged.exists
+            or staged_content != content
+            or staged.identity is None
+            or staged.identity[4] != 0o755
+        ):
+            raise UserError(
+                f"staged hook failed verification: {binding.path / temporary_name}"
+            )
         _revalidate_hook_directory(binding)
         _revalidate_hook_target(binding, target)
-        _commit_hook_target_atomically(binding, target, temporary_name)
+        _commit_hook_target_atomically(
+            binding,
+            target,
+            temporary_name,
+            staged,
+        )
         temporary_created = False
         os.fsync(binding.fd)
         _revalidate_hook_directory(binding)
@@ -3155,6 +3476,9 @@ def _install_hook(
                 f"hook target failed post-write verification: "
                 f"{binding.path / target.name}"
             )
+    except _HookExchangeRecoveryRequired:
+        temporary_created = False
+        raise
     except OSError as exc:
         raise UserError(
             f"failed to install hook {binding.path / target.name}: {exc}"
@@ -3385,8 +3709,9 @@ def _is_excluded(repo: pathlib.Path, rel: str) -> bool | None:
 
 
 def _discover_adoption_status(repo: pathlib.Path) -> dict[str, Any]:
+    deadline = time.monotonic() + GIT_ADOPTION_VALIDATION_TIMEOUT_SECONDS
     try:
-        adoption = _tracked_journal_adoption(repo)
+        adoption = _tracked_journal_adoption(repo, deadline=deadline)
     except UserError as exc:
         return {
             "adoption_status": "inconclusive",
@@ -3474,7 +3799,13 @@ def _discover_repos(codex_home: pathlib.Path, since_days: int) -> list[dict[str,
         roots_for_rollout: set[pathlib.Path] = set()
         for cwd in _unique_preserving_order(_extract_cwds(rollout)):
             if cwd not in resolved_roots:
-                resolved_roots[cwd] = _repo_root_for_path(cwd, codex_home=codex_home)
+                try:
+                    resolved_roots[cwd] = _repo_root_for_path(
+                        cwd,
+                        codex_home=codex_home,
+                    )
+                except (OSError, UserError):
+                    resolved_roots[cwd] = None
             root = resolved_roots[cwd]
             if root is None:
                 continue

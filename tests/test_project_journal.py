@@ -306,14 +306,14 @@ class ProjectJournalTests(unittest.TestCase):
             "GIT_OBJECT_DIRECTORY": str(self.root / "objects"),
             "GIT_WORK_TREE": str(self.root / "other-worktree"),
         }
-        completed_text = subprocess.CompletedProcess([], 0, "", "")
+        completed_bytes = subprocess.CompletedProcess([], 0, b"", b"")
 
         with mock.patch.dict(os.environ, poison, clear=False):
             with mock.patch.object(
-                project_journal.subprocess,
-                "run",
-                return_value=completed_text,
-            ) as run:
+                project_journal,
+                "_capture_bounded_process",
+                return_value=completed_bytes,
+            ) as capture:
                 project_journal._run_git(repo, "rev-parse", "--show-toplevel")
 
         expected_git_env = {
@@ -321,30 +321,25 @@ class ProjectJournalTests(unittest.TestCase):
             for key, value in project_journal.SAFE_GIT_ENV.items()
             if key.startswith("GIT_")
         }
-        for call in run.call_args_list:
-            child_env = call.kwargs["env"]
-            actual_git_env = {
-                key: value for key, value in child_env.items() if key.startswith("GIT_")
-            }
-            self.assertEqual(actual_git_env, expected_git_env)
-            self.assertNotIn("GIT_DIR", child_env)
-            self.assertNotIn("GIT_INDEX_FILE", child_env)
-            self.assertNotIn("GIT_OBJECT_DIRECTORY", child_env)
-            self.assertEqual(child_env["GIT_NO_LAZY_FETCH"], "1")
-            self.assertEqual(child_env["GIT_NO_REPLACE_OBJECTS"], "1")
-            self.assertEqual(child_env["GIT_OPTIONAL_LOCKS"], "0")
-            self.assertEqual(child_env["GIT_TERMINAL_PROMPT"], "0")
-            self.assertEqual(child_env["GIT_ASKPASS"], "")
-            self.assertIn("--no-optional-locks", call.args[0])
-            self.assertIn("core.fsmonitor=false", call.args[0])
-            self.assertIn(
-                f"core.hooksPath={os.devnull}",
-                call.args[0],
-            )
-            self.assertIn(
-                f"core.attributesFile={os.devnull}",
-                call.args[0],
-            )
+        capture.assert_called_once()
+        child_env = capture.call_args.kwargs["env"]
+        actual_git_env = {
+            key: value for key, value in child_env.items() if key.startswith("GIT_")
+        }
+        self.assertEqual(actual_git_env, expected_git_env)
+        self.assertNotIn("GIT_DIR", child_env)
+        self.assertNotIn("GIT_INDEX_FILE", child_env)
+        self.assertNotIn("GIT_OBJECT_DIRECTORY", child_env)
+        self.assertEqual(child_env["GIT_NO_LAZY_FETCH"], "1")
+        self.assertEqual(child_env["GIT_NO_REPLACE_OBJECTS"], "1")
+        self.assertEqual(child_env["GIT_OPTIONAL_LOCKS"], "0")
+        self.assertEqual(child_env["GIT_TERMINAL_PROMPT"], "0")
+        self.assertEqual(child_env["GIT_ASKPASS"], "")
+        argv = capture.call_args.args[0]
+        self.assertIn("--no-optional-locks", argv)
+        self.assertIn("core.fsmonitor=false", argv)
+        self.assertIn(f"core.hooksPath={os.devnull}", argv)
+        self.assertIn(f"core.attributesFile={os.devnull}", argv)
 
     def test_git_runtime_is_fixed_absolute_and_meets_minimum_version(self) -> None:
         runtime = project_journal._GIT_RUNTIME
@@ -898,6 +893,71 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertEqual(snapshot_deadlines, [102.5, 102.5])
         self.assertEqual(batch.call_args.kwargs["deadline"], 102.5)
         self.assertEqual(validate.call_args.kwargs["deadline"], 102.5)
+
+    def test_adoption_command_starts_deadline_before_repo_resolution(self) -> None:
+        repo = self.init_repo().resolve()
+        args = mock.Mock(repo=str(repo))
+        adoption = {
+            "tracked_journal_adopted": False,
+            "tracked_non_generated_journal_count": 0,
+            "valid_tracked_journal_count": 0,
+        }
+
+        with mock.patch.object(
+            project_journal.time,
+            "monotonic",
+            return_value=100.0,
+        ):
+            with mock.patch.object(
+                project_journal,
+                "_resolve_repo",
+                return_value=repo,
+            ) as resolve:
+                with mock.patch.object(
+                    project_journal,
+                    "_tracked_journal_adoption",
+                    return_value=adoption,
+                ) as tracked:
+                    with mock.patch("builtins.print"):
+                        project_journal.command_adoption_status(args)
+
+        expected_deadline = (
+            100.0 + project_journal.GIT_ADOPTION_VALIDATION_TIMEOUT_SECONDS
+        )
+        self.assertEqual(resolve.call_args.kwargs["deadline"], expected_deadline)
+        self.assertEqual(tracked.call_args.kwargs["deadline"], expected_deadline)
+        self.assertEqual(
+            resolve.call_args.kwargs["deadline_error"],
+            "tracked journal adoption validation exceeded its shared deadline",
+        )
+
+    def test_repo_resolution_uses_bounded_capture_with_shared_deadline(self) -> None:
+        repo = self.init_repo().resolve()
+        completed = subprocess.CompletedProcess(
+            [],
+            0,
+            f"{repo}\n".encode(),
+            b"",
+        )
+
+        with mock.patch.object(
+            project_journal,
+            "_capture_bounded_process",
+            return_value=completed,
+        ) as capture:
+            resolved = project_journal._resolve_repo(
+                str(repo),
+                deadline=123.0,
+                deadline_error="shared deadline",
+            )
+
+        self.assertEqual(resolved, repo)
+        self.assertEqual(capture.call_args.kwargs["deadline"], 123.0)
+        self.assertEqual(capture.call_args.kwargs["timeout_error"], "shared deadline")
+        self.assertEqual(
+            capture.call_args.kwargs["operation"],
+            "Git repository resolution",
+        )
 
     def test_frontmatter_and_validation_semantic_caps_fail_closed(self) -> None:
         base_fields = {
@@ -2588,7 +2648,8 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertIn("explicit repo-local `core.hooksPath`", skill)
         self.assertIn("revalidates the snapshot identity and SHA-256", skill)
         self.assertIn("native no-replace or exchange rename semantics", skill)
-        self.assertIn("mismatched exchanged entry is rolled back", skill)
+        self.assertIn("reported recovery locator", skill)
+        self.assertIn("required `O_NOFOLLOW|O_NONBLOCK`", skill)
         self.assertIn("every ancestor identity/access policy", skill)
         self.assertIn("allowing timestamp-only transitions", skill)
         self.assertIn(
@@ -3019,15 +3080,25 @@ class ProjectJournalTests(unittest.TestCase):
             "_rename_hook_entry_with_flag",
             side_effect=rename_with_target_race,
         ):
-            with self.assertRaisesRegex(
-                project_journal.UserError,
-                "hook target changed at atomic commit",
-            ):
+            with self.assertRaises(
+                project_journal._HookExchangeRecoveryRequired,
+            ) as raised:
                 project_journal.command_install_hooks(args)
 
         self.assertTrue(raced)
         installed = repo / ".githooks/post-merge"
-        self.assertTrue(installed.is_symlink())
+        self.assertFalse(installed.is_symlink())
+        self.assertIn(
+            project_journal.HOOK_BEGIN,
+            installed.read_text(encoding="utf-8"),
+        )
+        self.assertIn("preserved recovery locator", str(raised.exception))
+        recoveries = list(
+            (repo / ".githooks").glob(".project-journal-post-merge-*.tmp")
+        )
+        self.assertEqual(len(recoveries), 1)
+        self.assertTrue(recoveries[0].is_symlink())
+        self.assertEqual(recoveries[0].resolve(), outside.resolve())
         self.assertEqual(outside.read_text(encoding="utf-8"), "keep-me\n")
 
     def test_install_hooks_atomic_commit_rejects_racing_regular_target(
@@ -3089,6 +3160,187 @@ class ProjectJournalTests(unittest.TestCase):
                     (repo / ".githooks/post-merge").read_text(encoding="utf-8"),
                     "racing installer\n",
                 )
+
+    def test_install_hooks_preserves_recovery_on_rollback_failure(self) -> None:
+        repo = self.init_repo()
+        configured = run_git(
+            repo,
+            "config",
+            "--local",
+            "core.hooksPath",
+            ".githooks",
+        )
+        self.assertEqual(configured.returncode, 0, configured.stderr)
+        first = self.run_cli("install-hooks", "--repo", str(repo))
+        self.assertEqual(first.returncode, 0, first.stderr)
+        actual_rename = project_journal._rename_hook_entry_with_flag
+        raced = False
+
+        def rename_with_target_race(
+            directory_fd: int,
+            source: str,
+            destination: str,
+            *,
+            exchange: bool,
+        ) -> None:
+            nonlocal raced
+            if destination == "post-merge" and not raced:
+                raced = True
+                target = repo / ".githooks/post-merge"
+                target.unlink()
+                target.write_text("racing installer\n", encoding="utf-8")
+            actual_rename(
+                directory_fd,
+                source,
+                destination,
+                exchange=exchange,
+            )
+
+        args = mock.Mock(repo=str(repo))
+        with mock.patch.object(
+            project_journal,
+            "_rename_hook_entry_with_flag",
+            side_effect=rename_with_target_race,
+        ):
+            with mock.patch.object(
+                project_journal,
+                "_rollback_hook_exchange",
+                return_value="injected rollback failure",
+            ):
+                with self.assertRaises(
+                    project_journal._HookExchangeRecoveryRequired,
+                ) as raised:
+                    project_journal.command_install_hooks(args)
+
+        self.assertIn("preserved recovery locator", str(raised.exception))
+        recoveries = list(
+            (repo / ".githooks").glob(".project-journal-post-merge-*.tmp")
+        )
+        self.assertEqual(len(recoveries), 1)
+        self.assertEqual(
+            recoveries[0].read_text(encoding="utf-8"),
+            "racing installer\n",
+        )
+        self.assertIn(
+            project_journal.HOOK_BEGIN,
+            (repo / ".githooks/post-merge").read_text(encoding="utf-8"),
+        )
+
+    def test_install_hooks_preserves_third_party_write_during_rollback(
+        self,
+    ) -> None:
+        repo = self.init_repo()
+        configured = run_git(
+            repo,
+            "config",
+            "--local",
+            "core.hooksPath",
+            ".githooks",
+        )
+        self.assertEqual(configured.returncode, 0, configured.stderr)
+        first = self.run_cli("install-hooks", "--repo", str(repo))
+        self.assertEqual(first.returncode, 0, first.stderr)
+        actual_rename = project_journal._rename_hook_entry_with_flag
+        exchange_count = 0
+
+        def rename_with_two_races(
+            directory_fd: int,
+            source: str,
+            destination: str,
+            *,
+            exchange: bool,
+        ) -> None:
+            nonlocal exchange_count
+            if destination == "post-merge" and exchange:
+                exchange_count += 1
+                target = repo / ".githooks/post-merge"
+                target.unlink()
+                target.write_text(
+                    (
+                        "racing installer\n"
+                        if exchange_count == 1
+                        else "third-party rollback write\n"
+                    ),
+                    encoding="utf-8",
+                )
+            actual_rename(
+                directory_fd,
+                source,
+                destination,
+                exchange=exchange,
+            )
+
+        args = mock.Mock(repo=str(repo))
+        with mock.patch.object(
+            project_journal,
+            "_rename_hook_entry_with_flag",
+            side_effect=rename_with_two_races,
+        ):
+            with self.assertRaises(
+                project_journal._HookExchangeRecoveryRequired,
+            ) as raised:
+                project_journal.command_install_hooks(args)
+
+        self.assertEqual(exchange_count, 2)
+        self.assertIn("preserved recovery locator", str(raised.exception))
+        recoveries = list(
+            (repo / ".githooks").glob(".project-journal-post-merge-*.tmp")
+        )
+        self.assertEqual(len(recoveries), 1)
+        self.assertEqual(
+            recoveries[0].read_text(encoding="utf-8"),
+            "third-party rollback write\n",
+        )
+        self.assertEqual(
+            (repo / ".githooks/post-merge").read_text(encoding="utf-8"),
+            "racing installer\n",
+        )
+
+    def test_hook_target_fifo_is_rejected_without_blocking(self) -> None:
+        repo = self.init_repo()
+        fifo = repo / ".git/hooks/post-checkout"
+        os.mkfifo(fifo)
+
+        started = time.monotonic()
+        result = self.run_cli("install-hooks", "--repo", str(repo))
+
+        self.assertLess(time.monotonic() - started, 2.0)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("not a regular file", result.stderr)
+
+    def test_hook_target_requires_no_follow_primitive(self) -> None:
+        repo = self.init_repo().resolve()
+        binding = project_journal._bind_hook_directory(
+            project_journal._default_hook_path_plan(repo)
+        )
+        try:
+            with mock.patch.object(
+                project_journal.os,
+                "O_NOFOLLOW",
+                0,
+            ):
+                with self.assertRaisesRegex(
+                    project_journal.UnsupportedPlatform,
+                    "O_NOFOLLOW",
+                ):
+                    project_journal._snapshot_hook_target(binding, "post-merge")
+        finally:
+            project_journal._close_hook_binding(binding)
+
+    def test_hook_installers_are_serialized_by_owner_private_lock(self) -> None:
+        repo = self.init_repo().resolve()
+        first = project_journal._preflight_hook_targets(repo)
+        try:
+            with self.assertRaisesRegex(
+                project_journal.UserError,
+                "another project journal hook installation is active",
+            ):
+                project_journal._preflight_hook_targets(repo)
+        finally:
+            project_journal._close_hook_binding(first)
+
+        second = project_journal._preflight_hook_targets(repo)
+        project_journal._close_hook_binding(second)
 
     def test_install_hooks_refuses_intermediate_component_symlink(self) -> None:
         repo = self.init_repo()
@@ -3540,6 +3792,106 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertIn("config --local core.hooksPath .githooks", result.stderr)
         self.assertFalse((repo / ".git/hooks/post-merge").exists())
 
+    def test_global_config_fifo_is_rejected_without_blocking(self) -> None:
+        config = self.root / "global-config-fifo"
+        os.mkfifo(config)
+
+        started = time.monotonic()
+        with self.assertRaisesRegex(
+            project_journal.UserError,
+            "not a regular file",
+        ):
+            project_journal._global_git_config_entries(config)
+
+        self.assertLess(time.monotonic() - started, 1.0)
+
+    def test_global_config_symlink_replacement_is_not_followed(self) -> None:
+        config = self.root / "global-config"
+        replacement = self.root / "replacement-config"
+        config.write_text("[core]\n", encoding="utf-8")
+        replacement.write_text("[core]\n    hooksPath = attacker\n", encoding="utf-8")
+        actual_open = project_journal.os.open
+        replaced = False
+
+        def open_after_replacement(
+            path: os.PathLike[str] | str,
+            flags: int,
+            *args: object,
+            **kwargs: object,
+        ) -> int:
+            nonlocal replaced
+            if os.fspath(path) == os.fspath(config) and not replaced:
+                replaced = True
+                config.unlink()
+                config.symlink_to(replacement)
+            return actual_open(path, flags, *args, **kwargs)
+
+        with mock.patch.object(
+            project_journal.os,
+            "open",
+            side_effect=open_after_replacement,
+        ):
+            with self.assertRaisesRegex(
+                project_journal.UserError,
+                "symlink|without following links",
+            ):
+                project_journal._global_git_config_entries(config)
+
+        self.assertTrue(replaced)
+        self.assertEqual(
+            replacement.read_text(encoding="utf-8"),
+            "[core]\n    hooksPath = attacker\n",
+        )
+
+    def test_config_snapshot_requires_nonblocking_no_follow_primitives(self) -> None:
+        config = self.root / "global-config"
+        config.write_text("[core]\n", encoding="utf-8")
+
+        for name in ("O_NOFOLLOW", "O_NONBLOCK"):
+            with self.subTest(name=name):
+                with mock.patch.object(project_journal.os, name, 0):
+                    with self.assertRaisesRegex(
+                        project_journal.UnsupportedPlatform,
+                        name,
+                    ):
+                        project_journal._global_git_config_entries(config)
+
+    def test_config_snapshot_allows_timestamp_only_transition(self) -> None:
+        config = self.root / "global-config"
+        content = b"[core]\n"
+        config.write_bytes(content)
+        original = config.stat()
+        actual_read = project_journal.os.read
+        changed = False
+
+        def read_after_timestamp_change(fd: int, size: int) -> bytes:
+            nonlocal changed
+            chunk = actual_read(fd, size)
+            if chunk and not changed:
+                changed = True
+                os.utime(
+                    config,
+                    ns=(
+                        original.st_atime_ns,
+                        original.st_mtime_ns + 1_000_000_000,
+                    ),
+                )
+            return chunk
+
+        with mock.patch.object(
+            project_journal.os,
+            "read",
+            side_effect=read_after_timestamp_change,
+        ):
+            snapshot = project_journal._secure_read_regular_path(
+                config,
+                label="test config",
+                byte_limit=1024,
+            )
+
+        self.assertTrue(changed)
+        self.assertEqual(snapshot, content)
+
     def test_install_hooks_refuses_actual_system_hooks_path_until_local_override(
         self,
     ) -> None:
@@ -3779,6 +4131,43 @@ class ProjectJournalTests(unittest.TestCase):
         for row in rows.values():
             if row["tracked_journal_adopted"] is False:
                 self.assertEqual(row["adoption_status"], "unadopted")
+
+    def test_discover_repos_isolates_repository_resolution_timeout(self) -> None:
+        healthy = self.init_repo("healthy").resolve()
+        stalled = self.root / "stalled"
+        stalled.mkdir()
+        codex_home = self.root / "codex-home"
+        rollout_dir = codex_home / "sessions/2026/05/05"
+        rollout_dir.mkdir(parents=True)
+        (rollout_dir / "rollout-resolution-timeout.jsonl").write_text(
+            json.dumps({"payload": {"cwd": str(stalled)}})
+            + "\n"
+            + json.dumps({"payload": {"cwd": str(healthy)}})
+            + "\n",
+            encoding="utf-8",
+        )
+
+        def resolve_candidate(
+            path_text: str,
+            *,
+            codex_home: pathlib.Path | None = None,
+        ) -> pathlib.Path | None:
+            del codex_home
+            if pathlib.Path(path_text) == stalled:
+                raise project_journal.UserError(
+                    "Git repository resolution timed out after 10 seconds"
+                )
+            return healthy
+
+        with mock.patch.object(
+            project_journal,
+            "_repo_root_for_path",
+            side_effect=resolve_candidate,
+        ):
+            rows = project_journal._discover_repos(codex_home, 9999)
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(pathlib.Path(rows[0]["repo"]), healthy)
 
     def test_discover_repos_isolates_worktree_journal_count_limit(self) -> None:
         healthy = self.init_repo("healthy")
