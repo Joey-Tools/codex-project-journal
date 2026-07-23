@@ -10,6 +10,7 @@ import sys
 import tempfile
 import textwrap
 import unittest
+from unittest import mock
 
 
 SCRIPT = pathlib.Path(__file__).resolve().parents[1] / "scripts" / "project_journal.py"
@@ -287,6 +288,233 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertEqual(status["tracked_non_generated_journal_count"], 1)
         self.assertEqual(status["valid_tracked_journal_count"], 0)
 
+    def test_adoption_status_uses_staged_invalid_blob_not_valid_worktree(
+        self,
+    ) -> None:
+        repo = self.init_repo()
+        journal = self.write_journal(
+            repo,
+            "docs/project_journal/2026/05/2026-05-05-staged-invalid-a1b2c3.md",
+            entry_id="20260505-a1b2c3",
+            title="Staged Invalid",
+            status="paused",
+            updated="2026-05-05",
+        )
+        add = run_git(repo, "add", "--", str(journal.relative_to(repo)))
+        self.assertEqual(add.returncode, 0, add.stderr)
+        journal.write_text(
+            journal.read_text(encoding="utf-8").replace(
+                "status: paused",
+                "status: active",
+            ),
+            encoding="utf-8",
+        )
+
+        status = self.adoption_status(repo)
+
+        self.assertFalse(status["tracked_journal_adopted"])
+        self.assertEqual(status["tracked_non_generated_journal_count"], 1)
+        self.assertEqual(status["valid_tracked_journal_count"], 0)
+
+    def test_adoption_status_uses_staged_valid_blob_not_invalid_worktree(
+        self,
+    ) -> None:
+        repo = self.init_repo()
+        journal = self.write_journal(
+            repo,
+            "docs/project_journal/2026/05/2026-05-05-staged-valid-a1b2c3.md",
+            entry_id="20260505-a1b2c3",
+            title="Staged Valid",
+            status="active",
+            updated="2026-05-05",
+        )
+        add = run_git(repo, "add", "--", str(journal.relative_to(repo)))
+        self.assertEqual(add.returncode, 0, add.stderr)
+        journal.write_text(
+            journal.read_text(encoding="utf-8").replace(
+                "status: active",
+                "status: paused",
+            ),
+            encoding="utf-8",
+        )
+
+        status = self.adoption_status(repo)
+
+        self.assertTrue(status["tracked_journal_adopted"])
+        self.assertEqual(status["tracked_non_generated_journal_count"], 1)
+        self.assertEqual(status["valid_tracked_journal_count"], 1)
+
+    def test_adoption_status_rejects_index_symlink_replaced_by_regular_file(
+        self,
+    ) -> None:
+        repo = self.init_repo()
+        source = self.write_journal(
+            repo,
+            "valid-source.md",
+            entry_id="20260505-a1b2c3",
+            title="Symlink Source",
+            status="active",
+            updated="2026-05-05",
+        )
+        journal = (
+            repo
+            / "docs/project_journal/2026/05/2026-05-05-symlink-a1b2c3.md"
+        )
+        journal.parent.mkdir(parents=True)
+        journal.symlink_to(source)
+        add = run_git(repo, "add", "--", str(journal.relative_to(repo)))
+        self.assertEqual(add.returncode, 0, add.stderr)
+        journal.unlink()
+        journal.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+
+        status = self.adoption_status(repo)
+
+        self.assertFalse(status["tracked_journal_adopted"])
+        self.assertEqual(status["tracked_non_generated_journal_count"], 0)
+        self.assertEqual(status["valid_tracked_journal_count"], 0)
+
+    def test_adoption_status_rejects_conflicted_index_entry(self) -> None:
+        repo = self.init_repo()
+        journal = self.write_journal(
+            repo,
+            "docs/project_journal/2026/05/2026-05-05-conflict-a1b2c3.md",
+            entry_id="20260505-a1b2c3",
+            title="Conflict",
+            status="active",
+            updated="2026-05-05",
+        )
+        blob = run_git(repo, "hash-object", "-w", str(journal))
+        self.assertEqual(blob.returncode, 0, blob.stderr)
+        rel_path = journal.relative_to(repo).as_posix()
+        index_info = "".join(
+            f"100644 {blob.stdout.strip()} {stage}\t{rel_path}\n"
+            for stage in (1, 2, 3)
+        )
+        update = subprocess.run(
+            ["git", "-C", str(repo), "update-index", "--index-info"],
+            check=False,
+            text=True,
+            input=index_info,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.assertEqual(update.returncode, 0, update.stderr)
+
+        status = self.adoption_status(repo)
+
+        self.assertFalse(status["tracked_journal_adopted"])
+        self.assertEqual(status["tracked_non_generated_journal_count"], 0)
+        self.assertEqual(status["valid_tracked_journal_count"], 0)
+
+    def test_adoption_status_checks_generated_marker_in_index_blob(self) -> None:
+        repo = self.init_repo()
+        generated = self.run_cli(
+            "generate",
+            "--repo",
+            str(repo),
+            "--output",
+            "docs/project_journal/custom.md",
+        )
+        self.assertEqual(generated.returncode, 0, generated.stderr)
+        custom_index = repo / "docs/project_journal/custom.md"
+        add = run_git(repo, "add", "--", str(custom_index.relative_to(repo)))
+        self.assertEqual(add.returncode, 0, add.stderr)
+        valid_source = self.write_journal(
+            repo,
+            "valid-source.md",
+            entry_id="20260505-a1b2c3",
+            title="Valid Worktree Replacement",
+            status="active",
+            updated="2026-05-05",
+        )
+        custom_index.write_text(
+            valid_source.read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+
+        status = self.adoption_status(repo)
+
+        self.assertFalse(status["tracked_journal_adopted"])
+        self.assertEqual(status["tracked_non_generated_journal_count"], 0)
+        self.assertEqual(status["valid_tracked_journal_count"], 0)
+
+    def test_adoption_status_fails_closed_when_index_changes_during_validation(
+        self,
+    ) -> None:
+        repo = self.init_repo()
+        journal = self.write_journal(
+            repo,
+            "docs/project_journal/2026/05/2026-05-05-index-race-a1b2c3.md",
+            entry_id="20260505-a1b2c3",
+            title="Index Race",
+            status="active",
+            updated="2026-05-05",
+        )
+        add = run_git(repo, "add", "--", str(journal.relative_to(repo)))
+        self.assertEqual(add.returncode, 0, add.stderr)
+
+        original_read = project_journal._read_index_blob
+        mutated = False
+
+        def read_then_mutate(
+            repo_arg: pathlib.Path,
+            blob: project_journal.IndexJournalBlob,
+        ) -> bytes:
+            nonlocal mutated
+            content = original_read(repo_arg, blob)
+            if not mutated:
+                mutated = True
+                journal.write_text(
+                    journal.read_text(encoding="utf-8").replace(
+                        "status: active",
+                        "status: paused",
+                    ),
+                    encoding="utf-8",
+                )
+                restage = run_git(
+                    repo,
+                    "add",
+                    "--",
+                    str(journal.relative_to(repo)),
+                )
+                self.assertEqual(restage.returncode, 0, restage.stderr)
+            return content
+
+        with mock.patch.object(
+            project_journal,
+            "_read_index_blob",
+            side_effect=read_then_mutate,
+        ):
+            with self.assertRaisesRegex(
+                project_journal.UserError,
+                "Git index changed during validation",
+            ):
+                project_journal._load_entries_from_index(repo)
+
+    def test_parse_index_journal_blobs_handles_raw_paths_and_rejects_malformed(
+        self,
+    ) -> None:
+        oid = b"a" * 40
+        raw_path = b"docs/project_journal/2026/05/non-utf8-\xff.md"
+        parsed = project_journal._parse_index_journal_blobs(
+            b"100644 " + oid + b" 0\t" + raw_path + b"\0"
+        )
+        self.assertEqual(len(parsed), 1)
+        self.assertEqual(os.fsencode(parsed[0].rel_path), raw_path)
+
+        malformed_outputs = (
+            b"100644 " + oid + b" 0\t" + raw_path,
+            b"100644 not-an-oid 0\t" + raw_path + b"\0",
+            b"100644 " + oid + b" 0 docs/project_journal/bad.md\0",
+            b"100644 "
+            + oid
+            + b" 0\tdocs/project_journal/../outside.md\0",
+        )
+        for output in malformed_outputs:
+            with self.subTest(output=output):
+                with self.assertRaises(project_journal.UserError):
+                    project_journal._parse_index_journal_blobs(output)
+
     def test_validate_rejects_invalid_status_and_broken_superseded_link(self) -> None:
         repo = self.init_repo()
         self.write_journal(
@@ -377,6 +605,10 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertIn("adoption-status --repo <path>", skill)
         self.assertIn(
             "Directory presence, untracked files, and an empty or generated-`INDEX.md`-only directory do not establish adoption",
+            skill,
+        )
+        self.assertIn(
+            "accepts only unconflicted stage-0 regular-file entries and validates the exact indexed blob",
             skill,
         )
         self.assertIn(

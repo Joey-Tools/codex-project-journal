@@ -20,6 +20,7 @@ Treat the generated `docs/project_journal/INDEX.md` as a local ignored convenien
 - Read the repo `AGENTS.md`, existing docs, and the user request.
 - Auto-trigger this skill only when repo policy requires project journaling, the bundled helper reports a valid tracked non-generated journal entry, or the task spans Codex sessions, a PR, or a durable workstream.
 - Run the bundled helper's `adoption-status --repo <path>` command to inspect tracked journal evidence. Directory presence, untracked files, and an empty or generated-`INDEX.md`-only directory do not establish adoption.
+- Treat `adoption-status` as index-authoritative: it accepts only unconflicted stage-0 regular-file entries and validates the exact indexed blob. Worktree file type or content cannot create or remove adoption evidence.
 - If a spanning task is the only trigger and the repo has neither an adopted journal nor a policy requirement, treat the trigger as a reason to assess durable state, not as permission to create files.
 - Before introducing the first tracker into an unadopted repo, identify an explicit product need in the user request or established project workflow for repo-owned coordination, recovery, or backlog state. General preference for journaling is not enough.
 - If that need is absent, use the current task, PR, issue, or handoff channel and leave `docs/PROJECT_STATE.md`, `docs/PROJECT_TODO.md`, and `docs/project_journal/` unchanged.
