@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 import pathlib
+import shlex
 import shutil
 import signal
 import subprocess
@@ -50,8 +51,6 @@ class ProjectJournalTests(unittest.TestCase):
         self.root = pathlib.Path(self.tmp.name)
         self.home = self.root / "home"
         self.home.mkdir()
-        self.empty_gitconfig = self.root / "empty-gitconfig"
-        self.empty_gitconfig.write_text("", encoding="utf-8")
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
@@ -70,7 +69,6 @@ class ProjectJournalTests(unittest.TestCase):
             "PATH": os.environ.get("PATH", ""),
             "HOME": str(self.home),
             "GIT_CONFIG_NOSYSTEM": "1",
-            "GIT_CONFIG_GLOBAL": str(self.empty_gitconfig),
         }
         if env is not None:
             base_env.update(env)
@@ -347,6 +345,83 @@ class ProjectJournalTests(unittest.TestCase):
                 f"core.attributesFile={os.devnull}",
                 call.args[0],
             )
+
+    def test_git_runtime_is_fixed_absolute_and_meets_minimum_version(self) -> None:
+        runtime = project_journal._GIT_RUNTIME
+
+        self.assertIsNotNone(runtime)
+        assert runtime is not None
+        self.assertTrue(runtime.executable.is_absolute())
+        self.assertEqual(runtime.executable, runtime.executable.resolve())
+        self.assertGreaterEqual(runtime.version, project_journal.MINIMUM_GIT_VERSION)
+        command = project_journal._git_command(
+            self.root,
+            "rev-parse",
+            "--show-toplevel",
+        )
+        self.assertEqual(command[0], str(runtime.executable))
+
+    def test_old_git_fails_closed_and_discovery_reports_inconclusive(
+        self,
+    ) -> None:
+        repo = self.init_repo()
+        codex_home = self.root / "codex-home"
+        rollout_dir = codex_home / "sessions/2026/05/05"
+        rollout_dir.mkdir(parents=True)
+        (rollout_dir / "rollout-old-git.jsonl").write_text(
+            json.dumps({"payload": {"cwd": str(repo)}}) + "\n",
+            encoding="utf-8",
+        )
+
+        shim_dir = self.root / "old-git-bin"
+        shim_dir.mkdir()
+        shim_log = self.root / "old-git.log"
+        shim = shim_dir / "git"
+        shim.write_text(
+            textwrap.dedent(
+                f"""\
+                #!/bin/sh
+                printf '%s|lazy=%s\\n' "$*" "${{GIT_NO_LAZY_FETCH:-}}" >> {shlex.quote(str(shim_log))}
+                if [ "$1" = "--version" ]; then
+                  if [ "${{GIT_NO_LAZY_FETCH:-}}" != "1" ]; then
+                    exit 91
+                  fi
+                  printf 'git version 2.44.9\\n'
+                  exit 0
+                fi
+                exit 92
+                """
+            ),
+            encoding="utf-8",
+        )
+        shim.chmod(0o755)
+
+        result = self.run_cli(
+            "discover-repos",
+            "--codex-home",
+            str(codex_home),
+            "--since-days",
+            "9999",
+            "--json",
+            env={
+                "PATH": str(shim_dir),
+            },
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = json.loads(result.stdout)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(pathlib.Path(rows[0]["repo"]), repo.resolve())
+        self.assertEqual(rows[0]["adoption_status"], "inconclusive")
+        self.assertEqual(
+            rows[0]["adoption_error"]["code"],
+            "unsupported_git_version",
+        )
+        self.assertIn("Git >= 2.45 is required", rows[0]["adoption_error"]["message"])
+        self.assertIsNone(rows[0]["index_ignored"])
+        invocations = shim_log.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(invocations, ["--version|lazy=1"])
+        self.assertNotIn("fsmonitor", "\n".join(invocations))
 
     def test_adoption_status_ignores_poisoned_git_repo_and_object_env(
         self,
@@ -699,16 +774,205 @@ class ProjectJournalTests(unittest.TestCase):
                     "_read_index_blobs_batch",
                     return_value=[],
                 ) as batch:
-                    project_journal._load_entries_from_index(
-                        repo,
-                        timeout_seconds=2.5,
-                    )
+                    with mock.patch.object(
+                        project_journal,
+                        "_validate_entries",
+                        wraps=project_journal._validate_entries,
+                    ) as validate:
+                        project_journal._load_entries_from_index(
+                            repo,
+                            timeout_seconds=2.5,
+                        )
 
         snapshot_deadlines = [
             call.kwargs["deadline"] for call in snapshot.call_args_list
         ]
         self.assertEqual(snapshot_deadlines, [102.5, 102.5])
         self.assertEqual(batch.call_args.kwargs["deadline"], 102.5)
+        self.assertEqual(validate.call_args.kwargs["deadline"], 102.5)
+
+    def test_frontmatter_and_validation_semantic_caps_fail_closed(self) -> None:
+        base_fields = {
+            "id": "20260723-a1b2c3",
+            "title": "Cap Test",
+            "status": "active",
+            "created": "2026-07-23",
+            "updated": "2026-07-23",
+            "branch": "",
+            "pr": "",
+            "supersedes": [],
+            "superseded_by": "",
+        }
+
+        too_many_fields = "\n".join(
+            ["---"]
+            + [
+                f"field_{index}: value"
+                for index in range(project_journal.MAX_FRONTMATTER_FIELDS + 1)
+            ]
+            + ["---"]
+        )
+        with self.assertRaisesRegex(
+            project_journal.UserError,
+            "frontmatter exceeds",
+        ):
+            project_journal._parse_frontmatter_text(
+                too_many_fields,
+                "too-many-fields.md",
+            )
+
+        aliases = ", ".join(
+            f"alias-{index}"
+            for index in range(project_journal.MAX_FRONTMATTER_LIST_ITEMS + 1)
+        )
+        with self.assertRaisesRegex(project_journal.UserError, "list items"):
+            project_journal._parse_frontmatter_text(
+                f"---\naliases: [{aliases}]\n---\n",
+                "too-many-aliases.md",
+            )
+
+        block_supersedes = "\n".join(
+            ["---", "supersedes:"]
+            + [
+                f"  - missing-{index}"
+                for index in range(project_journal.MAX_FRONTMATTER_LIST_ITEMS + 1)
+            ]
+            + ["---"]
+        )
+        with self.assertRaisesRegex(project_journal.UserError, "list items"):
+            project_journal._parse_frontmatter_text(
+                block_supersedes,
+                "too-many-supersedes.md",
+            )
+
+        per_entry = project_journal.JournalEntry(
+            path=self.root / "per-entry.md",
+            rel_path="docs/project_journal/per-entry.md",
+            fields={
+                **base_fields,
+                "supersedes": [
+                    f"missing-{index}"
+                    for index in range(
+                        project_journal.MAX_VALIDATION_ISSUES_PER_ENTRY + 1
+                    )
+                ],
+            },
+        )
+        with self.assertRaisesRegex(
+            project_journal.UserError,
+            "validation issues exceed .* per entry",
+        ):
+            project_journal._validate_entries([per_entry])
+
+        invalid_entries = [
+            project_journal.JournalEntry(
+                path=self.root / f"invalid-{index}.md",
+                rel_path=f"docs/project_journal/invalid-{index}.md",
+                fields={
+                    **base_fields,
+                    "id": f"20260723-{index:06d}",
+                    "status": "invalid",
+                    "created": "bad",
+                    "updated": "bad",
+                },
+            )
+            for index in range(project_journal.MAX_VALIDATION_ISSUES_TOTAL // 3 + 2)
+        ]
+        with self.assertRaisesRegex(
+            project_journal.UserError,
+            "validation issues exceed .* total",
+        ):
+            project_journal._validate_entries(invalid_entries)
+
+        with self.assertRaisesRegex(
+            project_journal.UserError,
+            "entry count exceeds",
+        ):
+            project_journal._validate_entries(
+                [per_entry] * (project_journal.MAX_JOURNAL_ENTRIES + 1)
+            )
+
+    def test_semantic_cap_in_one_repo_isolated_by_discovery(self) -> None:
+        healthy = self.init_repo("healthy-semantic")
+        healthy_journal = self.write_journal(
+            healthy,
+            "docs/project_journal/2026/07/healthy.md",
+            entry_id="20260723-healthy",
+            title="Healthy",
+            status="active",
+            updated="2026-07-23",
+        )
+        self.assertEqual(
+            run_git(
+                healthy,
+                "add",
+                "--",
+                str(healthy_journal.relative_to(healthy)),
+            ).returncode,
+            0,
+        )
+
+        oversized = self.init_repo("oversized-semantic")
+        oversized_journal = self.write_journal(
+            oversized,
+            "docs/project_journal/2026/07/oversized.md",
+            entry_id="20260723-oversized",
+            title="Oversized",
+            status="active",
+            updated="2026-07-23",
+        )
+        aliases = ", ".join(
+            f"alias-{index}"
+            for index in range(project_journal.MAX_FRONTMATTER_LIST_ITEMS + 1)
+        )
+        oversized_journal.write_text(
+            oversized_journal.read_text(encoding="utf-8").replace(
+                "---\n\n## Summary",
+                f"aliases: [{aliases}]\n---\n\n## Summary",
+            ),
+            encoding="utf-8",
+        )
+        self.assertEqual(
+            run_git(
+                oversized,
+                "add",
+                "--",
+                str(oversized_journal.relative_to(oversized)),
+            ).returncode,
+            0,
+        )
+
+        codex_home = self.root / "codex-home"
+        rollout_dir = codex_home / "sessions/2026/07/23"
+        rollout_dir.mkdir(parents=True)
+        (rollout_dir / "rollout-semantic-caps.jsonl").write_text(
+            json.dumps({"payload": {"cwd": str(healthy)}})
+            + "\n"
+            + json.dumps({"payload": {"cwd": str(oversized)}})
+            + "\n",
+            encoding="utf-8",
+        )
+        result = self.run_cli(
+            "discover-repos",
+            "--codex-home",
+            str(codex_home),
+            "--since-days",
+            "9999",
+            "--json",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = {
+            pathlib.Path(row["repo"]).name: row for row in json.loads(result.stdout)
+        }
+        self.assertEqual(rows["healthy-semantic"]["adoption_status"], "adopted")
+        oversized_row = rows["oversized-semantic"]
+        self.assertEqual(oversized_row["adoption_status"], "inconclusive")
+        self.assertEqual(
+            oversized_row["adoption_error"]["code"],
+            "journal_semantic_limit_exceeded",
+        )
+        self.assertIn("list items", oversized_row["adoption_error"]["message"])
 
     def test_parse_index_journal_blobs_handles_raw_paths_and_rejects_malformed(
         self,
@@ -1253,6 +1517,145 @@ class ProjectJournalTests(unittest.TestCase):
         )
         self.assertIn(
             "cleanup-incomplete: process-group cleanup was interrupted",
+            detail,
+        )
+
+    @unittest.skipUnless(os.name == "posix", "POSIX process-group contract")
+    def test_async_interrupt_at_cleanup_handoff_never_signals_or_retries(
+        self,
+    ) -> None:
+        spawned: list[subprocess.Popen[bytes]] = []
+        original_popen = subprocess.Popen
+        original_claim = project_journal._ProcessOwnership.claim_group_cleanup
+        interrupted = False
+
+        def capture_popen(
+            *args: object,
+            **kwargs: object,
+        ) -> subprocess.Popen[bytes]:
+            process = original_popen(*args, **kwargs)
+            spawned.append(process)
+            return process
+
+        def claim_then_interrupt(
+            ownership: project_journal._ProcessOwnership,
+        ) -> None:
+            nonlocal interrupted
+            original_claim(ownership)
+            if not interrupted:
+                interrupted = True
+                raise KeyboardInterrupt
+
+        parser = project_journal._IndexStageStreamParser()
+        try:
+            with mock.patch.object(
+                project_journal.subprocess,
+                "Popen",
+                side_effect=capture_popen,
+            ):
+                with mock.patch.object(
+                    project_journal._ProcessOwnership,
+                    "claim_group_cleanup",
+                    side_effect=claim_then_interrupt,
+                    autospec=True,
+                ):
+                    with mock.patch.object(
+                        project_journal,
+                        "_terminate_process_group_and_reap",
+                    ) as cleanup:
+                        with mock.patch.object(
+                            project_journal,
+                            "_signal_process_group",
+                        ) as signal_group:
+                            with self.assertRaises(KeyboardInterrupt) as raised:
+                                self.capture_process(
+                                    [
+                                        sys.executable,
+                                        "-c",
+                                        "import os; os.write(1, b'invalid')",
+                                    ],
+                                    timeout_seconds=5,
+                                    stdout_limit=1024,
+                                    stdout_feed=parser.feed,
+                                    stdout_finish=parser.finish,
+                                )
+        finally:
+            for process in spawned:
+                process.wait(timeout=5)
+
+        cleanup.assert_not_called()
+        signal_group.assert_not_called()
+        detail = "\n".join(
+            [
+                *getattr(raised.exception, "__notes__", ()),
+                *(str(value) for value in raised.exception.args),
+            ]
+        )
+        self.assertIn(
+            "cleanup-incomplete: process-group cleanup was interrupted",
+            detail,
+        )
+
+    @unittest.skipUnless(os.name == "posix", "POSIX process-group contract")
+    def test_async_interrupt_after_reap_handoff_reaps_without_resignal(
+        self,
+    ) -> None:
+        spawned: list[subprocess.Popen[bytes]] = []
+        original_popen = subprocess.Popen
+        original_transfer = project_journal._ProcessOwnership.transfer_to_reap
+        interrupted = False
+
+        def capture_popen(
+            *args: object,
+            **kwargs: object,
+        ) -> subprocess.Popen[bytes]:
+            process = original_popen(*args, **kwargs)
+            spawned.append(process)
+            return process
+
+        def transfer_then_interrupt(
+            ownership: project_journal._ProcessOwnership,
+            expected_returncode: int | None,
+        ) -> None:
+            nonlocal interrupted
+            original_transfer(ownership, expected_returncode)
+            if not interrupted:
+                interrupted = True
+                raise KeyboardInterrupt
+
+        with mock.patch.object(
+            project_journal.subprocess,
+            "Popen",
+            side_effect=capture_popen,
+        ):
+            with mock.patch.object(
+                project_journal._ProcessOwnership,
+                "transfer_to_reap",
+                side_effect=transfer_then_interrupt,
+                autospec=True,
+            ):
+                with mock.patch.object(
+                    project_journal,
+                    "_signal_process_group",
+                ) as signal_group:
+                    with self.assertRaises(KeyboardInterrupt) as raised:
+                        self.capture_process(
+                            [sys.executable, "-c", "pass"],
+                            timeout_seconds=5,
+                            stdout_limit=1024,
+                        )
+
+        signal_group.assert_not_called()
+        self.assertEqual(len(spawned), 1)
+        self.assertIsNotNone(spawned[0].returncode)
+        detail = "\n".join(
+            [
+                *getattr(raised.exception, "__notes__", ()),
+                *(str(value) for value in raised.exception.args),
+            ]
+        )
+        self.assertIn(
+            "cleanup-incomplete: final direct-child reap was interrupted",
             detail,
         )
 
@@ -1901,12 +2304,21 @@ class ProjectJournalTests(unittest.TestCase):
             skill,
         )
         self.assertIn("clears ambient Git control variables", skill)
+        self.assertIn("bounded credential-free `git --version` gate", skill)
+        self.assertIn("Git older than 2.45 fails closed", skill)
         self.assertIn("one absolute monotonic deadline", skill)
-        self.assertIn("index byte/record/stderr", skill)
+        self.assertIn("frontmatter parsing, semantic validation", skill)
+        self.assertIn("frontmatter field/list, validation-issue", skill)
+        self.assertIn("Per-path validation state is structured", skill)
+        self.assertIn(
+            "index, entry, frontmatter field/list, validation-issue, byte, record, and stderr limits",
+            skill,
+        )
         self.assertIn("one bounded `git cat-file --batch` session", skill)
         self.assertIn("final raw index revalidation", skill)
         self.assertIn("stays unreaped as the PID/PGID identity fence", skill)
         self.assertIn("status is observed with `WNOWAIT`", skill)
+        self.assertIn("explicit ownership states", skill)
         self.assertIn(
             "no numeric PGID is signalled after that fence is released",
             skill,
@@ -1916,6 +2328,9 @@ class ProjectJournalTests(unittest.TestCase):
             "`inconclusive` carries a structured `adoption_error` and null adoption fields",
             skill,
         )
+        self.assertIn("actual global Git config", skill)
+        self.assertIn("without following includes", skill)
+        self.assertIn("explicit repo-local `core.hooksPath`", skill)
         self.assertIn(
             "leave `docs/PROJECT_STATE.md`, `docs/PROJECT_TODO.md`, and `docs/project_journal/` unchanged",
             skill,
@@ -1985,12 +2400,17 @@ class ProjectJournalTests(unittest.TestCase):
             readme,
         )
         self.assertIn("ignores ambient Git control/configuration redirections", readme)
+        self.assertIn("requires a bounded credential-free version result", readme)
         self.assertIn("byte, record, and stderr bounds", readme)
         self.assertIn("one bounded `git cat-file --batch` session", readme)
         self.assertIn("one absolute monotonic deadline", readme)
+        self.assertIn("structured per-path validity", readme)
+        self.assertIn("entry/field/list/issue budgets", readme)
         self.assertIn("unreaped direct child fences the PID/PGID", readme)
+        self.assertIn("Explicit cleanup ownership states", readme)
         self.assertIn("never signals a numeric PGID after the final reap", readme)
         self.assertIn("reports `cleanup-incomplete`", readme)
+        self.assertIn("global `core.hooksPath`", readme)
         self.assertIn("`adopted`, `unadopted`, or `inconclusive`", readme)
         self.assertIn(
             "explicit product need justifies first adoption",
@@ -2370,9 +2790,11 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertFalse((repo / "post-merge").exists())
         self.assertFalse((repo / ".git/hooks/post-merge").exists())
 
-    def test_install_hooks_ignores_ambient_global_hooks_path(self) -> None:
+    def test_install_hooks_refuses_actual_global_hooks_path_until_local_override(
+        self,
+    ) -> None:
         repo = self.init_repo()
-        global_config = self.root / "global-gitconfig"
+        global_config = self.home / ".gitconfig"
         global_hooks = self.root / "global-hooks"
         global_config.write_text(
             textwrap.dedent(
@@ -2383,15 +2805,99 @@ class ProjectJournalTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
-        env = {
-            "GIT_CONFIG_GLOBAL": str(global_config),
+        actual_git_env = {
+            "HOME": str(self.home),
+            "GIT_CONFIG_NOSYSTEM": "1",
             "PATH": os.environ.get("PATH", ""),
         }
+        selected_git = str(project_journal._fixed_git_executable())
+        actual_before = subprocess.run(
+            [
+                selected_git,
+                "-C",
+                str(repo),
+                "config",
+                "--get",
+                "core.hooksPath",
+            ],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=actual_git_env,
+        )
+        self.assertEqual(actual_before.returncode, 0, actual_before.stderr)
+        self.assertEqual(actual_before.stdout.strip(), str(global_hooks))
 
-        result = self.run_cli("install-hooks", "--repo", str(repo), env=env)
+        refused = self.run_cli("install-hooks", "--repo", str(repo))
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("global core.hooksPath is set", refused.stderr)
+        self.assertIn("config --local core.hooksPath .githooks", refused.stderr)
+        self.assertFalse((repo / ".git/hooks/post-merge").exists())
+        self.assertFalse((global_hooks / "post-merge").exists())
+
+        local_override = run_git(
+            repo,
+            "config",
+            "--local",
+            "core.hooksPath",
+            ".githooks",
+        )
+        self.assertEqual(local_override.returncode, 0, local_override.stderr)
+        installed = self.run_cli("install-hooks", "--repo", str(repo))
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        expected_hook = repo / ".githooks/post-merge"
+        self.assertTrue(expected_hook.exists())
+        actual_hook = subprocess.run(
+            [
+                selected_git,
+                "-C",
+                str(repo),
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-path",
+                "hooks/post-merge",
+            ],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=actual_git_env,
+        )
+        self.assertEqual(actual_hook.returncode, 0, actual_hook.stderr)
+        self.assertEqual(
+            pathlib.Path(actual_hook.stdout.strip()).resolve(),
+            expected_hook.resolve(),
+        )
+
+    def test_install_hooks_refuses_unfollowed_global_include(self) -> None:
+        repo = self.init_repo()
+        included = self.root / "invalid-included-gitconfig"
+        included.write_text("[invalid\n", encoding="utf-8")
+        (self.home / ".gitconfig").write_text(
+            f"[include]\n    path = {included}\n",
+            encoding="utf-8",
+        )
+
+        result = self.run_cli("install-hooks", "--repo", str(repo))
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("does not follow global includes", result.stderr)
+        self.assertIn("config --local core.hooksPath .githooks", result.stderr)
+        self.assertFalse((repo / ".git/hooks/post-merge").exists())
+
+    def test_install_hooks_accepts_explicitly_disabled_global_config(self) -> None:
+        repo = self.init_repo()
+
+        result = self.run_cli(
+            "install-hooks",
+            "--repo",
+            str(repo),
+            env={"GIT_CONFIG_GLOBAL": os.devnull},
+        )
+
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue((repo / ".git/hooks/post-merge").exists())
-        self.assertFalse((global_hooks / "post-merge").exists())
 
     def test_install_hooks_refuses_configured_hooks_path_outside_repo(self) -> None:
         for name, hooks_path in (

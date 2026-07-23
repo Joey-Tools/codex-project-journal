@@ -12,10 +12,12 @@ import pathlib
 import re
 import selectors
 import shlex
+import shutil
 import signal
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import Callable
 from typing import Any
@@ -55,13 +57,30 @@ MAX_TRACKED_JOURNAL_BATCH_STDOUT_BYTES = (
     MAX_TRACKED_JOURNAL_TOTAL_BYTES
     + MAX_TRACKED_JOURNAL_RECORDS * (MAX_CAT_FILE_BATCH_HEADER_BYTES + 2)
 )
+MAX_JOURNAL_ENTRIES = MAX_TRACKED_JOURNAL_RECORDS
+MAX_FRONTMATTER_LINES = 2048
+MAX_FRONTMATTER_FIELDS = 64
+MAX_FRONTMATTER_LIST_ITEMS = 256
+MAX_FRONTMATTER_VALUE_CHARS = 64 * 1024
+MAX_FRONTMATTER_LIST_ITEM_CHARS = 4096
+MAX_VALIDATION_ISSUES_PER_ENTRY = 64
+MAX_VALIDATION_ISSUES_TOTAL = 2048
 MAX_GIT_STDERR_BYTES = 64 * 1024
+MAX_GIT_VERSION_OUTPUT_BYTES = 4096
+MAX_GLOBAL_GIT_CONFIG_OUTPUT_BYTES = 16 * 1024
+MAX_GLOBAL_GIT_CONFIG_SOURCE_BYTES = 1024 * 1024
 GIT_INDEX_SNAPSHOT_TIMEOUT_SECONDS = 10.0
 GIT_CAT_FILE_BATCH_TIMEOUT_SECONDS = 10.0
 GIT_ADOPTION_VALIDATION_TIMEOUT_SECONDS = 10.0
+GIT_VERSION_TIMEOUT_SECONDS = 2.0
+GIT_CONFIG_QUERY_TIMEOUT_SECONDS = 5.0
 GIT_PROCESS_TERMINATE_GRACE_SECONDS = 0.25
 GIT_PROCESS_KILL_DRAIN_SECONDS = 1.0
 PROCESS_READ_CHUNK_BYTES = 64 * 1024
+MINIMUM_GIT_VERSION = (2, 45, 0)
+GIT_VERSION_RE = re.compile(
+    rb"\Agit version ([0-9]+)\.([0-9]+)(?:\.([0-9]+))?(?:[ .].*)?\n?\Z"
+)
 GIT_ENV_PASSTHROUGH = (
     "HOME",
     "LANG",
@@ -72,6 +91,11 @@ GIT_ENV_PASSTHROUGH = (
     "TEMP",
     "TMP",
     "TMPDIR",
+)
+GLOBAL_CONFIG_GIT_ENV_PASSTHROUGH = (
+    *GIT_ENV_PASSTHROUGH,
+    "GIT_CONFIG_GLOBAL",
+    "XDG_CONFIG_HOME",
 )
 SAFE_GIT_ENV = {
     "GIT_ASKPASS": "",
@@ -106,6 +130,18 @@ SAFE_GIT_CONFIG_ARGS = (
 
 class UserError(Exception):
     """A clean user-facing error."""
+
+
+class UnsupportedGitVersion(UserError):
+    """The fixed Git runtime cannot satisfy the helper's safety contract."""
+
+    code = "unsupported_git_version"
+
+
+class JournalLimitExceeded(UserError):
+    """Journal syntax or validation exceeded a declared semantic budget."""
+
+    code = "journal_semantic_limit_exceeded"
 
 
 class _ProcessIdentityLost(UserError):
@@ -153,15 +189,128 @@ class _ProcessSignalResult:
     error: str | None = None
 
 
+@dataclasses.dataclass(frozen=True)
+class _GitRuntime:
+    executable: pathlib.Path
+    version: tuple[int, int, int]
+
+
+@dataclasses.dataclass(frozen=True)
+class _ValidationReport:
+    issues: tuple[str, ...]
+    invalid_paths: frozenset[str]
+
+
+@dataclasses.dataclass(frozen=True)
+class _IndexedJournalLoad:
+    entries: tuple[JournalEntry, ...]
+    validation: _ValidationReport
+    non_generated_count: int
+    valid_count: int
+
+
+class _IssueCollector:
+    def __init__(self) -> None:
+        self._issues: list[str] = []
+        self._invalid_paths: set[str] = set()
+        self._per_path_count: dict[str, int] = {}
+
+    def add(self, rel_path: str, detail: str) -> None:
+        current = self._per_path_count.get(rel_path, 0)
+        if current >= MAX_VALIDATION_ISSUES_PER_ENTRY:
+            raise JournalLimitExceeded(
+                f"{rel_path}: validation issues exceed "
+                f"{MAX_VALIDATION_ISSUES_PER_ENTRY} per entry"
+            )
+        if len(self._issues) >= MAX_VALIDATION_ISSUES_TOTAL:
+            raise JournalLimitExceeded(
+                f"journal validation issues exceed {MAX_VALIDATION_ISSUES_TOTAL} total"
+            )
+        prefix = f"{rel_path}:"
+        issue = detail if detail.startswith(prefix) else f"{prefix} {detail}"
+        self._issues.append(issue)
+        self._invalid_paths.add(rel_path)
+        self._per_path_count[rel_path] = current + 1
+
+    def report(self) -> _ValidationReport:
+        return _ValidationReport(
+            issues=tuple(self._issues),
+            invalid_paths=frozenset(self._invalid_paths),
+        )
+
+
+@dataclasses.dataclass
+class _ProcessOwnership:
+    """Track whether numeric group signalling or only a final reap is allowed."""
+
+    state: str
+    expected_returncode: int | None = None
+
+    @classmethod
+    def for_process(cls) -> _ProcessOwnership:
+        return cls("group-owned" if os.name == "posix" else "child-owned")
+
+    @property
+    def permits_group_cleanup(self) -> bool:
+        return self.state in {"group-owned", "child-owned"}
+
+    @property
+    def needs_reap(self) -> bool:
+        return self.state == "reap-only"
+
+    def claim_group_cleanup(self) -> None:
+        if not self.permits_group_cleanup:
+            raise RuntimeError(f"invalid cleanup ownership state {self.state!r}")
+        self.state = "cleanup-claimed"
+
+    def transfer_to_reap(self, expected_returncode: int | None) -> None:
+        if self.state not in {
+            "group-owned",
+            "child-owned",
+            "cleanup-claimed",
+        }:
+            raise RuntimeError(f"invalid reap ownership state {self.state!r}")
+        self.expected_returncode = expected_returncode
+        self.state = "reap-only"
+
+    def release(self) -> None:
+        self.state = "released"
+
+    def abandon_incomplete(self) -> None:
+        self.state = "cleanup-incomplete"
+
+
+_GIT_RUNTIME: _GitRuntime | None = None
+_GIT_RUNTIME_ERROR: UnsupportedGitVersion | None = None
+
+
 def _git_environment() -> dict[str, str]:
     env = {key: os.environ[key] for key in GIT_ENV_PASSTHROUGH if key in os.environ}
     env.update(SAFE_GIT_ENV)
     return env
 
 
+def _global_config_git_environment() -> dict[str, str]:
+    env = {
+        key: os.environ[key]
+        for key in GLOBAL_CONFIG_GIT_ENV_PASSTHROUGH
+        if key in os.environ
+    }
+    env.update(SAFE_GIT_ENV)
+    return env
+
+
+def _fixed_git_executable() -> pathlib.Path:
+    if _GIT_RUNTIME_ERROR is not None:
+        raise _GIT_RUNTIME_ERROR
+    if _GIT_RUNTIME is None:
+        raise UnsupportedGitVersion("Git runtime validation did not complete")
+    return _GIT_RUNTIME.executable
+
+
 def _git_command(repo: pathlib.Path, *args: str) -> list[str]:
     return [
-        "git",
+        str(_fixed_git_executable()),
         "--no-pager",
         "--no-optional-locks",
         *SAFE_GIT_CONFIG_ARGS,
@@ -229,27 +378,89 @@ def _strip_quotes(value: str) -> str:
     return value
 
 
-def _parse_scalar(value: str) -> Any:
+def _check_deadline(deadline: float | None, error: str) -> None:
+    if deadline is not None and time.monotonic() >= deadline:
+        raise UserError(error)
+
+
+def _validate_frontmatter_value(
+    value: str,
+    *,
+    label: str,
+    field: str,
+    list_item: bool = False,
+) -> str:
+    limit = (
+        MAX_FRONTMATTER_LIST_ITEM_CHARS if list_item else MAX_FRONTMATTER_VALUE_CHARS
+    )
+    if len(value) > limit:
+        kind = "list item" if list_item else "value"
+        raise JournalLimitExceeded(
+            f"{label}: field {field!r} {kind} exceeds {limit} characters"
+        )
+    return value
+
+
+def _parse_scalar(
+    value: str,
+    *,
+    label: str,
+    field: str,
+    deadline: float | None = None,
+    deadline_error: str = "journal validation exceeded its shared deadline",
+) -> Any:
+    _check_deadline(deadline, deadline_error)
     value = value.strip()
+    _validate_frontmatter_value(value, label=label, field=field)
     if value == "[]":
         return []
     if value.startswith("[") and value.endswith("]"):
         inner = value[1:-1].strip()
         if not inner:
             return []
-        return [
-            _strip_quotes(part.strip()) for part in inner.split(",") if part.strip()
-        ]
+        raw_parts = inner.split(",", MAX_FRONTMATTER_LIST_ITEMS)
+        if len(raw_parts) > MAX_FRONTMATTER_LIST_ITEMS:
+            raise JournalLimitExceeded(
+                f"{label}: field {field!r} exceeds "
+                f"{MAX_FRONTMATTER_LIST_ITEMS} list items"
+            )
+        items: list[str] = []
+        for raw_part in raw_parts:
+            _check_deadline(deadline, deadline_error)
+            part = _strip_quotes(raw_part.strip())
+            if not part:
+                continue
+            items.append(
+                _validate_frontmatter_value(
+                    part,
+                    label=label,
+                    field=field,
+                    list_item=True,
+                )
+            )
+        return items
     return _strip_quotes(value)
 
 
-def _parse_frontmatter_text(text: str, label: str) -> dict[str, Any]:
+def _parse_frontmatter_text(
+    text: str,
+    label: str,
+    *,
+    deadline: float | None = None,
+    deadline_error: str = "journal validation exceeded its shared deadline",
+) -> dict[str, Any]:
+    _check_deadline(deadline, deadline_error)
+    if text.count("\n") + 1 > MAX_FRONTMATTER_LINES:
+        raise JournalLimitExceeded(
+            f"{label}: document exceeds {MAX_FRONTMATTER_LINES} lines"
+        )
     lines = text.splitlines()
     if not lines or lines[0].strip() != "---":
         raise UserError(f"{label}: missing frontmatter")
 
     end = None
     for index, line in enumerate(lines[1:], start=1):
+        _check_deadline(deadline, deadline_error)
         if line.strip() == "---":
             end = index
             break
@@ -258,7 +469,9 @@ def _parse_frontmatter_text(text: str, label: str) -> dict[str, Any]:
 
     fields: dict[str, Any] = {}
     current_key: str | None = None
+    field_count = 0
     for raw_line in lines[1:end]:
+        _check_deadline(deadline, deadline_error)
         if not raw_line.strip():
             continue
         if raw_line.startswith((" ", "\t")):
@@ -270,7 +483,21 @@ def _parse_frontmatter_text(text: str, label: str) -> dict[str, Any]:
                 if not isinstance(existing, list):
                     existing = []
                     fields[current_key] = existing
-                existing.append(_strip_quotes(stripped[2:].strip()))
+                if len(existing) >= MAX_FRONTMATTER_LIST_ITEMS:
+                    raise JournalLimitExceeded(
+                        f"{label}: field {current_key!r} exceeds "
+                        f"{MAX_FRONTMATTER_LIST_ITEMS} list items"
+                    )
+                item = _strip_quotes(stripped[2:].strip())
+                if item:
+                    existing.append(
+                        _validate_frontmatter_value(
+                            item,
+                            label=label,
+                            field=current_key,
+                            list_item=True,
+                        )
+                    )
             continue
         if ":" not in raw_line:
             raise UserError(f"{label}: invalid frontmatter line: {raw_line}")
@@ -278,24 +505,80 @@ def _parse_frontmatter_text(text: str, label: str) -> dict[str, Any]:
         key = key.strip()
         if not key:
             raise UserError(f"{label}: empty frontmatter key")
-        fields[key] = _parse_scalar(raw_value)
+        field_count += 1
+        if field_count > MAX_FRONTMATTER_FIELDS:
+            raise JournalLimitExceeded(
+                f"{label}: frontmatter exceeds {MAX_FRONTMATTER_FIELDS} fields"
+            )
+        fields[key] = _parse_scalar(
+            raw_value,
+            label=label,
+            field=key,
+            deadline=deadline,
+            deadline_error=deadline_error,
+        )
         current_key = key
     return fields
 
 
 def _parse_frontmatter(path: pathlib.Path) -> dict[str, Any]:
-    return _parse_frontmatter_text(
-        path.read_text(encoding="utf-8"),
-        str(path),
-    )
+    content = path.read_bytes()
+    if len(content) > MAX_TRACKED_JOURNAL_BLOB_BYTES:
+        raise JournalLimitExceeded(
+            f"{path}: journal file exceeds {MAX_TRACKED_JOURNAL_BLOB_BYTES} bytes"
+        )
+    try:
+        text = content.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise UserError(f"{path}: journal file is not valid UTF-8") from exc
+    return _parse_frontmatter_text(text, str(path))
 
 
-def _as_list(value: Any) -> list[str]:
+def _as_list(
+    value: Any,
+    *,
+    label: str,
+    field: str,
+    deadline: float | None = None,
+    deadline_error: str = "journal validation exceeded its shared deadline",
+) -> list[str]:
+    _check_deadline(deadline, deadline_error)
     if value is None or value == "":
         return []
     if isinstance(value, list):
-        return [str(item).strip() for item in value if str(item).strip()]
-    return [str(value).strip()]
+        if len(value) > MAX_FRONTMATTER_LIST_ITEMS:
+            raise JournalLimitExceeded(
+                f"{label}: field {field!r} exceeds "
+                f"{MAX_FRONTMATTER_LIST_ITEMS} list items"
+            )
+        items: list[str] = []
+        for item in value:
+            _check_deadline(deadline, deadline_error)
+            text = str(item).strip()
+            if not text:
+                continue
+            items.append(
+                _validate_frontmatter_value(
+                    text,
+                    label=label,
+                    field=field,
+                    list_item=True,
+                )
+            )
+        return items
+    text = str(value).strip()
+    return (
+        [
+            _validate_frontmatter_value(
+                text,
+                label=label,
+                field=field,
+                list_item=True,
+            )
+        ]
+        if text
+        else []
+    )
 
 
 def _journal_paths(repo: pathlib.Path) -> list[pathlib.Path]:
@@ -307,6 +590,10 @@ def _journal_paths(repo: pathlib.Path) -> list[pathlib.Path]:
         if _is_generated_index(path):
             continue
         paths.append(path)
+        if len(paths) > MAX_JOURNAL_ENTRIES:
+            raise JournalLimitExceeded(
+                f"journal entry count exceeds {MAX_JOURNAL_ENTRIES}"
+            )
     return sorted(paths)
 
 
@@ -736,12 +1023,24 @@ def _annotate_cleanup_interruption(
 def _terminate_process_group_and_reap(
     process: subprocess.Popen[bytes],
     selector: selectors.BaseSelector,
+    ownership: _ProcessOwnership | None = None,
 ) -> str | None:
     """Clean up while the unreaped direct child still fences its PID/PGID."""
+    if ownership is None:
+        ownership = _ProcessOwnership.for_process()
+        ownership.claim_group_cleanup()
+    elif ownership.state != "cleanup-claimed":
+        raise RuntimeError(
+            f"cleanup requires claimed ownership, got {ownership.state!r}"
+        )
+
     issues: list[str] = []
     observed_returncode: int | None = None
+    kill_deadline = time.monotonic() + GIT_PROCESS_KILL_DRAIN_SECONDS
 
-    if os.name == "posix":
+    if isinstance(process.returncode, int):
+        observed_returncode = process.returncode
+    elif os.name == "posix":
         term_result = _signal_process_group(process, signal.SIGTERM)
         if term_result.error is not None:
             issues.append(
@@ -803,6 +1102,7 @@ def _terminate_process_group_and_reap(
             kill_deadline = terminate_deadline
 
     _close_selector(selector)
+    ownership.transfer_to_reap(observed_returncode)
     reap_error = _reap_after_final_group_signal(
         process,
         observed_returncode,
@@ -810,6 +1110,8 @@ def _terminate_process_group_and_reap(
     )
     if reap_error is not None:
         issues.append(reap_error)
+    else:
+        ownership.release()
     return "; ".join(issues) or None
 
 
@@ -860,8 +1162,7 @@ def _capture_bounded_process(
         _close_selector(selector)
         raise UserError(f"failed to start {operation}: {exc}") from exc
 
-    leader_identity_held = os.name == "posix"
-    direct_child_needs_cleanup = True
+    ownership = _ProcessOwnership.for_process()
     selector_open = True
     try:
         assert process.stdout is not None
@@ -967,14 +1268,14 @@ def _capture_bounded_process(
                 timeout_error,
             )
             if returncode != 0:
-                leader_identity_held = False
-                direct_child_needs_cleanup = False
                 try:
+                    ownership.claim_group_cleanup()
                     cleanup_error = _terminate_process_group_and_reap(
                         process,
                         selector,
                     )
                 except BaseException as cleanup_exc:
+                    ownership.abandon_incomplete()
                     _close_selector(selector)
                     selector_open = False
                     _annotate_cleanup_interruption(
@@ -985,19 +1286,29 @@ def _capture_bounded_process(
                     raise
                 selector_open = False
                 if cleanup_error is not None:
+                    ownership.abandon_incomplete()
+                    child_detail = stderr.decode(
+                        "utf-8",
+                        errors="replace",
+                    ).strip()
+                    detail_suffix = (
+                        f"; bounded child stderr: {child_detail}"
+                        if child_detail
+                        else ""
+                    )
                     raise UserError(
                         f"{operation} cleanup-incomplete after exit "
-                        f"{returncode}: {cleanup_error}"
+                        f"{returncode}: {cleanup_error}{detail_suffix}"
                     )
+                ownership.release()
             else:
                 if stdout_finish is not None:
                     stdout_finish()
                 # Entering the final reap permanently releases permission to
                 # signal by numeric PGID. The wait may reap successfully and
                 # then be interrupted before it returns to this frame.
-                leader_identity_held = False
-                direct_child_needs_cleanup = False
                 try:
+                    ownership.transfer_to_reap(returncode)
                     reap_error = _reap_after_final_group_signal(
                         process,
                         returncode,
@@ -1014,6 +1325,7 @@ def _capture_bounded_process(
                     raise
                 if reap_error is not None:
                     raise UserError(f"{operation} cleanup-incomplete: {reap_error}")
+                ownership.release()
                 _close_selector(selector)
                 selector_open = False
         else:
@@ -1024,14 +1336,14 @@ def _capture_bounded_process(
                 returncode = process.wait(timeout=remaining)
             except subprocess.TimeoutExpired as exc:
                 raise UserError(timeout_error) from exc
-            direct_child_needs_cleanup = False
+            ownership.transfer_to_reap(returncode)
+            ownership.release()
             if returncode == 0 and stdout_finish is not None:
                 stdout_finish()
             _close_selector(selector)
             selector_open = False
     except _ProcessIdentityLost as exc:
-        leader_identity_held = False
-        direct_child_needs_cleanup = False
+        ownership.release()
         if selector_open:
             _close_selector(selector)
             selector_open = False
@@ -1041,12 +1353,15 @@ def _capture_bounded_process(
         ) from exc
     except BaseException as exc:
         cleanup_error: str | None = None
-        if leader_identity_held or (os.name != "posix" and direct_child_needs_cleanup):
-            leader_identity_held = False
-            direct_child_needs_cleanup = False
+        if ownership.permits_group_cleanup:
             try:
-                cleanup_error = _terminate_process_group_and_reap(process, selector)
+                ownership.claim_group_cleanup()
+                cleanup_error = _terminate_process_group_and_reap(
+                    process,
+                    selector,
+                )
             except BaseException as cleanup_exc:
+                ownership.abandon_incomplete()
                 _close_selector(selector)
                 selector_open = False
                 _annotate_cleanup_interruption(
@@ -1056,6 +1371,37 @@ def _capture_bounded_process(
                 )
                 raise
             selector_open = False
+            if cleanup_error is None:
+                ownership.release()
+        elif ownership.needs_reap:
+            if selector_open:
+                _close_selector(selector)
+                selector_open = False
+            try:
+                cleanup_error = _reap_after_final_group_signal(
+                    process,
+                    ownership.expected_returncode,
+                    time.monotonic() + GIT_PROCESS_KILL_DRAIN_SECONDS,
+                )
+            except BaseException:
+                _annotate_cleanup_interruption(
+                    exc,
+                    operation,
+                    "reap-only cleanup",
+                )
+                raise exc
+            if cleanup_error is None:
+                ownership.release()
+        elif ownership.state == "cleanup-claimed":
+            ownership.abandon_incomplete()
+            if selector_open:
+                _close_selector(selector)
+                selector_open = False
+            _annotate_cleanup_interruption(
+                exc,
+                operation,
+                "cleanup ownership handoff",
+            )
         elif selector_open:
             _close_selector(selector)
             selector_open = False
@@ -1076,6 +1422,101 @@ def _capture_bounded_process(
         bytes(stdout),
         bytes(stderr),
     )
+
+
+def _initialize_git_runtime() -> None:
+    global _GIT_RUNTIME
+    global _GIT_RUNTIME_ERROR
+
+    if _GIT_RUNTIME is not None or _GIT_RUNTIME_ERROR is not None:
+        return
+    candidate = shutil.which("git", path=os.environ.get("PATH"))
+    if candidate is None:
+        _GIT_RUNTIME_ERROR = UnsupportedGitVersion(
+            "Git >= 2.45 is required, but no Git executable was found on PATH"
+        )
+        return
+    try:
+        executable = pathlib.Path(candidate).resolve(strict=True)
+        executable_stat = executable.stat()
+    except OSError as exc:
+        _GIT_RUNTIME_ERROR = UnsupportedGitVersion(
+            f"failed to resolve the selected Git executable: {exc}"
+        )
+        return
+    if not stat.S_ISREG(executable_stat.st_mode) or not os.access(
+        executable,
+        os.X_OK,
+    ):
+        _GIT_RUNTIME_ERROR = UnsupportedGitVersion(
+            f"selected Git executable is not an executable regular file: {executable}"
+        )
+        return
+
+    version_env = {
+        key: os.environ[key]
+        for key in (
+            "LANG",
+            "LC_ALL",
+            "LC_CTYPE",
+            "PATH",
+            "SYSTEMROOT",
+            "TEMP",
+            "TMP",
+            "TMPDIR",
+        )
+        if key in os.environ
+    }
+    version_env.update(SAFE_GIT_ENV)
+    try:
+        result = _capture_bounded_process(
+            [str(executable), "--version"],
+            env=version_env,
+            timeout_seconds=GIT_VERSION_TIMEOUT_SECONDS,
+            stdout_limit=MAX_GIT_VERSION_OUTPUT_BYTES,
+            stderr_limit=MAX_GIT_VERSION_OUTPUT_BYTES,
+            stdout_overflow_error=(
+                f"Git version stdout exceeds {MAX_GIT_VERSION_OUTPUT_BYTES} bytes"
+            ),
+            stderr_overflow_error=(
+                f"Git version stderr exceeds {MAX_GIT_VERSION_OUTPUT_BYTES} bytes"
+            ),
+            timeout_error=(
+                f"Git version probe timed out after "
+                f"{GIT_VERSION_TIMEOUT_SECONDS:g} seconds"
+            ),
+            operation="Git version probe",
+        )
+    except UserError as exc:
+        _GIT_RUNTIME_ERROR = UnsupportedGitVersion(
+            f"failed the bounded credential-free Git version gate: {exc}"
+        )
+        return
+    if result.returncode != 0:
+        detail = (
+            result.stderr.decode("utf-8", errors="replace").strip()
+            or result.stdout.decode("utf-8", errors="replace").strip()
+            or f"exit {result.returncode}"
+        )
+        _GIT_RUNTIME_ERROR = UnsupportedGitVersion(
+            f"Git version probe failed: {detail}"
+        )
+        return
+    match = GIT_VERSION_RE.fullmatch(result.stdout)
+    if match is None:
+        _GIT_RUNTIME_ERROR = UnsupportedGitVersion(
+            "Git version probe returned an unsupported response"
+        )
+        return
+    version = tuple(int(part or 0) for part in match.groups())
+    if version < MINIMUM_GIT_VERSION:
+        actual = ".".join(str(part) for part in version)
+        minimum = ".".join(str(part) for part in MINIMUM_GIT_VERSION[:2])
+        _GIT_RUNTIME_ERROR = UnsupportedGitVersion(
+            f"Git >= {minimum} is required; selected {executable} reports {actual}"
+        )
+        return
+    _GIT_RUNTIME = _GitRuntime(executable=executable, version=version)
 
 
 def _tracked_index_journal_snapshot(
@@ -1193,11 +1634,11 @@ def _read_index_blobs_batch(
 
 
 def _is_generated_index_blob(content: bytes) -> bool:
-    lines = content.splitlines()
+    lines = content.split(b"\n", 3)
     return (
         len(lines) >= 3
-        and lines[0] == b"# Project Journal Index"
-        and lines[2] == INDEX_GENERATED_LINE.encode("utf-8")
+        and lines[0].removesuffix(b"\r") == b"# Project Journal Index"
+        and lines[2].removesuffix(b"\r") == INDEX_GENERATED_LINE.encode("utf-8")
     )
 
 
@@ -1213,17 +1654,21 @@ def _load_entries_from_paths(
     repo: pathlib.Path, paths: list[pathlib.Path]
 ) -> tuple[list[JournalEntry], list[str]]:
     entries: list[JournalEntry] = []
-    issues: list[str] = []
+    collector = _IssueCollector()
+    if len(paths) > MAX_JOURNAL_ENTRIES:
+        raise JournalLimitExceeded(f"journal entry count exceeds {MAX_JOURNAL_ENTRIES}")
     for path in paths:
         rel_path = path.relative_to(repo).as_posix()
         try:
             fields = _parse_frontmatter(path)
+        except JournalLimitExceeded:
+            raise
         except UserError as exc:
-            issues.append(str(exc))
+            collector.add(rel_path, str(exc))
             continue
         entries.append(JournalEntry(path=path, rel_path=rel_path, fields=fields))
-    issues.extend(_validate_entries(entries))
-    return entries, issues
+    report = _validate_entries(entries, collector=collector)
+    return entries, list(report.issues)
 
 
 def _load_entries(repo: pathlib.Path) -> tuple[list[JournalEntry], list[str]]:
@@ -1235,16 +1680,37 @@ def _load_entries_from_index(
     *,
     timeout_seconds: float = GIT_ADOPTION_VALIDATION_TIMEOUT_SECONDS,
 ) -> tuple[list[JournalEntry], list[str], int]:
+    loaded = _load_entries_from_index_report(
+        repo,
+        timeout_seconds=timeout_seconds,
+    )
+    return (
+        list(loaded.entries),
+        list(loaded.validation.issues),
+        loaded.non_generated_count,
+    )
+
+
+def _load_entries_from_index_report(
+    repo: pathlib.Path,
+    *,
+    timeout_seconds: float = GIT_ADOPTION_VALIDATION_TIMEOUT_SECONDS,
+) -> _IndexedJournalLoad:
     if timeout_seconds <= 0:
         raise ValueError("timeout_seconds must be positive")
     entries: list[JournalEntry] = []
-    issues: list[str] = []
+    collector = _IssueCollector()
     non_generated_count = 0
     validation_deadline = time.monotonic() + timeout_seconds
+    deadline_error = "tracked journal adoption validation exceeded its shared deadline"
     initial_index, blobs = _tracked_index_journal_snapshot(
         repo,
         deadline=validation_deadline,
     )
+    if len(blobs) > MAX_JOURNAL_ENTRIES:
+        raise JournalLimitExceeded(
+            f"tracked journal entry count exceeds {MAX_JOURNAL_ENTRIES}"
+        )
     contents = _read_index_blobs_batch(
         repo,
         blobs,
@@ -1252,6 +1718,7 @@ def _load_entries_from_index(
     )
 
     for blob, content in zip(blobs, contents):
+        _check_deadline(validation_deadline, deadline_error)
         if _is_generated_index_blob(content):
             continue
 
@@ -1259,12 +1726,19 @@ def _load_entries_from_index(
         try:
             text = content.decode("utf-8")
         except UnicodeDecodeError:
-            issues.append(f"{blob.rel_path}: index blob is not valid UTF-8")
+            collector.add(blob.rel_path, "index blob is not valid UTF-8")
             continue
         try:
-            fields = _parse_frontmatter_text(text, blob.rel_path)
+            fields = _parse_frontmatter_text(
+                text,
+                blob.rel_path,
+                deadline=validation_deadline,
+                deadline_error=deadline_error,
+            )
+        except JournalLimitExceeded:
+            raise
         except UserError as exc:
-            issues.append(str(exc))
+            collector.add(blob.rel_path, str(exc))
             continue
         entry_path = repo.joinpath(*pathlib.PurePosixPath(blob.rel_path).parts)
         entries.append(
@@ -1275,6 +1749,12 @@ def _load_entries_from_index(
             )
         )
 
+    report = _validate_entries(
+        entries,
+        deadline=validation_deadline,
+        deadline_error=deadline_error,
+        collector=collector,
+    )
     final_index, _ = _tracked_index_journal_snapshot(
         repo,
         deadline=validation_deadline,
@@ -1282,22 +1762,25 @@ def _load_entries_from_index(
     if final_index != initial_index:
         raise UserError("tracked journal Git index changed during validation")
 
-    issues.extend(_validate_entries(entries))
-    return entries, issues, non_generated_count
+    valid_count = 0
+    for entry in entries:
+        _check_deadline(validation_deadline, deadline_error)
+        if entry.rel_path not in report.invalid_paths:
+            valid_count += 1
+    return _IndexedJournalLoad(
+        entries=tuple(entries),
+        validation=report,
+        non_generated_count=non_generated_count,
+        valid_count=valid_count,
+    )
 
 
 def _tracked_journal_adoption(repo: pathlib.Path) -> dict[str, Any]:
-    entries, issues, non_generated_count = _load_entries_from_index(repo)
-    invalid_paths = {
-        entry.rel_path
-        for entry in entries
-        if any(issue.startswith(f"{entry.rel_path}:") for issue in issues)
-    }
-    valid_count = sum(entry.rel_path not in invalid_paths for entry in entries)
+    loaded = _load_entries_from_index_report(repo)
     return {
-        "tracked_journal_adopted": valid_count > 0,
-        "tracked_non_generated_journal_count": non_generated_count,
-        "valid_tracked_journal_count": valid_count,
+        "tracked_journal_adopted": loaded.valid_count > 0,
+        "tracked_non_generated_journal_count": loaded.non_generated_count,
+        "valid_tracked_journal_count": loaded.valid_count,
     }
 
 
@@ -1311,58 +1794,83 @@ def _validate_date(value: str) -> bool:
     return True
 
 
-def _validate_entries(entries: list[JournalEntry]) -> list[str]:
-    issues: list[str] = []
+def _validate_entries(
+    entries: list[JournalEntry],
+    *,
+    deadline: float | None = None,
+    deadline_error: str = "journal validation exceeded its shared deadline",
+    collector: _IssueCollector | None = None,
+) -> _ValidationReport:
+    if len(entries) > MAX_JOURNAL_ENTRIES:
+        raise JournalLimitExceeded(f"journal entry count exceeds {MAX_JOURNAL_ENTRIES}")
+    if collector is None:
+        collector = _IssueCollector()
     ids: dict[str, JournalEntry] = {}
     rel_paths = {entry.rel_path for entry in entries}
 
     for entry in entries:
+        _check_deadline(deadline, deadline_error)
         label = entry.rel_path
         for field in REQUIRED_FIELDS:
+            _check_deadline(deadline, deadline_error)
             if field not in entry.fields:
-                issues.append(f"{label}: missing required field {field!r}")
+                collector.add(label, f"missing required field {field!r}")
 
         if not entry.entry_id:
-            issues.append(f"{label}: field 'id' must not be empty")
+            collector.add(label, "field 'id' must not be empty")
         elif entry.entry_id in ids:
-            issues.append(f"{label}: duplicate id {entry.entry_id!r}")
+            collector.add(label, f"duplicate id {entry.entry_id!r}")
         else:
             ids[entry.entry_id] = entry
 
         if not entry.title:
-            issues.append(f"{label}: field 'title' must not be empty")
+            collector.add(label, "field 'title' must not be empty")
         if entry.status not in VALID_STATUSES:
-            issues.append(
-                f"{label}: invalid status {entry.status!r}; expected one of {', '.join(VALID_STATUSES)}"
+            collector.add(
+                label,
+                f"invalid status {entry.status!r}; "
+                f"expected one of {', '.join(VALID_STATUSES)}",
             )
         if not entry.created:
-            issues.append(f"{label}: field 'created' must not be empty")
+            collector.add(label, "field 'created' must not be empty")
         elif not _validate_date(entry.created):
-            issues.append(f"{label}: invalid created date {entry.created!r}")
+            collector.add(label, f"invalid created date {entry.created!r}")
         if not entry.updated:
-            issues.append(f"{label}: field 'updated' must not be empty")
+            collector.add(label, "field 'updated' must not be empty")
         elif not _validate_date(entry.updated):
-            issues.append(f"{label}: invalid updated date {entry.updated!r}")
+            collector.add(label, f"invalid updated date {entry.updated!r}")
 
     valid_targets = set(ids) | rel_paths
     for entry in entries:
-        for superseded in _as_list(entry.fields.get("supersedes")):
+        _check_deadline(deadline, deadline_error)
+        for superseded in _as_list(
+            entry.fields.get("supersedes"),
+            label=entry.rel_path,
+            field="supersedes",
+            deadline=deadline,
+            deadline_error=deadline_error,
+        ):
+            _check_deadline(deadline, deadline_error)
             if superseded not in valid_targets:
-                issues.append(
-                    f"{entry.rel_path}: supersedes target {superseded!r} does not match a journal id or path"
+                collector.add(
+                    entry.rel_path,
+                    f"supersedes target {superseded!r} "
+                    "does not match a journal id or path",
                 )
         target = str(entry.fields.get("superseded_by", "")).strip()
         if target and target not in valid_targets:
-            issues.append(
-                f"{entry.rel_path}: superseded_by target {target!r} does not match a journal id or path"
+            collector.add(
+                entry.rel_path,
+                f"superseded_by target {target!r} does not match a journal id or path",
             )
         if entry.status == "superseded":
             if not target:
-                issues.append(
-                    f"{entry.rel_path}: superseded entries must set 'superseded_by'"
+                collector.add(
+                    entry.rel_path,
+                    "superseded entries must set 'superseded_by'",
                 )
 
-    return issues
+    return collector.report()
 
 
 def _markdown_escape(value: str) -> str:
@@ -1570,6 +2078,167 @@ def _default_hooks_dir(repo: pathlib.Path) -> pathlib.Path:
     return hooks_dir.resolve()
 
 
+def _global_git_config_paths() -> list[pathlib.Path]:
+    override = os.environ.get("GIT_CONFIG_GLOBAL")
+    if override is not None:
+        if not override:
+            raise UserError(
+                "GIT_CONFIG_GLOBAL is empty; cannot prove the actual global "
+                "core.hooksPath configuration safely"
+            )
+        if override == os.devnull:
+            return []
+        path = pathlib.Path(override).expanduser()
+        if not path.is_absolute():
+            path = pathlib.Path.cwd() / path
+        return [path.resolve()]
+
+    home_text = os.environ.get("HOME")
+    home = (
+        pathlib.Path(home_text).expanduser()
+        if home_text
+        else pathlib.Path("~").expanduser()
+    )
+    xdg_text = os.environ.get("XDG_CONFIG_HOME")
+    xdg = pathlib.Path(xdg_text).expanduser() if xdg_text else home / ".config"
+    if not xdg.is_absolute():
+        raise UserError(
+            "XDG_CONFIG_HOME is relative; cannot prove the actual global "
+            "core.hooksPath configuration safely"
+        )
+    return [
+        (xdg / "git/config").resolve(),
+        (home / ".gitconfig").resolve(),
+    ]
+
+
+def _global_git_config_entries(config_path: pathlib.Path) -> list[tuple[str, str]]:
+    try:
+        with config_path.open("rb") as source:
+            before = os.fstat(source.fileno())
+            content = source.read(MAX_GLOBAL_GIT_CONFIG_SOURCE_BYTES + 1)
+            after = os.fstat(source.fileno())
+    except OSError as exc:
+        raise UserError(
+            f"failed to snapshot global Git config {config_path}: {exc}"
+        ) from exc
+    if len(content) > MAX_GLOBAL_GIT_CONFIG_SOURCE_BYTES:
+        raise UserError(
+            "global Git config source exceeds "
+            f"{MAX_GLOBAL_GIT_CONFIG_SOURCE_BYTES} bytes"
+        )
+    stable_signals = (
+        "st_dev",
+        "st_ino",
+        "st_mode",
+        "st_size",
+        "st_mtime_ns",
+    )
+    if any(getattr(before, name) != getattr(after, name) for name in stable_signals):
+        raise UserError("global Git config changed while it was being snapshotted")
+
+    with tempfile.NamedTemporaryFile(
+        prefix="project-journal-global-config-",
+        suffix=".cfg",
+    ) as staged:
+        staged.write(content)
+        staged.flush()
+        command = [
+            str(_fixed_git_executable()),
+            "--no-pager",
+            "--no-optional-locks",
+            "config",
+            "--file",
+            staged.name,
+            "--no-includes",
+            "--null",
+            "--list",
+        ]
+        result = _capture_bounded_process(
+            command,
+            env=_global_config_git_environment(),
+            timeout_seconds=GIT_CONFIG_QUERY_TIMEOUT_SECONDS,
+            stdout_limit=MAX_GLOBAL_GIT_CONFIG_OUTPUT_BYTES,
+            stderr_limit=MAX_GIT_STDERR_BYTES,
+            stdout_overflow_error=(
+                "global Git config query stdout exceeds "
+                f"{MAX_GLOBAL_GIT_CONFIG_OUTPUT_BYTES} bytes"
+            ),
+            stderr_overflow_error=(
+                f"global Git config query stderr exceeds {MAX_GIT_STDERR_BYTES} bytes"
+            ),
+            timeout_error=(
+                f"global Git config query timed out after "
+                f"{GIT_CONFIG_QUERY_TIMEOUT_SECONDS:g} seconds"
+            ),
+            operation="global Git config query",
+        )
+    if result.returncode != 0:
+        detail = (
+            result.stderr.decode("utf-8", errors="replace").strip()
+            or f"exit {result.returncode}"
+        )
+        raise UserError(f"failed to inspect global Git config safely: {detail}")
+    if result.stdout and not result.stdout.endswith(b"\0"):
+        raise UserError("global Git config query returned malformed framing")
+    try:
+        records = [
+            value.decode("utf-8") for value in result.stdout.split(b"\0") if value
+        ]
+    except UnicodeDecodeError as exc:
+        raise UserError("global Git config query returned non-UTF-8 data") from exc
+    entries: list[tuple[str, str]] = []
+    for record in records:
+        key, separator, value = record.partition("\n")
+        if not separator or not key:
+            raise UserError("global Git config query returned malformed records")
+        entries.append((key.lower(), value))
+    return entries
+
+
+def _preflight_global_hooks_config(repo: pathlib.Path) -> None:
+    entries: list[tuple[str, str]] = []
+    for config_path in _global_git_config_paths():
+        if not config_path.exists():
+            continue
+        try:
+            config_stat = config_path.stat()
+        except OSError as exc:
+            raise UserError(
+                f"failed to inspect global Git config {config_path}: {exc}"
+            ) from exc
+        if not stat.S_ISREG(config_stat.st_mode):
+            raise UserError(f"global Git config is not a regular file: {config_path}")
+        entries.extend(_global_git_config_entries(config_path))
+    hooks_values = [value for key, value in entries if key == "core.hookspath"]
+    include_keys = [
+        key
+        for key, _value in entries
+        if key == "include.path"
+        or (key.startswith("includeif.") and key.endswith(".path"))
+    ]
+    if not hooks_values and not include_keys:
+        return
+
+    git_executable = shlex.quote(str(_fixed_git_executable()))
+    repo_arg = shlex.quote(str(repo))
+    instruction = (
+        f"{git_executable} -C {repo_arg} config --local core.hooksPath .githooks"
+    )
+    if hooks_values:
+        raise UserError(
+            "global core.hooksPath is set, so installing into the default "
+            "repository hook directory would not be used by actual Git; "
+            f"set an explicit repo-local override first, for example: {instruction}"
+        )
+    raise UserError(
+        "global Git config contains include directives; project_journal.py "
+        "does not follow global includes while resolving core.hooksPath, so "
+        "the effective hook directory cannot be proved safely; set an explicit "
+        f"repo-local override first, for example: {instruction}"
+    )
+
+
 def _hooks_dir(repo: pathlib.Path) -> pathlib.Path:
     for scope in ("--worktree", "--local"):
         configured = _run_git(
@@ -1582,6 +2251,7 @@ def _hooks_dir(repo: pathlib.Path) -> pathlib.Path:
         )
         if configured.returncode == 0:
             return _hooks_dir_from_config(repo, configured.stdout.strip())
+    _preflight_global_hooks_config(repo)
     return _default_hooks_dir(repo)
 
 
@@ -1733,8 +2403,11 @@ def _git_output_path(repo: pathlib.Path, raw_path: str) -> pathlib.Path:
 
 
 def _source_root_from_linked_worktree(repo: pathlib.Path) -> pathlib.Path | None:
-    git_dir = _run_git(repo, "rev-parse", "--git-dir")
-    common_dir = _run_git(repo, "rev-parse", "--git-common-dir")
+    try:
+        git_dir = _run_git(repo, "rev-parse", "--git-dir")
+        common_dir = _run_git(repo, "rev-parse", "--git-common-dir")
+    except UnsupportedGitVersion:
+        return None
     if git_dir.returncode != 0 or common_dir.returncode != 0:
         return None
 
@@ -1752,13 +2425,28 @@ def _source_root_from_linked_worktree(repo: pathlib.Path) -> pathlib.Path | None
     return source_root
 
 
+def _filesystem_repo_root(path: pathlib.Path) -> pathlib.Path | None:
+    candidate = path if path.is_dir() else path.parent
+    while True:
+        git_marker = candidate / ".git"
+        if git_marker.is_dir() or git_marker.is_file():
+            return candidate.resolve()
+        parent = candidate.parent
+        if parent == candidate:
+            return None
+        candidate = parent
+
+
 def _repo_root_for_existing_path(path: pathlib.Path) -> pathlib.Path | None:
     while not path.exists():
         parent = path.parent
         if parent == path:
             return None
         path = parent
-    result = _run_git(path, "rev-parse", "--show-toplevel")
+    try:
+        result = _run_git(path, "rev-parse", "--show-toplevel")
+    except UnsupportedGitVersion:
+        return _filesystem_repo_root(path)
     if result.returncode != 0:
         return None
     return pathlib.Path(result.stdout.strip()).resolve()
@@ -1813,8 +2501,11 @@ def _has_hook_marker(repo: pathlib.Path) -> bool:
     return True
 
 
-def _is_excluded(repo: pathlib.Path, rel: str) -> bool:
-    exclude = _git_path(repo, "info/exclude")
+def _is_excluded(repo: pathlib.Path, rel: str) -> bool | None:
+    try:
+        exclude = _git_path(repo, "info/exclude")
+    except UserError:
+        return None
     if not exclude.exists():
         return False
     return rel in exclude.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -1827,7 +2518,7 @@ def _discover_adoption_status(repo: pathlib.Path) -> dict[str, Any]:
         return {
             "adoption_status": "inconclusive",
             "adoption_error": {
-                "code": "adoption_check_failed",
+                "code": getattr(exc, "code", "adoption_check_failed"),
                 "message": str(exc),
             },
             "tracked_journal_adopted": None,
@@ -1973,6 +2664,9 @@ def main(argv: list[str] | None = None) -> int:
     except UserError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
+
+
+_initialize_git_runtime()
 
 
 if __name__ == "__main__":
