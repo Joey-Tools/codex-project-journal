@@ -4,6 +4,7 @@ Public Codex skill and helper scripts for lightweight per-workstream project jou
 The skill does not bootstrap trackers, generated indexes, or local hooks across repositories by default.
 An empty `docs/project_journal/` directory or generated `INDEX.md` does not establish adoption.
 Adoption checks validate exact unconflicted stage-0 regular-file blobs from the Git index, not substituted worktree paths or content.
+The helper ignores ambient Git control/configuration redirections, forbids lazy object fetching, and streams raw index snapshots through monotonic time plus byte, record, and stderr bounds before exact revalidation.
 
 ## Test
 

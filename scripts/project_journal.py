@@ -10,10 +10,14 @@ import json
 import os
 import pathlib
 import re
+import selectors
 import shlex
+import signal
 import stat
 import subprocess
 import sys
+import time
+from collections.abc import Callable
 from typing import Any
 
 
@@ -45,6 +49,51 @@ MAX_TRACKED_JOURNAL_INDEX_BYTES = 4 * 1024 * 1024
 MAX_TRACKED_JOURNAL_RECORDS = 4096
 MAX_TRACKED_JOURNAL_BLOB_BYTES = 1024 * 1024
 MAX_TRACKED_JOURNAL_TOTAL_BYTES = 16 * 1024 * 1024
+MAX_GIT_STDERR_BYTES = 64 * 1024
+GIT_INDEX_SNAPSHOT_TIMEOUT_SECONDS = 10.0
+GIT_PROCESS_TERMINATE_GRACE_SECONDS = 0.25
+GIT_PROCESS_KILL_DRAIN_SECONDS = 1.0
+PROCESS_READ_CHUNK_BYTES = 64 * 1024
+GIT_ENV_PASSTHROUGH = (
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "PATH",
+    "SYSTEMROOT",
+    "TEMP",
+    "TMP",
+    "TMPDIR",
+)
+SAFE_GIT_ENV = {
+    "GIT_ASKPASS": "",
+    "GIT_ATTR_NOSYSTEM": "1",
+    "GIT_CONFIG_GLOBAL": os.devnull,
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_CONFIG_SYSTEM": os.devnull,
+    "GIT_LITERAL_PATHSPECS": "1",
+    "GIT_NO_LAZY_FETCH": "1",
+    "GIT_NO_REPLACE_OBJECTS": "1",
+    "GIT_OPTIONAL_LOCKS": "0",
+    "GIT_TERMINAL_PROMPT": "0",
+    "GCM_INTERACTIVE": "Never",
+    "SSH_ASKPASS": "",
+    "SSH_ASKPASS_REQUIRE": "never",
+}
+SAFE_GIT_CONFIG_ARGS = (
+    "-c",
+    "core.askPass=",
+    "-c",
+    f"core.attributesFile={os.devnull}",
+    "-c",
+    "core.fsmonitor=false",
+    "-c",
+    f"core.hooksPath={os.devnull}",
+    "-c",
+    "credential.helper=",
+    "-c",
+    "credential.interactive=never",
+)
 
 
 class UserError(Exception):
@@ -86,10 +135,30 @@ class IndexJournalBlob:
     rel_path: str
 
 
+def _git_environment() -> dict[str, str]:
+    env = {key: os.environ[key] for key in GIT_ENV_PASSTHROUGH if key in os.environ}
+    env.update(SAFE_GIT_ENV)
+    return env
+
+
+def _git_command(repo: pathlib.Path, *args: str) -> list[str]:
+    return [
+        "git",
+        "--no-pager",
+        "--no-optional-locks",
+        *SAFE_GIT_CONFIG_ARGS,
+        "-C",
+        str(repo),
+        *args,
+    ]
+
+
 def _run_git(repo: pathlib.Path, *args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        ["git", "-C", str(repo), *args],
+        _git_command(repo, *args),
         check=False,
+        env=_git_environment(),
+        stdin=subprocess.DEVNULL,
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -99,22 +168,13 @@ def _run_git(repo: pathlib.Path, *args: str) -> subprocess.CompletedProcess[str]
 def _run_git_bytes(
     repo: pathlib.Path, *args: str
 ) -> subprocess.CompletedProcess[bytes]:
-    env = os.environ.copy()
-    env.update(
-        {
-            "GIT_LITERAL_PATHSPECS": "1",
-            "GIT_NO_LAZY_FETCH": "1",
-            "GIT_NO_REPLACE_OBJECTS": "1",
-            "GIT_OPTIONAL_LOCKS": "0",
-        }
-    )
     return subprocess.run(
-        ["git", "-C", str(repo), *args],
+        _git_command(repo, *args),
         check=False,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        env=env,
+        env=_git_environment(),
     )
 
 
@@ -245,43 +305,37 @@ def _journal_paths(repo: pathlib.Path) -> list[pathlib.Path]:
     return sorted(paths)
 
 
-def _parse_index_journal_blobs(output: bytes) -> list[IndexJournalBlob]:
-    if output and not output.endswith(b"\0"):
-        raise UserError("malformed git ls-files output: missing NUL terminator")
-
+def _parse_index_stage_record(
+    record: bytes,
+    records: dict[bytes, list[tuple[bytes, bytes, bytes]]],
+) -> None:
     journal_prefix = JOURNAL_ROOT.as_posix().encode("ascii") + b"/"
     default_index = DEFAULT_INDEX.as_posix().encode("ascii")
-    records: dict[bytes, list[tuple[bytes, bytes, bytes]]] = {}
-    record_count = 0
-    for record in output.split(b"\0"):
-        if not record:
-            continue
-        record_count += 1
-        if record_count > MAX_TRACKED_JOURNAL_RECORDS:
-            raise UserError(
-                "tracked journal index exceeds "
-                f"{MAX_TRACKED_JOURNAL_RECORDS} records"
-            )
-        metadata, separator, raw_path = record.partition(b"\t")
-        fields = metadata.split(b" ")
-        if not separator or not raw_path or len(fields) != 3:
-            raise UserError("malformed git ls-files stage record")
-        mode, oid, stage = fields
-        if not INDEX_MODE_RE.fullmatch(mode):
-            raise UserError("malformed git ls-files mode")
-        if not INDEX_OID_RE.fullmatch(oid):
-            raise UserError("malformed git ls-files object id")
-        if stage not in {b"0", b"1", b"2", b"3"}:
-            raise UserError("malformed git ls-files stage")
-        if not raw_path.startswith(journal_prefix):
-            raise UserError("git ls-files returned a path outside the journal root")
-        path_parts = raw_path.split(b"/")
-        if any(part in {b"", b".", b".."} for part in path_parts):
-            raise UserError("git ls-files returned an unsafe journal path")
-        if raw_path == default_index or not raw_path.endswith(b".md"):
-            continue
-        records.setdefault(raw_path, []).append((mode, oid, stage))
 
+    metadata, separator, raw_path = record.partition(b"\t")
+    fields = metadata.split(b" ")
+    if not separator or not raw_path or len(fields) != 3:
+        raise UserError("malformed git ls-files stage record")
+    mode, oid, stage = fields
+    if not INDEX_MODE_RE.fullmatch(mode):
+        raise UserError("malformed git ls-files mode")
+    if not INDEX_OID_RE.fullmatch(oid):
+        raise UserError("malformed git ls-files object id")
+    if stage not in {b"0", b"1", b"2", b"3"}:
+        raise UserError("malformed git ls-files stage")
+    if not raw_path.startswith(journal_prefix):
+        raise UserError("git ls-files returned a path outside the journal root")
+    path_parts = raw_path.split(b"/")
+    if any(part in {b"", b".", b".."} for part in path_parts):
+        raise UserError("git ls-files returned an unsafe journal path")
+    if raw_path == default_index or not raw_path.endswith(b".md"):
+        return
+    records.setdefault(raw_path, []).append((mode, oid, stage))
+
+
+def _index_journal_blobs_from_records(
+    records: dict[bytes, list[tuple[bytes, bytes, bytes]]],
+) -> list[IndexJournalBlob]:
     blobs: list[IndexJournalBlob] = []
     for raw_path, path_records in sorted(records.items()):
         if len(path_records) != 1:
@@ -300,16 +354,302 @@ def _parse_index_journal_blobs(output: bytes) -> list[IndexJournalBlob]:
     return blobs
 
 
+class _IndexStageStreamParser:
+    def __init__(self, *, max_records: int = MAX_TRACKED_JOURNAL_RECORDS) -> None:
+        self._max_records = max_records
+        self._pending = bytearray()
+        self._record_count = 0
+        self._records: dict[bytes, list[tuple[bytes, bytes, bytes]]] = {}
+        self._blobs: list[IndexJournalBlob] | None = None
+
+    def feed(self, chunk: bytes) -> None:
+        if self._blobs is not None:
+            raise RuntimeError("cannot feed a finished Git index parser")
+        self._pending.extend(chunk)
+        consumed = 0
+        while True:
+            terminator = self._pending.find(0, consumed)
+            if terminator < 0:
+                break
+            record = bytes(self._pending[consumed:terminator])
+            consumed = terminator + 1
+            if not record:
+                continue
+            self._record_count += 1
+            if self._record_count > self._max_records:
+                raise UserError(
+                    f"tracked journal index exceeds {self._max_records} records"
+                )
+            _parse_index_stage_record(record, self._records)
+        if consumed:
+            del self._pending[:consumed]
+
+    def finish(self) -> None:
+        if self._blobs is not None:
+            return
+        if self._pending:
+            raise UserError("malformed git ls-files output: missing NUL terminator")
+        self._blobs = _index_journal_blobs_from_records(self._records)
+
+    def blobs(self) -> list[IndexJournalBlob]:
+        if self._blobs is None:
+            raise RuntimeError("Git index parser has not reached EOF")
+        return self._blobs
+
+
+def _parse_index_journal_blobs(output: bytes) -> list[IndexJournalBlob]:
+    if len(output) > MAX_TRACKED_JOURNAL_INDEX_BYTES:
+        raise UserError(
+            "tracked journal index output exceeds "
+            f"{MAX_TRACKED_JOURNAL_INDEX_BYTES} bytes"
+        )
+    parser = _IndexStageStreamParser()
+    parser.feed(output)
+    parser.finish()
+    return parser.blobs()
+
+
+def _close_selector_stream(
+    selector: selectors.BaseSelector,
+    stream: Any,
+) -> None:
+    try:
+        selector.unregister(stream)
+    except (KeyError, ValueError):
+        pass
+    try:
+        stream.close()
+    except OSError:
+        pass
+
+
+def _discard_selector_output(
+    selector: selectors.BaseSelector,
+    deadline: float,
+) -> None:
+    while selector.get_map():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        try:
+            events = selector.select(remaining)
+        except OSError:
+            return
+        if not events:
+            continue
+        for key, _mask in events:
+            try:
+                chunk = os.read(key.fd, PROCESS_READ_CHUNK_BYTES)
+            except BlockingIOError:
+                continue
+            except OSError:
+                chunk = b""
+            if not chunk:
+                _close_selector_stream(selector, key.fileobj)
+
+
+def _close_selector(selector: selectors.BaseSelector) -> None:
+    for key in list(selector.get_map().values()):
+        _close_selector_stream(selector, key.fileobj)
+    try:
+        selector.close()
+    except OSError:
+        pass
+
+
+def _signal_process_group(
+    process: subprocess.Popen[bytes],
+    sig: int,
+) -> None:
+    try:
+        if os.name == "posix":
+            os.killpg(process.pid, sig)
+        elif sig == signal.SIGTERM:
+            process.terminate()
+        else:
+            process.kill()
+    except OSError:
+        pass
+
+
+def _terminate_process_group_and_reap(
+    process: subprocess.Popen[bytes],
+    selector: selectors.BaseSelector,
+) -> None:
+    _signal_process_group(process, signal.SIGTERM)
+    terminate_deadline = time.monotonic() + GIT_PROCESS_TERMINATE_GRACE_SECONDS
+    _discard_selector_output(selector, terminate_deadline)
+
+    kill_signal = getattr(signal, "SIGKILL", signal.SIGTERM)
+    _signal_process_group(process, kill_signal)
+    kill_deadline = time.monotonic() + GIT_PROCESS_KILL_DRAIN_SECONDS
+    _discard_selector_output(selector, kill_deadline)
+    _close_selector(selector)
+
+    try:
+        process.wait(timeout=max(0.0, kill_deadline - time.monotonic()))
+    except subprocess.TimeoutExpired:
+        try:
+            process.kill()
+            process.wait(timeout=GIT_PROCESS_KILL_DRAIN_SECONDS)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+
+def _capture_bounded_process(
+    argv: list[str],
+    *,
+    env: dict[str, str],
+    timeout_seconds: float,
+    stdout_limit: int,
+    stderr_limit: int,
+    stdout_feed: Callable[[bytes], None] | None = None,
+    stdout_finish: Callable[[], None] | None = None,
+    stdout_overflow_error: str,
+    stderr_overflow_error: str,
+    timeout_error: str,
+) -> subprocess.CompletedProcess[bytes]:
+    if timeout_seconds <= 0:
+        raise ValueError("timeout_seconds must be positive")
+    if stdout_limit < 0 or stderr_limit < 0:
+        raise ValueError("stream limits must not be negative")
+
+    deadline = time.monotonic() + timeout_seconds
+    try:
+        selector = selectors.DefaultSelector()
+    except OSError as exc:
+        raise UserError(f"failed to create Git index snapshot selector: {exc}") from exc
+    stdout = bytearray()
+    stderr = bytearray()
+    stdout_finished = False
+    try:
+        process = subprocess.Popen(
+            argv,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=os.name == "posix",
+        )
+    except OSError as exc:
+        _close_selector(selector)
+        raise UserError(f"failed to start Git index snapshot: {exc}") from exc
+
+    try:
+        assert process.stdout is not None
+        assert process.stderr is not None
+        for stream, stream_name in (
+            (process.stdout, "stdout"),
+            (process.stderr, "stderr"),
+        ):
+            try:
+                os.set_blocking(stream.fileno(), False)
+                selector.register(
+                    stream,
+                    selectors.EVENT_READ,
+                    data=stream_name,
+                )
+            except OSError as exc:
+                raise UserError(
+                    f"failed to configure Git index snapshot {stream_name}: {exc}"
+                ) from exc
+
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise UserError(timeout_error)
+            try:
+                events = selector.select(remaining)
+            except OSError as exc:
+                raise UserError(
+                    f"failed to monitor Git index snapshot streams: {exc}"
+                ) from exc
+            if not events:
+                continue
+            for key, _mask in events:
+                if time.monotonic() >= deadline:
+                    raise UserError(timeout_error)
+                target = stdout if key.data == "stdout" else stderr
+                limit = stdout_limit if key.data == "stdout" else stderr_limit
+                available = limit - len(target)
+                read_size = min(PROCESS_READ_CHUNK_BYTES, available + 1)
+                try:
+                    chunk = os.read(key.fd, read_size)
+                except BlockingIOError:
+                    continue
+                except OSError as exc:
+                    raise UserError(
+                        f"failed to read Git index snapshot {key.data}: {exc}"
+                    ) from exc
+                if not chunk:
+                    _close_selector_stream(selector, key.fileobj)
+                    if key.data == "stdout" and not stdout_finished:
+                        if stdout_finish is not None:
+                            stdout_finish()
+                        stdout_finished = True
+                    continue
+                if len(chunk) > available:
+                    if key.data == "stdout":
+                        raise UserError(stdout_overflow_error)
+                    raise UserError(stderr_overflow_error)
+                if key.data == "stdout" and stdout_feed is not None:
+                    stdout_feed(chunk)
+                target.extend(chunk)
+
+        if not stdout_finished and stdout_finish is not None:
+            stdout_finish()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise UserError(timeout_error)
+        try:
+            returncode = process.wait(timeout=remaining)
+        except subprocess.TimeoutExpired as exc:
+            raise UserError(timeout_error) from exc
+    except BaseException:
+        _terminate_process_group_and_reap(process, selector)
+        raise
+    else:
+        _close_selector(selector)
+
+    return subprocess.CompletedProcess(
+        argv,
+        returncode,
+        bytes(stdout),
+        bytes(stderr),
+    )
+
+
 def _tracked_index_journal_snapshot(
     repo: pathlib.Path,
 ) -> tuple[bytes, list[IndexJournalBlob]]:
-    result = _run_git_bytes(
+    parser = _IndexStageStreamParser()
+    command = _git_command(
         repo,
         "ls-files",
         "--stage",
         "-z",
         "--",
         JOURNAL_ROOT.as_posix(),
+    )
+    result = _capture_bounded_process(
+        command,
+        env=_git_environment(),
+        timeout_seconds=GIT_INDEX_SNAPSHOT_TIMEOUT_SECONDS,
+        stdout_limit=MAX_TRACKED_JOURNAL_INDEX_BYTES,
+        stderr_limit=MAX_GIT_STDERR_BYTES,
+        stdout_feed=parser.feed,
+        stdout_finish=parser.finish,
+        stdout_overflow_error=(
+            "tracked journal index output exceeds "
+            f"{MAX_TRACKED_JOURNAL_INDEX_BYTES} bytes"
+        ),
+        stderr_overflow_error=(
+            f"git ls-files stderr exceeds {MAX_GIT_STDERR_BYTES} bytes"
+        ),
+        timeout_error=(
+            "tracked journal index snapshot timed out after "
+            f"{GIT_INDEX_SNAPSHOT_TIMEOUT_SECONDS:g} seconds"
+        ),
     )
     if result.returncode != 0:
         detail = (
@@ -318,12 +658,7 @@ def _tracked_index_journal_snapshot(
             or "tracked journal lookup failed"
         )
         raise UserError(f"failed to list tracked journal entries: {detail}")
-    if len(result.stdout) > MAX_TRACKED_JOURNAL_INDEX_BYTES:
-        raise UserError(
-            "tracked journal index output exceeds "
-            f"{MAX_TRACKED_JOURNAL_INDEX_BYTES} bytes"
-        )
-    return result.stdout, _parse_index_journal_blobs(result.stdout)
+    return result.stdout, parser.blobs()
 
 
 def _tracked_index_journal_blobs(repo: pathlib.Path) -> list[IndexJournalBlob]:
@@ -633,6 +968,18 @@ def command_adoption_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_append_hook_log(args: argparse.Namespace) -> int:
+    repo = _resolve_repo(args.repo)
+    log_path = _git_path(repo, "project-journal-index.log")
+    try:
+        with log_path.open("ab") as log:
+            while chunk := sys.stdin.buffer.read(64 * 1024):
+                log.write(chunk)
+    except OSError as exc:
+        raise UserError(f"failed to append project journal hook log: {exc}") from exc
+    return 0
+
+
 def _hook_body() -> str:
     python_exe = shlex.quote(sys.executable)
     script_path = shlex.quote(str(pathlib.Path(__file__).resolve()))
@@ -647,27 +994,19 @@ if [ "${{PROJECT_JOURNAL_INDEX_DISABLE:-}}" = "1" ]; then
   exit 0
 fi
 
-repo=$(git rev-parse --show-toplevel 2>/dev/null)
+repo=$(pwd -P 2>/dev/null)
 if [ -z "$repo" ]; then
   exit 0
 fi
 
 tmp_log=$(mktemp "${{TMPDIR:-/tmp}}/project-journal-index.XXXXXX" 2>/dev/null)
-if [ -z "$tmp_log" ]; then
-  tmp_log="${{TMPDIR:-/tmp}}/project-journal-index.$$"
-  : > "$tmp_log" 2>/dev/null || tmp_log=""
-fi
 
 if [ -n "$tmp_log" ]; then
   if ! {{
     date -u '+%Y-%m-%dT%H:%M:%SZ'
     {python_exe} {script_path} generate --repo "$repo" --output {DEFAULT_INDEX.as_posix()} --ensure-exclude
   }} > "$tmp_log" 2>&1; then
-    log_path=$(git rev-parse --git-path project-journal-index.log 2>/dev/null)
-    if [ -z "$log_path" ]; then
-      log_path="$repo/.git/project-journal-index.log"
-    fi
-    cat "$tmp_log" >> "$log_path" 2>/dev/null || true
+    {python_exe} {script_path} _append-hook-log --repo "$repo" < "$tmp_log" 2>/dev/null || true
   fi
   rm -f "$tmp_log"
 else
@@ -708,7 +1047,18 @@ def _hooks_dir_from_config(repo: pathlib.Path, raw_path: str) -> pathlib.Path:
 
 
 def _default_hooks_dir(repo: pathlib.Path) -> pathlib.Path:
-    hooks_dir = _git_path(repo, "hooks")
+    common_dir = _run_git(repo, "rev-parse", "--git-common-dir")
+    if common_dir.returncode != 0 or not common_dir.stdout.strip():
+        detail = (
+            common_dir.stderr.strip()
+            or common_dir.stdout.strip()
+            or "Git common directory lookup failed"
+        )
+        raise UserError(f"failed to resolve default hook directory: {detail}")
+    common_path = pathlib.Path(common_dir.stdout.strip())
+    if not common_path.is_absolute():
+        common_path = repo / common_path
+    hooks_dir = common_path.resolve() / "hooks"
     if hooks_dir.is_symlink():
         raise UserError(
             f"{hooks_dir} is a symlink; refusing to install hooks through hook directory links"
@@ -718,19 +1068,16 @@ def _default_hooks_dir(repo: pathlib.Path) -> pathlib.Path:
 
 def _hooks_dir(repo: pathlib.Path) -> pathlib.Path:
     for scope in ("--worktree", "--local"):
-        configured = _run_git(repo, "config", scope, "--get", "core.hooksPath")
+        configured = _run_git(
+            repo,
+            "config",
+            "--includes",
+            scope,
+            "--get",
+            "core.hooksPath",
+        )
         if configured.returncode == 0:
             return _hooks_dir_from_config(repo, configured.stdout.strip())
-    effective = _run_git(repo, "config", "--get", "core.hooksPath")
-    if effective.returncode == 0:
-        if not effective.stdout.strip():
-            raise UserError(
-                "core.hooksPath is empty; unset it or set a non-empty hook directory before installing"
-            )
-        raise UserError(
-            "effective core.hooksPath comes from non-local git config; "
-            "set a repo-local core.hooksPath or unset the global/system value before installing"
-        )
     return _default_hooks_dir(repo)
 
 
@@ -1061,6 +1408,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     adoption.add_argument("--repo", required=True)
     adoption.set_defaults(func=command_adoption_status)
+
+    hook_log = subparsers.add_parser(
+        "_append-hook-log",
+        help=argparse.SUPPRESS,
+    )
+    hook_log.add_argument("--repo", required=True)
+    hook_log.set_defaults(func=command_append_hook_log)
 
     hooks = subparsers.add_parser(
         "install-hooks", help="Install local Git hooks for index refresh."

@@ -9,7 +9,9 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
+from collections.abc import Callable
 from unittest import mock
 
 
@@ -21,9 +23,7 @@ TEMPLATES_MD = (
     pathlib.Path(__file__).resolve().parents[1] / "references" / "templates.md"
 )
 MIGRATION_PLAYBOOK_MD = (
-    pathlib.Path(__file__).resolve().parents[1]
-    / "references"
-    / "migration-playbook.md"
+    pathlib.Path(__file__).resolve().parents[1] / "references" / "migration-playbook.md"
 )
 SPEC = importlib.util.spec_from_file_location("project_journal", SCRIPT)
 assert SPEC is not None
@@ -86,6 +86,28 @@ class ProjectJournalTests(unittest.TestCase):
         result = self.run_cli("adoption-status", "--repo", str(repo))
         self.assertEqual(result.returncode, 0, result.stderr)
         return json.loads(result.stdout)
+
+    def capture_process(
+        self,
+        argv: list[str],
+        *,
+        timeout_seconds: float,
+        stdout_limit: int,
+        stdout_feed: Callable[[bytes], None] | None = None,
+        stdout_finish: Callable[[], None] | None = None,
+    ) -> subprocess.CompletedProcess[bytes]:
+        return project_journal._capture_bounded_process(
+            argv,
+            env={"PATH": os.environ.get("PATH", "")},
+            timeout_seconds=timeout_seconds,
+            stdout_limit=stdout_limit,
+            stderr_limit=1024,
+            stdout_feed=stdout_feed,
+            stdout_finish=stdout_finish,
+            stdout_overflow_error="test stdout exceeds limit",
+            stderr_overflow_error="test stderr exceeds limit",
+            timeout_error="test process timed out",
+        )
 
     def write_journal(
         self,
@@ -269,6 +291,177 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertEqual(tracked["tracked_non_generated_journal_count"], 1)
         self.assertEqual(tracked["valid_tracked_journal_count"], 1)
 
+    def test_git_policy_removes_ambient_git_control_environment(self) -> None:
+        repo = self.init_repo()
+        poison = {
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(self.root / "alternates"),
+            "GIT_COMMON_DIR": str(self.root / "common"),
+            "GIT_CONFIG": str(self.root / "config"),
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "core.worktree",
+            "GIT_CONFIG_VALUE_0": str(self.root / "other-worktree"),
+            "GIT_DIR": str(self.root / "other-git-dir"),
+            "GIT_EXEC_PATH": str(self.root / "git-exec"),
+            "GIT_INDEX_FILE": str(self.root / "other-index"),
+            "GIT_NO_LAZY_FETCH": "0",
+            "GIT_OBJECT_DIRECTORY": str(self.root / "objects"),
+            "GIT_WORK_TREE": str(self.root / "other-worktree"),
+        }
+        completed_text = subprocess.CompletedProcess([], 0, "", "")
+        completed_bytes = subprocess.CompletedProcess([], 0, b"", b"")
+
+        with mock.patch.dict(os.environ, poison, clear=False):
+            with mock.patch.object(
+                project_journal.subprocess,
+                "run",
+                side_effect=(completed_text, completed_bytes),
+            ) as run:
+                project_journal._run_git(repo, "rev-parse", "--show-toplevel")
+                project_journal._run_git_bytes(repo, "cat-file", "-s", "a" * 40)
+
+        expected_git_env = {
+            key: value
+            for key, value in project_journal.SAFE_GIT_ENV.items()
+            if key.startswith("GIT_")
+        }
+        for call in run.call_args_list:
+            child_env = call.kwargs["env"]
+            actual_git_env = {
+                key: value for key, value in child_env.items() if key.startswith("GIT_")
+            }
+            self.assertEqual(actual_git_env, expected_git_env)
+            self.assertNotIn("GIT_DIR", child_env)
+            self.assertNotIn("GIT_INDEX_FILE", child_env)
+            self.assertNotIn("GIT_OBJECT_DIRECTORY", child_env)
+            self.assertEqual(child_env["GIT_NO_LAZY_FETCH"], "1")
+            self.assertEqual(child_env["GIT_NO_REPLACE_OBJECTS"], "1")
+            self.assertEqual(child_env["GIT_OPTIONAL_LOCKS"], "0")
+            self.assertEqual(child_env["GIT_TERMINAL_PROMPT"], "0")
+            self.assertEqual(child_env["GIT_ASKPASS"], "")
+            self.assertIn("--no-optional-locks", call.args[0])
+            self.assertIn("core.fsmonitor=false", call.args[0])
+            self.assertIn(
+                f"core.hooksPath={os.devnull}",
+                call.args[0],
+            )
+            self.assertIn(
+                f"core.attributesFile={os.devnull}",
+                call.args[0],
+            )
+
+    def test_adoption_status_ignores_poisoned_git_repo_and_object_env(
+        self,
+    ) -> None:
+        requested = self.init_repo("requested")
+        attacker = self.init_repo("attacker")
+        attacker_journal = self.write_journal(
+            attacker,
+            "docs/project_journal/2026/05/2026-05-05-attacker-a1b2c3.md",
+            entry_id="20260505-a1b2c3",
+            title="Attacker Journal",
+            status="active",
+            updated="2026-05-05",
+        )
+        add = run_git(
+            attacker,
+            "add",
+            "--",
+            str(attacker_journal.relative_to(attacker)),
+        )
+        self.assertEqual(add.returncode, 0, add.stderr)
+
+        poison_config = self.root / "poison-gitconfig"
+        poison_config.write_text(
+            textwrap.dedent(
+                f"""\
+                [core]
+                    worktree = {attacker}
+                [remote "origin"]
+                    promisor = true
+                """
+            ),
+            encoding="utf-8",
+        )
+        poison = {
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(attacker / ".git/objects"),
+            "GIT_COMMON_DIR": str(attacker / ".git"),
+            "GIT_CONFIG": str(poison_config),
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_GLOBAL": str(poison_config),
+            "GIT_CONFIG_KEY_0": "core.worktree",
+            "GIT_CONFIG_NOSYSTEM": "0",
+            "GIT_CONFIG_SYSTEM": str(poison_config),
+            "GIT_CONFIG_VALUE_0": str(attacker),
+            "GIT_DIR": str(attacker / ".git"),
+            "GIT_INDEX_FILE": str(attacker / ".git/index"),
+            "GIT_NO_LAZY_FETCH": "0",
+            "GIT_OBJECT_DIRECTORY": str(attacker / ".git/objects"),
+            "GIT_WORK_TREE": str(attacker),
+        }
+
+        result = self.run_cli(
+            "adoption-status",
+            "--repo",
+            str(requested),
+            env=poison,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        status = json.loads(result.stdout)
+        self.assertEqual(pathlib.Path(status["repo"]), requested.resolve())
+        self.assertFalse(status["tracked_journal_adopted"])
+        self.assertEqual(status["valid_tracked_journal_count"], 0)
+
+    def test_missing_index_blob_does_not_lazy_fetch_under_poisoned_env(
+        self,
+    ) -> None:
+        repo = self.init_repo()
+        remote = self.root / "remote.git"
+        remote.mkdir()
+        init_remote = run_git(remote, "init", "--bare")
+        self.assertEqual(init_remote.returncode, 0, init_remote.stderr)
+
+        marker = self.root / "upload-pack-ran"
+        upload_pack = self.root / "upload-pack"
+        upload_pack.write_text(
+            f"#!/bin/sh\nprintf invoked > {marker}\nexit 1\n",
+            encoding="utf-8",
+        )
+        upload_pack.chmod(0o755)
+        for key, value in (
+            ("core.repositoryFormatVersion", "1"),
+            ("extensions.partialClone", "origin"),
+            ("remote.origin.promisor", "true"),
+            ("remote.origin.partialCloneFilter", "blob:none"),
+            ("remote.origin.url", str(remote)),
+            ("remote.origin.uploadpack", str(upload_pack)),
+        ):
+            configured = run_git(repo, "config", key, value)
+            self.assertEqual(configured.returncode, 0, configured.stderr)
+
+        missing_oid = "a" * 40
+        rel_path = "docs/project_journal/2026/05/2026-05-05-missing-object-a1b2c3.md"
+        staged = run_git(
+            repo,
+            "update-index",
+            "--add",
+            "--info-only",
+            "--cacheinfo",
+            f"100644,{missing_oid},{rel_path}",
+        )
+        self.assertEqual(staged.returncode, 0, staged.stderr)
+
+        result = self.run_cli(
+            "adoption-status",
+            "--repo",
+            str(repo),
+            env={"GIT_NO_LAZY_FETCH": "0"},
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("failed to inspect index blob", result.stderr)
+        self.assertFalse(marker.exists())
+
     def test_adoption_status_rejects_invalid_tracked_journal_entry(self) -> None:
         repo = self.init_repo()
         journal = self.write_journal(
@@ -356,10 +549,7 @@ class ProjectJournalTests(unittest.TestCase):
             status="active",
             updated="2026-05-05",
         )
-        journal = (
-            repo
-            / "docs/project_journal/2026/05/2026-05-05-symlink-a1b2c3.md"
-        )
+        journal = repo / "docs/project_journal/2026/05/2026-05-05-symlink-a1b2c3.md"
         journal.parent.mkdir(parents=True)
         journal.symlink_to(source)
         add = run_git(repo, "add", "--", str(journal.relative_to(repo)))
@@ -387,8 +577,7 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertEqual(blob.returncode, 0, blob.stderr)
         rel_path = journal.relative_to(repo).as_posix()
         index_info = "".join(
-            f"100644 {blob.stdout.strip()} {stage}\t{rel_path}\n"
-            for stage in (1, 2, 3)
+            f"100644 {blob.stdout.strip()} {stage}\t{rel_path}\n" for stage in (1, 2, 3)
         )
         update = subprocess.run(
             ["git", "-C", str(repo), "update-index", "--index-info"],
@@ -506,14 +695,297 @@ class ProjectJournalTests(unittest.TestCase):
             b"100644 " + oid + b" 0\t" + raw_path,
             b"100644 not-an-oid 0\t" + raw_path + b"\0",
             b"100644 " + oid + b" 0 docs/project_journal/bad.md\0",
-            b"100644 "
-            + oid
-            + b" 0\tdocs/project_journal/../outside.md\0",
+            b"100644 " + oid + b" 0\tdocs/project_journal/../outside.md\0",
         )
         for output in malformed_outputs:
             with self.subTest(output=output):
                 with self.assertRaises(project_journal.UserError):
                     project_journal._parse_index_journal_blobs(output)
+
+    def test_index_stream_parser_enforces_record_limit_while_feeding(
+        self,
+    ) -> None:
+        oid = b"a" * 40
+        records = b"".join(
+            b"100644 "
+            + oid
+            + b" 0\tdocs/project_journal/2026/05/entry-"
+            + str(index).encode("ascii")
+            + b".md\0"
+            for index in range(3)
+        )
+        parser = project_journal._IndexStageStreamParser(max_records=2)
+
+        with self.assertRaisesRegex(
+            project_journal.UserError,
+            "exceeds 2 records",
+        ):
+            parser.feed(records)
+
+    def test_bounded_capture_does_not_spawn_without_selector(self) -> None:
+        with mock.patch.object(
+            project_journal.selectors,
+            "DefaultSelector",
+            side_effect=OSError("too many open files"),
+        ):
+            with mock.patch.object(
+                project_journal.subprocess,
+                "Popen",
+            ) as popen:
+                with self.assertRaisesRegex(
+                    project_journal.UserError,
+                    "failed to create Git index snapshot selector",
+                ):
+                    self.capture_process(
+                        [sys.executable, "-c", "pass"],
+                        timeout_seconds=1,
+                        stdout_limit=1024,
+                    )
+
+        popen.assert_not_called()
+
+    def test_bounded_capture_kills_process_group_on_stdout_overflow(
+        self,
+    ) -> None:
+        marker = self.root / "overflow-child-survived"
+        ready = self.root / "overflow-child-started"
+        child = self.root / "delayed-marker.py"
+        child.write_text(
+            textwrap.dedent(
+                """\
+                import pathlib
+                import sys
+                import time
+
+                time.sleep(0.5)
+                pathlib.Path(sys.argv[1]).write_text("survived", encoding="utf-8")
+                """
+            ),
+            encoding="utf-8",
+        )
+        producer = self.root / "overflow-producer.py"
+        producer.write_text(
+            textwrap.dedent(
+                """\
+                import os
+                import pathlib
+                import subprocess
+                import sys
+                import time
+
+                subprocess.Popen([sys.executable, sys.argv[1], sys.argv[2]])
+                pathlib.Path(sys.argv[3]).write_text("started", encoding="utf-8")
+                os.write(1, b"x" * 8192)
+                time.sleep(30)
+                """
+            ),
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(
+            project_journal.UserError,
+            "test stdout exceeds limit",
+        ):
+            self.capture_process(
+                [
+                    sys.executable,
+                    str(producer),
+                    str(child),
+                    str(marker),
+                    str(ready),
+                ],
+                timeout_seconds=5,
+                stdout_limit=1024,
+            )
+
+        self.assertTrue(ready.exists())
+        time.sleep(0.7)
+        self.assertFalse(marker.exists())
+
+    def test_bounded_capture_kills_process_group_on_stream_parse_error(
+        self,
+    ) -> None:
+        marker = self.root / "parse-child-survived"
+        ready = self.root / "parse-child-started"
+        child = self.root / "parse-delayed-marker.py"
+        child.write_text(
+            textwrap.dedent(
+                """\
+                import pathlib
+                import sys
+                import time
+
+                time.sleep(0.5)
+                pathlib.Path(sys.argv[1]).write_text("survived", encoding="utf-8")
+                """
+            ),
+            encoding="utf-8",
+        )
+        producer = self.root / "parse-producer.py"
+        producer.write_text(
+            textwrap.dedent(
+                """\
+                import os
+                import pathlib
+                import subprocess
+                import sys
+                import time
+
+                subprocess.Popen([sys.executable, sys.argv[1], sys.argv[2]])
+                pathlib.Path(sys.argv[3]).write_text("started", encoding="utf-8")
+                os.write(1, b"malformed-stage-record\\0")
+                time.sleep(30)
+                """
+            ),
+            encoding="utf-8",
+        )
+        parser = project_journal._IndexStageStreamParser()
+
+        with self.assertRaisesRegex(
+            project_journal.UserError,
+            "malformed git ls-files stage record",
+        ):
+            self.capture_process(
+                [
+                    sys.executable,
+                    str(producer),
+                    str(child),
+                    str(marker),
+                    str(ready),
+                ],
+                timeout_seconds=5,
+                stdout_limit=1024,
+                stdout_feed=parser.feed,
+                stdout_finish=parser.finish,
+            )
+
+        self.assertTrue(ready.exists())
+        time.sleep(0.7)
+        self.assertFalse(marker.exists())
+
+    def test_bounded_capture_kills_process_group_on_timeout(self) -> None:
+        marker = self.root / "timeout-child-survived"
+        ready = self.root / "timeout-child-started"
+        release = self.root / "timeout-child-release"
+        child = self.root / "timeout-delayed-marker.py"
+        child.write_text(
+            textwrap.dedent(
+                """\
+                import pathlib
+                import sys
+                import time
+
+                release = pathlib.Path(sys.argv[2])
+                while not release.exists():
+                    time.sleep(0.005)
+                time.sleep(0.3)
+                pathlib.Path(sys.argv[1]).write_text("survived", encoding="utf-8")
+                """
+            ),
+            encoding="utf-8",
+        )
+        producer = self.root / "timeout-producer.py"
+        producer.write_text(
+            textwrap.dedent(
+                """\
+                import pathlib
+                import subprocess
+                import sys
+                import time
+
+                subprocess.Popen(
+                    [sys.executable, sys.argv[1], sys.argv[2], sys.argv[4]]
+                )
+                pathlib.Path(sys.argv[3]).write_text("started", encoding="utf-8")
+                time.sleep(30)
+                """
+            ),
+            encoding="utf-8",
+        )
+
+        argv = [
+            sys.executable,
+            str(producer),
+            str(child),
+            str(marker),
+            str(ready),
+            str(release),
+        ]
+        process = subprocess.Popen(
+            argv,
+            env={"PATH": os.environ.get("PATH", "")},
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+
+        def cleanup_process() -> None:
+            if process.poll() is not None:
+                return
+            project_journal._signal_process_group(
+                process,
+                getattr(
+                    project_journal.signal,
+                    "SIGKILL",
+                    project_journal.signal.SIGTERM,
+                ),
+            )
+            try:
+                process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                process.kill()
+
+        self.addCleanup(cleanup_process)
+        ready_deadline = time.monotonic() + 5
+        while not ready.exists() and time.monotonic() < ready_deadline:
+            self.assertIsNone(process.poll())
+            time.sleep(0.01)
+        self.assertTrue(ready.exists())
+        release.write_text("go", encoding="utf-8")
+
+        with mock.patch.object(
+            project_journal.subprocess,
+            "Popen",
+            return_value=process,
+        ):
+            with self.assertRaisesRegex(
+                project_journal.UserError,
+                "test process timed out",
+            ):
+                self.capture_process(
+                    argv,
+                    timeout_seconds=0.1,
+                    stdout_limit=1024,
+                )
+
+        time.sleep(0.4)
+        self.assertFalse(marker.exists())
+
+    def test_bounded_capture_enforces_stderr_limit(self) -> None:
+        producer = self.root / "stderr-producer.py"
+        producer.write_text(
+            textwrap.dedent(
+                """\
+                import os
+                import time
+
+                os.write(2, b"x" * 2048)
+                time.sleep(30)
+                """
+            ),
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(
+            project_journal.UserError,
+            "test stderr exceeds limit",
+        ):
+            self.capture_process(
+                [sys.executable, str(producer)],
+                timeout_seconds=5,
+                stdout_limit=1024,
+            )
 
     def test_validate_rejects_invalid_status_and_broken_superseded_link(self) -> None:
         repo = self.init_repo()
@@ -611,6 +1083,8 @@ class ProjectJournalTests(unittest.TestCase):
             "accepts only unconflicted stage-0 regular-file entries and validates the exact indexed blob",
             skill,
         )
+        self.assertIn("clears ambient Git control variables", skill)
+        self.assertIn("monotonic time, byte, record, and stderr limits", skill)
         self.assertIn(
             "leave `docs/PROJECT_STATE.md`, `docs/PROJECT_TODO.md`, and `docs/project_journal/` unchanged",
             skill,
@@ -679,6 +1153,8 @@ class ProjectJournalTests(unittest.TestCase):
             "generated `INDEX.md` does not establish adoption",
             readme,
         )
+        self.assertIn("ignores ambient Git control/configuration redirections", readme)
+        self.assertIn("byte, record, and stderr bounds", readme)
         self.assertIn(
             "explicit product need justifies first adoption",
             templates,
@@ -772,6 +1248,7 @@ class ProjectJournalTests(unittest.TestCase):
             self.assertTrue(hook.exists())
             content = hook.read_text(encoding="utf-8")
             self.assertIn(project_journal.HOOK_BEGIN, content)
+            self.assertNotIn("project-journal-index.$$", content)
 
         hook_run = subprocess.run(
             [str(repo / ".git/hooks/post-merge")],
@@ -804,6 +1281,92 @@ class ProjectJournalTests(unittest.TestCase):
         log = repo / ".git/project-journal-index.log"
         self.assertTrue(log.exists())
         self.assertIn("invalid status", log.read_text(encoding="utf-8"))
+
+    def test_installed_hook_ignores_ambient_git_repo_redirection(self) -> None:
+        repo = self.init_repo("victim")
+        journal = self.write_journal(
+            repo,
+            "docs/project_journal/2026/05/2026-05-05-victim-a1b2c3.md",
+            entry_id="20260505-a1b2c3",
+            title="Victim Work",
+            status="active",
+            updated="2026-05-05",
+        )
+        attacker = self.init_repo("hook-attacker")
+        attacker_journal = self.write_journal(
+            attacker,
+            "docs/project_journal/2026/05/2026-05-05-attacker-d4e5f6.md",
+            entry_id="20260505-d4e5f6",
+            title="Attacker Work",
+            status="active",
+            updated="2026-05-05",
+        )
+        attacker_add = run_git(
+            attacker,
+            "add",
+            "--",
+            str(attacker_journal.relative_to(attacker)),
+        )
+        self.assertEqual(attacker_add.returncode, 0, attacker_add.stderr)
+
+        install = self.run_cli("install-hooks", "--repo", str(repo))
+        self.assertEqual(install.returncode, 0, install.stderr)
+        hook = repo / ".git/hooks/post-merge"
+        poison = {
+            "PATH": os.environ.get("PATH", ""),
+            "HOME": str(self.home),
+            "TMPDIR": str(self.root),
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(attacker / ".git/objects"),
+            "GIT_COMMON_DIR": str(attacker / ".git"),
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "core.worktree",
+            "GIT_CONFIG_VALUE_0": str(attacker),
+            "GIT_DIR": str(attacker / ".git"),
+            "GIT_INDEX_FILE": str(attacker / ".git/index"),
+            "GIT_OBJECT_DIRECTORY": str(attacker / ".git/objects"),
+            "GIT_WORK_TREE": str(attacker),
+        }
+
+        hook_run = subprocess.run(
+            [str(hook)],
+            cwd=repo,
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=poison,
+        )
+
+        self.assertEqual(hook_run.returncode, 0, hook_run.stderr)
+        self.assertTrue((repo / "docs/project_journal/INDEX.md").exists())
+        self.assertFalse((attacker / "docs/project_journal/INDEX.md").exists())
+
+        journal.write_text(
+            journal.read_text(encoding="utf-8").replace(
+                "status: active",
+                "status: invalid",
+            ),
+            encoding="utf-8",
+        )
+        failing_hook_run = subprocess.run(
+            [str(hook)],
+            cwd=repo,
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=poison,
+        )
+
+        self.assertEqual(
+            failing_hook_run.returncode,
+            0,
+            failing_hook_run.stderr,
+        )
+        victim_log = repo / ".git/project-journal-index.log"
+        self.assertTrue(victim_log.exists())
+        self.assertIn("invalid status", victim_log.read_text(encoding="utf-8"))
+        self.assertFalse((attacker / ".git/project-journal-index.log").exists())
 
     def test_post_rewrite_hook_drains_stdin(self) -> None:
         repo = self.init_repo()
@@ -929,6 +1492,22 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertTrue((repo / ".githooks/post-merge").exists())
         self.assertFalse((repo / ".git/hooks/post-merge").exists())
 
+    def test_install_hooks_respects_included_local_hooks_path(self) -> None:
+        repo = self.init_repo()
+        included = repo / ".git/hooks.inc"
+        included.write_text(
+            "[core]\n    hooksPath = .githooks\n",
+            encoding="utf-8",
+        )
+        result = run_git(repo, "config", "include.path", "hooks.inc")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        install = self.run_cli("install-hooks", "--repo", str(repo))
+
+        self.assertEqual(install.returncode, 0, install.stderr)
+        self.assertTrue((repo / ".githooks/post-merge").exists())
+        self.assertFalse((repo / ".git/hooks/post-merge").exists())
+
     def test_install_hooks_respects_worktree_core_hooks_path(self) -> None:
         repo = self.init_repo()
         config_extension = run_git(repo, "config", "extensions.worktreeConfig", "true")
@@ -954,7 +1533,7 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertFalse((repo / "post-merge").exists())
         self.assertFalse((repo / ".git/hooks/post-merge").exists())
 
-    def test_install_hooks_refuses_non_local_effective_hooks_path(self) -> None:
+    def test_install_hooks_ignores_ambient_global_hooks_path(self) -> None:
         repo = self.init_repo()
         global_config = self.root / "global-gitconfig"
         global_hooks = self.root / "global-hooks"
@@ -973,9 +1552,9 @@ class ProjectJournalTests(unittest.TestCase):
         }
 
         result = self.run_cli("install-hooks", "--repo", str(repo), env=env)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("non-local git config", result.stderr)
-        self.assertFalse((repo / ".git/hooks/post-merge").exists())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((repo / ".git/hooks/post-merge").exists())
+        self.assertFalse((global_hooks / "post-merge").exists())
 
     def test_install_hooks_refuses_configured_hooks_path_outside_repo(self) -> None:
         for name, hooks_path in (
