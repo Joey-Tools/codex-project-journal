@@ -218,8 +218,8 @@ class _GitRuntime:
     source_executable: pathlib.Path
     version: tuple[int, int, int]
     digest: str
-    file_identity: tuple[int, int, int, int, int]
-    directory_identity: tuple[int, int, int, int]
+    file_identity: tuple[int, int, int, int, int, int]
+    directory_identity: tuple[int, int, int, int, int]
     snapshot_owner: tempfile.TemporaryDirectory[str]
 
 
@@ -280,7 +280,7 @@ def _cleanup_git_launch_after_terminal(
 class _HookTargetSnapshot:
     name: str
     exists: bool
-    identity: tuple[int, int, int, int, int, int] | None = None
+    identity: tuple[int, int, int, int, int, int, int] | None = None
     digest: str | None = None
 
 
@@ -298,7 +298,7 @@ class _HookPathPlan:
 class _BoundHookDirectory:
     path: pathlib.Path
     fd: int
-    identity: tuple[int, int, int, int]
+    identity: tuple[int, int, int, int, int]
     parent_fd: int | None
     component: str | None
     access_policy_required: bool
@@ -308,11 +308,11 @@ class _BoundHookDirectory:
 class _HookDirectoryBinding:
     path: pathlib.Path
     fd: int
-    identity: tuple[int, int, int, int]
+    identity: tuple[int, int, int, int, int]
     ancestors: tuple[_BoundHookDirectory, ...]
     targets: tuple[_HookTargetSnapshot, ...]
     install_lock_fd: int | None = None
-    install_lock_identity: tuple[int, int, int, int, int] | None = None
+    install_lock_identity: tuple[int, int, int, int, int, int] | None = None
 
 
 @dataclasses.dataclass
@@ -450,23 +450,121 @@ _GIT_RUNTIME: _GitRuntime | None = None
 _GIT_RUNTIME_ERROR: UserError | None = None
 
 
-def _file_identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
+def _file_identity(value: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    """Bind file object identity, owner/group/mode access policy, and size."""
     return (
         value.st_dev,
         value.st_ino,
         value.st_uid,
+        value.st_gid,
         stat.S_IMODE(value.st_mode),
         value.st_size,
     )
 
 
-def _directory_identity(value: os.stat_result) -> tuple[int, int, int, int]:
+def _directory_identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
+    """Bind directory object identity and owner/group/mode access policy."""
     return (
         value.st_dev,
         value.st_ino,
         value.st_uid,
+        value.st_gid,
         stat.S_IMODE(value.st_mode),
     )
+
+
+def _darwin_fd_has_extended_acl(fd: int) -> bool:
+    try:
+        library = ctypes.CDLL(None, use_errno=True)
+        acl_get_fd_np = library.acl_get_fd_np
+        acl_free = library.acl_free
+    except (AttributeError, OSError) as exc:
+        raise UnsupportedPlatform(
+            "Darwin extended ACL inspection is unavailable"
+        ) from exc
+
+    acl_get_fd_np.argtypes = [ctypes.c_int, ctypes.c_int]
+    acl_get_fd_np.restype = ctypes.c_void_p
+    acl_free.argtypes = [ctypes.c_void_p]
+    acl_free.restype = ctypes.c_int
+    ctypes.set_errno(0)
+    acl = acl_get_fd_np(fd, 0x00000100)  # ACL_TYPE_EXTENDED
+    if not acl:
+        error_number = ctypes.get_errno()
+        if error_number in {
+            errno.ENOENT,
+            errno.ENOTSUP,
+            getattr(errno, "EOPNOTSUPP", errno.ENOTSUP),
+        }:
+            return False
+        raise OSError(
+            error_number or errno.EIO,
+            os.strerror(error_number or errno.EIO),
+        )
+    ctypes.set_errno(0)
+    if acl_free(acl) != 0:
+        error_number = ctypes.get_errno() or errno.EIO
+        raise OSError(error_number, os.strerror(error_number))
+    return True
+
+
+def _fd_has_extended_acl(fd: int) -> bool:
+    """Return ACL presence or fail closed when this POSIX host cannot inspect it."""
+    if sys.platform == "darwin":
+        return _darwin_fd_has_extended_acl(fd)
+    if sys.platform.startswith("linux"):
+        listxattr = getattr(os, "listxattr", None)
+        if listxattr is None:
+            raise UnsupportedPlatform(
+                "Linux extended ACL inspection requires os.listxattr"
+            )
+        try:
+            names = listxattr(fd)
+        except OSError as exc:
+            if exc.errno in {
+                errno.ENOTSUP,
+                getattr(errno, "EOPNOTSUPP", errno.ENOTSUP),
+            }:
+                return False
+            raise
+        acl_names = {
+            "system.posix_acl_access",
+            "system.posix_acl_default",
+            "system.nfs4_acl",
+            "system.richacl",
+        }
+        return any(os.fsdecode(name) in acl_names for name in names)
+    raise UnsupportedPlatform(
+        f"extended ACL inspection is unsupported on {sys.platform!r}"
+    )
+
+
+def _reject_extended_acl(
+    fd: int,
+    path: pathlib.Path,
+    subject: str,
+) -> None:
+    try:
+        has_extended_acl = _fd_has_extended_acl(fd)
+    except UnsupportedPlatform:
+        raise
+    except OSError as exc:
+        raise UserError(
+            f"{subject} access-policy inspection failed: {path}: {exc}"
+        ) from exc
+    if has_extended_acl:
+        raise UserError(f"{subject} has an unsupported extended ACL: {path}")
+
+
+def _reject_runtime_extended_acl(
+    fd: int,
+    path: pathlib.Path,
+    subject: str,
+) -> None:
+    try:
+        _reject_extended_acl(fd, path, subject)
+    except UserError as exc:
+        raise OSError(str(exc)) from exc
 
 
 def _git_source_identity(value: os.stat_result) -> tuple[int, ...]:
@@ -608,7 +706,13 @@ def _revalidate_git_runtime_directory(
     _check_deadline(deadline, deadline_error)
     directory_stat = os.stat(runtime.executable.parent, follow_symlinks=False)
     _check_deadline(deadline, deadline_error)
-    expected_dev, expected_ino, expected_uid, expected_mode = runtime.directory_identity
+    (
+        expected_dev,
+        expected_ino,
+        expected_uid,
+        expected_gid,
+        expected_mode,
+    ) = runtime.directory_identity
     if (
         not stat.S_ISDIR(directory_stat.st_mode)
         or directory_stat.st_dev != expected_dev
@@ -617,11 +721,40 @@ def _revalidate_git_runtime_directory(
         raise OSError("owner-private Git snapshot directory identity changed")
     if (
         directory_stat.st_uid != expected_uid
+        or directory_stat.st_gid != expected_gid
         or stat.S_IMODE(directory_stat.st_mode) != expected_mode
         or directory_stat.st_uid != os.geteuid()
         or stat.S_IMODE(directory_stat.st_mode) != 0o700
     ):
         raise OSError("owner-private Git snapshot directory access policy changed")
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | _required_open_flag("O_NOFOLLOW")
+        | _required_open_flag("O_NONBLOCK")
+    )
+    _check_deadline(deadline, deadline_error)
+    directory_fd = os.open(runtime.executable.parent, directory_flags)
+    try:
+        _check_deadline(deadline, deadline_error)
+        descriptor_stat = os.fstat(directory_fd)
+        if _directory_identity(descriptor_stat) != runtime.directory_identity:
+            raise OSError("owner-private Git snapshot directory binding changed")
+        _reject_runtime_extended_acl(
+            directory_fd,
+            runtime.executable.parent,
+            "owner-private Git snapshot directory",
+        )
+        _check_deadline(deadline, deadline_error)
+        descriptor_after = os.fstat(directory_fd)
+        if _directory_identity(descriptor_after) != runtime.directory_identity:
+            raise OSError(
+                "owner-private Git snapshot directory access policy changed "
+                "during ACL inspection"
+            )
+    finally:
+        os.close(directory_fd)
 
 
 def _revalidate_open_git_runtime_snapshot(
@@ -636,9 +769,14 @@ def _revalidate_open_git_runtime_snapshot(
     _check_deadline(deadline, deadline_error)
     path_stat = os.stat(runtime.executable, follow_symlinks=False)
     _check_deadline(deadline, deadline_error)
-    expected_dev, expected_ino, expected_uid, expected_mode, expected_size = (
-        runtime.file_identity
-    )
+    (
+        expected_dev,
+        expected_ino,
+        expected_uid,
+        expected_gid,
+        expected_mode,
+        expected_size,
+    ) = runtime.file_identity
     for value in (descriptor_stat, path_stat):
         if (
             not stat.S_ISREG(value.st_mode)
@@ -648,6 +786,7 @@ def _revalidate_open_git_runtime_snapshot(
             raise OSError("owner-private Git snapshot identity changed")
         if (
             value.st_uid != expected_uid
+            or value.st_gid != expected_gid
             or stat.S_IMODE(value.st_mode) != expected_mode
             or value.st_uid != os.geteuid()
             or stat.S_IMODE(value.st_mode) != 0o500
@@ -655,6 +794,12 @@ def _revalidate_open_git_runtime_snapshot(
             raise OSError("owner-private Git snapshot access policy changed")
         if value.st_size != expected_size:
             raise OSError("owner-private Git snapshot content size changed")
+    _reject_runtime_extended_acl(
+        fd,
+        runtime.executable,
+        "owner-private Git snapshot",
+    )
+    _check_deadline(deadline, deadline_error)
 
 
 def _open_bound_git_runtime_snapshot(
@@ -721,7 +866,7 @@ def _verify_git_runtime_snapshot(
                 deadline=deadline,
                 deadline_error=deadline_error,
             )
-            if size != runtime.file_identity[4]:
+            if size != runtime.file_identity[5]:
                 raise OSError("owner-private Git snapshot size changed")
             if digest != runtime.digest:
                 raise OSError("owner-private Git snapshot content changed")
@@ -772,6 +917,27 @@ def _prepare_git_runtime_launch(
             or stat.S_IMODE(directory_stat.st_mode) != 0o700
         ):
             raise OSError("command-private Git launch directory is not owner-private")
+        directory_flags = (
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | _required_open_flag("O_NOFOLLOW")
+            | _required_open_flag("O_NONBLOCK")
+        )
+        directory_fd = os.open(directory, directory_flags)
+        try:
+            if _directory_identity(os.fstat(directory_fd)) != _directory_identity(
+                directory_stat
+            ):
+                raise OSError("command-private Git launch directory binding changed")
+            _reject_runtime_extended_acl(
+                directory_fd,
+                directory,
+                "command-private Git launch directory",
+            )
+        finally:
+            os.close(directory_fd)
+        _check_deadline(deadline, deadline_error)
 
         executable = directory / "git"
         flags = (
@@ -808,13 +974,19 @@ def _prepare_git_runtime_launch(
                             "short write while preparing command-private Git launch"
                         )
                     offset += written
-            if copied != runtime.file_identity[4]:
+            if copied != runtime.file_identity[5]:
                 raise OSError("owner-private Git snapshot size changed before launch")
             if digest.hexdigest() != runtime.digest:
                 raise OSError(
                     "owner-private Git snapshot content changed before launch"
                 )
             os.fchmod(destination_fd, 0o500)
+            _check_deadline(deadline, deadline_error)
+            _reject_runtime_extended_acl(
+                destination_fd,
+                executable,
+                "command-private Git launch",
+            )
             _check_deadline(deadline, deadline_error)
             destination_written_stat = os.fstat(destination_fd)
         finally:
@@ -844,9 +1016,30 @@ def _prepare_git_runtime_launch(
             raise OSError("command-private Git launch directory identity changed")
         if (
             locked_directory_stat.st_uid != os.geteuid()
+            or locked_directory_stat.st_gid != directory_stat.st_gid
             or stat.S_IMODE(locked_directory_stat.st_mode) != 0o500
         ):
             raise OSError("command-private Git launch directory access policy changed")
+        locked_directory_fd = os.open(directory, directory_flags)
+        try:
+            if (
+                locked_directory_stat.st_dev,
+                locked_directory_stat.st_ino,
+                locked_directory_stat.st_uid,
+                locked_directory_stat.st_gid,
+                stat.S_IMODE(locked_directory_stat.st_mode),
+            ) != _directory_identity(os.fstat(locked_directory_fd)):
+                raise OSError(
+                    "command-private Git launch directory binding changed after lock"
+                )
+            _reject_runtime_extended_acl(
+                locked_directory_fd,
+                directory,
+                "command-private Git launch directory",
+            )
+        finally:
+            os.close(locked_directory_fd)
+        _check_deadline(deadline, deadline_error)
 
         read_flags = (
             os.O_RDONLY
@@ -859,6 +1052,7 @@ def _prepare_git_runtime_launch(
         try:
             expected_dev = destination_written_stat.st_dev
             expected_ino = destination_written_stat.st_ino
+            expected_gid = destination_written_stat.st_gid
 
             def validate_destination_stats(
                 values: tuple[os.stat_result, ...],
@@ -872,6 +1066,7 @@ def _prepare_git_runtime_launch(
                         raise OSError("command-private Git launch identity changed")
                     if (
                         value.st_uid != os.geteuid()
+                        or value.st_gid != expected_gid
                         or stat.S_IMODE(value.st_mode) != 0o500
                         or value.st_nlink != 1
                     ):
@@ -894,6 +1089,11 @@ def _prepare_git_runtime_launch(
                     destination_path_before,
                 )
             )
+            _reject_runtime_extended_acl(
+                destination_read_fd,
+                executable,
+                "command-private Git launch",
+            )
             destination_digest, destination_size = _hash_open_file(
                 destination_read_fd,
                 deadline=deadline,
@@ -912,6 +1112,11 @@ def _prepare_git_runtime_launch(
                     destination_after,
                     destination_path_after,
                 )
+            )
+            _reject_runtime_extended_acl(
+                destination_read_fd,
+                executable,
+                "command-private Git launch",
             )
             if destination_size != copied or destination_digest != runtime.digest:
                 raise OSError(
@@ -1782,9 +1987,11 @@ def _terminate_process_group_and_reap(
             )
         if probe_error is not None:
             issues.append(f"failed to probe bound process group: {probe_error}")
+        final_group_signal_sent = False
         if group_exists:
             kill_signal = getattr(signal, "SIGKILL", signal.SIGTERM)
             kill_result = _signal_process_group(process, kill_signal)
+            final_group_signal_sent = True
             if kill_result.error is not None:
                 issues.append(
                     f"failed to signal bound process group with SIGKILL: "
@@ -1792,6 +1999,23 @@ def _terminate_process_group_and_reap(
                 )
         kill_deadline = time.monotonic() + GIT_PROCESS_KILL_DRAIN_SECONDS
         _discard_selector_output(selector, kill_deadline)
+        if final_group_signal_sent:
+            # The unreaped leader still fences this numeric PID/PGID. Prove the
+            # group is absent before transferring ownership to reap-only; after
+            # that handoff a reused numeric PGID must never be probed or signalled.
+            final_group_exists, final_probe_error = (
+                _wait_for_bound_process_group_absence(
+                    process,
+                    kill_deadline,
+                )
+            )
+            if final_probe_error is not None:
+                issues.append(
+                    "failed to prove bound process-group absence after final "
+                    f"SIGKILL: {final_probe_error}"
+                )
+            elif final_group_exists:
+                issues.append("bound process group remained after final SIGKILL")
         try:
             observed_returncode = _wait_for_process_status_without_reaping(
                 process,
@@ -2230,8 +2454,8 @@ def _snapshot_git_executable(
 ) -> tuple[
     pathlib.Path,
     str,
+    tuple[int, int, int, int, int, int],
     tuple[int, int, int, int, int],
-    tuple[int, int, int, int],
     tempfile.TemporaryDirectory[str],
 ]:
     no_follow = _required_open_flag("O_NOFOLLOW")
@@ -2301,6 +2525,12 @@ def _snapshot_git_executable(
                 _check_deadline(deadline, deadline_error)
                 os.fsync(destination_fd)
                 _check_deadline(deadline, deadline_error)
+                _reject_runtime_extended_acl(
+                    destination_fd,
+                    snapshot,
+                    "owner-private Git snapshot",
+                )
+                _check_deadline(deadline, deadline_error)
                 destination_stat = os.fstat(destination_fd)
             finally:
                 os.close(destination_fd)
@@ -2350,6 +2580,35 @@ def _snapshot_git_executable(
         ):
             raise OSError("Git runtime snapshot size does not match its source")
         directory_stat = os.stat(directory, follow_symlinks=False)
+        _check_deadline(deadline, deadline_error)
+        directory_flags = (
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | no_follow
+            | nonblock
+        )
+        directory_fd = os.open(directory, directory_flags)
+        try:
+            bound_directory_stat = os.fstat(directory_fd)
+            if _directory_identity(bound_directory_stat) != _directory_identity(
+                directory_stat
+            ):
+                raise OSError("owner-private Git snapshot directory binding changed")
+            _reject_runtime_extended_acl(
+                directory_fd,
+                directory,
+                "owner-private Git snapshot directory",
+            )
+            if _directory_identity(os.fstat(directory_fd)) != _directory_identity(
+                directory_stat
+            ):
+                raise OSError(
+                    "owner-private Git snapshot directory access policy changed "
+                    "during ACL inspection"
+                )
+        finally:
+            os.close(directory_fd)
         _check_deadline(deadline, deadline_error)
         return (
             snapshot,
@@ -3375,7 +3634,7 @@ def _validate_hook_directory_stat(
     value: os.stat_result,
     *,
     require_access_policy: bool = True,
-) -> tuple[int, int, int, int]:
+) -> tuple[int, int, int, int, int]:
     if not stat.S_ISDIR(value.st_mode):
         raise UserError(f"hook directory is not a directory: {path}")
     mode = stat.S_IMODE(value.st_mode)
@@ -3415,6 +3674,12 @@ def _revalidate_hook_directory(binding: _HookDirectoryBinding) -> None:
                     path_stat,
                     require_access_policy=ancestor.access_policy_required,
                 )
+            if ancestor.access_policy_required:
+                _reject_extended_acl(
+                    ancestor.fd,
+                    ancestor.path,
+                    "hook path ancestor",
+                )
         except OSError as exc:
             raise UserError(
                 f"hook path ancestor became unavailable during installation: "
@@ -3432,11 +3697,13 @@ def _revalidate_hook_directory(binding: _HookDirectoryBinding) -> None:
 
 
 def _hook_target_identity(value: os.stat_result) -> tuple[int, ...]:
+    """Bind hook object/type, owner/group/mode policy, and content size."""
     return (
         value.st_dev,
         value.st_ino,
         stat.S_IFMT(value.st_mode),
         value.st_uid,
+        value.st_gid,
         stat.S_IMODE(value.st_mode),
         value.st_size,
     )
@@ -3469,6 +3736,11 @@ def _snapshot_hook_target(
         before = os.fstat(fd)
         if not stat.S_ISREG(before.st_mode):
             raise UserError(f"hook target is not a regular file: {binding.path / name}")
+        _reject_extended_acl(
+            fd,
+            binding.path / name,
+            "hook target",
+        )
         if before.st_size > MAX_EXISTING_HOOK_BYTES:
             raise UserError(
                 f"hook target exceeds {MAX_EXISTING_HOOK_BYTES} bytes: "
@@ -3487,6 +3759,11 @@ def _snapshot_hook_target(
                 break
             content.extend(chunk)
         after = os.fstat(fd)
+        _reject_extended_acl(
+            fd,
+            binding.path / name,
+            "hook target",
+        )
         linked = os.stat(name, dir_fd=binding.fd, follow_symlinks=False)
     finally:
         os.close(fd)
@@ -3629,6 +3906,12 @@ def _bind_hook_directory(plan: _HookPathPlan) -> _HookDirectoryBinding:
                         f"hook path component changed while being bound: "
                         f"{component_path}"
                     )
+                if access_policy_required:
+                    _reject_extended_acl(
+                        child_fd,
+                        component_path,
+                        "hook path component",
+                    )
             except BaseException:
                 os.close(child_fd)
                 raise
@@ -3690,6 +3973,11 @@ def _revalidate_hook_install_lock(binding: _HookDirectoryBinding) -> None:
     try:
         descriptor_stat = os.fstat(binding.install_lock_fd)
         path_stat = os.stat(name, dir_fd=binding.fd, follow_symlinks=False)
+        _reject_extended_acl(
+            binding.install_lock_fd,
+            binding.path / name,
+            "hook installation lock",
+        )
     except OSError as exc:
         raise UserError(
             f"hook installation lock became unavailable: {binding.path / name}: {exc}"
@@ -3735,6 +4023,11 @@ def _acquire_hook_install_lock(
         descriptor_stat = os.fstat(fd)
         path_stat = os.stat(name, dir_fd=binding.fd, follow_symlinks=False)
         descriptor_identity = _file_identity(descriptor_stat)
+        _reject_extended_acl(
+            fd,
+            binding.path / name,
+            "hook installation lock",
+        )
         if (
             not stat.S_ISREG(descriptor_stat.st_mode)
             or descriptor_identity != _file_identity(path_stat)
@@ -3753,6 +4046,11 @@ def _acquire_hook_install_lock(
             ) from exc
         descriptor_after = os.fstat(fd)
         path_after = os.stat(name, dir_fd=binding.fd, follow_symlinks=False)
+        _reject_extended_acl(
+            fd,
+            binding.path / name,
+            "hook installation lock",
+        )
         if (
             _file_identity(descriptor_after) != descriptor_identity
             or _file_identity(path_after) != descriptor_identity
@@ -3894,8 +4192,8 @@ def _recovery_error(
     except OSError as exc:
         detail = f"{detail}; directory fsync failed: {exc}"
     return _HookExchangeRecoveryRequired(
-        f"hook target changed at atomic commit and rollback is "
-        f"cleanup-incomplete: {detail}; preserved recovery locator: "
+        f"hook exchange state is uncertain and cleanup is incomplete: "
+        f"{detail}; preserved recovery locator: "
         f"{recovery_path}",
         temporary_name,
     )
@@ -3950,15 +4248,15 @@ def _hook_snapshot_match_status(
     else:
         if actual.identity[:3] != expected.identity[:3]:
             mismatches.append("object identity/type")
-        if actual.identity[3:5] != expected.identity[3:5]:
+        if actual.identity[3:6] != expected.identity[3:6]:
             mismatches.append("ownership/access policy")
-        if actual.identity[5] != expected.identity[5]:
+        if actual.identity[6] != expected.identity[6]:
             mismatches.append("content size")
     if actual.digest != expected.digest:
         mismatches.append("content digest")
     if not mismatches:
         mismatches.append("snapshot metadata")
-    return f"{subject} mismatches the committed staged hook ({', '.join(mismatches)})"
+    return f"{subject} mismatches its expected bound snapshot ({', '.join(mismatches)})"
 
 
 def _interrupted_absent_hook_commit_note(
@@ -4112,6 +4410,73 @@ def _interrupted_hook_post_commit_note(
     return detail
 
 
+def _revalidate_failed_hook_exchange(
+    binding: _HookDirectoryBinding,
+    target: _HookTargetSnapshot,
+    temporary_name: str,
+    staged: _HookTargetSnapshot,
+    exchange_error: OSError,
+) -> None:
+    target_snapshot: _HookTargetSnapshot | None = None
+    temporary_snapshot: _HookTargetSnapshot | None = None
+    target_error: Exception | None = None
+    temporary_error: Exception | None = None
+    try:
+        target_snapshot, _target_content = _snapshot_hook_target(
+            binding,
+            target.name,
+        )
+    except Exception as exc:
+        target_error = exc
+    try:
+        temporary_snapshot, _temporary_content = _snapshot_hook_target(
+            binding,
+            temporary_name,
+        )
+    except Exception as exc:
+        temporary_error = exc
+
+    # Cleanup is authorized only when object identity, exact content, and
+    # owner/group/mode access policy prove that the exchange did not occur.
+    if (
+        target_error is None
+        and temporary_error is None
+        and target_snapshot == target
+        and temporary_snapshot == staged
+    ):
+        return
+
+    expected_installed = dataclasses.replace(staged, name=target.name)
+    expected_displaced = dataclasses.replace(target, name=temporary_name)
+    if target_error is not None:
+        target_status = f"target revalidation failed or is unreadable: {target_error}"
+    else:
+        assert target_snapshot is not None
+        target_status = _hook_snapshot_match_status(
+            target_snapshot,
+            expected_installed,
+            "installed target",
+        )
+    if temporary_error is not None:
+        temporary_status = (
+            "transaction-temporary revalidation failed or is unreadable: "
+            f"{temporary_error}"
+        )
+    else:
+        assert temporary_snapshot is not None
+        temporary_status = _hook_snapshot_match_status(
+            temporary_snapshot,
+            expected_displaced,
+            "displaced-hook recovery object",
+        )
+    raise _recovery_error(
+        binding,
+        temporary_name,
+        f"atomic exchange reported {exchange_error}; {target_status}; "
+        f"{temporary_status}",
+    ) from exchange_error
+
+
 def _commit_hook_target_atomically(
     binding: _HookDirectoryBinding,
     target: _HookTargetSnapshot,
@@ -4154,6 +4519,13 @@ def _commit_hook_target_atomically(
             exchange=True,
         )
     except OSError as exc:
+        _revalidate_failed_hook_exchange(
+            binding,
+            target,
+            temporary_name,
+            staged,
+            exc,
+        )
         commit_state.mark_cleanup_safe()
         if exc.errno in {errno.ENOENT, errno.EEXIST, errno.ENOTEMPTY}:
             raise UserError(
@@ -4286,7 +4658,7 @@ def _install_hook(
             not staged.exists
             or staged_content != content
             or staged.identity is None
-            or staged.identity[4] != 0o755
+            or staged.identity[5] != 0o755
         ):
             raise UserError(
                 f"staged hook failed verification: {binding.path / temporary_name}"
@@ -4758,6 +5130,40 @@ def _enrich_discovered_repo(
     )
 
 
+def _repository_resolution_error_row(
+    cwd: str,
+    last_seen: str,
+    error: dict[str, str],
+) -> dict[str, Any]:
+    adoption_error = {
+        "code": error["code"],
+        "message": (
+            "repository resolution failed before adoption could be checked: "
+            f"{error['message']}"
+        ),
+    }
+    return {
+        "repo": None,
+        "candidate_cwd": cwd,
+        "last_seen": last_seen,
+        "rollout_count": 0,
+        "has_journal_dir": None,
+        "journal_count": None,
+        "has_index": None,
+        "index_ignored": None,
+        "hooks_installed": None,
+        "discovery_status": "inconclusive",
+        "discovery_error": {"repo_resolution": error},
+        "install_command": None,
+        "generate_command": None,
+        "adoption_status": "inconclusive",
+        "adoption_error": adoption_error,
+        "tracked_journal_adopted": None,
+        "tracked_non_generated_journal_count": None,
+        "valid_tracked_journal_count": None,
+    }
+
+
 def _discover_repos(codex_home: pathlib.Path, since_days: int) -> list[dict[str, Any]]:
     sessions = codex_home / "sessions"
     if not sessions.exists():
@@ -4765,6 +5171,8 @@ def _discover_repos(codex_home: pathlib.Path, since_days: int) -> list[dict[str,
     cutoff = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=since_days)).date()
     seen: dict[pathlib.Path, dict[str, Any]] = {}
     resolved_roots: dict[str, pathlib.Path | None] = {}
+    resolution_errors: dict[str, dict[str, str]] = {}
+    unresolved: dict[str, dict[str, Any]] = {}
     resolution_deadlines: dict[str, float] = {}
     script = pathlib.Path(__file__).resolve()
 
@@ -4773,6 +5181,7 @@ def _discover_repos(codex_home: pathlib.Path, since_days: int) -> list[dict[str,
             continue
         last_seen = _rollout_last_seen(rollout)
         roots_for_rollout: set[pathlib.Path] = set()
+        unresolved_for_rollout: set[str] = set()
         for cwd in _unique_preserving_order(_extract_cwds(rollout)):
             if cwd not in resolved_roots:
                 resolution_deadline = (
@@ -4785,10 +5194,23 @@ def _discover_repos(codex_home: pathlib.Path, since_days: int) -> list[dict[str,
                         codex_home=codex_home,
                         deadline=resolution_deadline,
                     )
-                except (OSError, UserError):
+                except (OSError, UserError) as exc:
                     resolved_roots[cwd] = None
+                    resolution_errors[cwd] = _discovery_error(exc)
             root = resolved_roots[cwd]
             if root is None:
+                resolution_error = resolution_errors.get(cwd)
+                if resolution_error is not None:
+                    row = unresolved.setdefault(
+                        cwd,
+                        _repository_resolution_error_row(
+                            cwd,
+                            last_seen,
+                            resolution_error,
+                        ),
+                    )
+                    row["last_seen"] = max(str(row["last_seen"]), last_seen)
+                    unresolved_for_rollout.add(cwd)
                 continue
             if root not in seen:
                 row: dict[str, Any] = {
@@ -4808,14 +5230,15 @@ def _discover_repos(codex_home: pathlib.Path, since_days: int) -> list[dict[str,
             row = seen[root]
             row["last_seen"] = max(str(row["last_seen"]), last_seen)
             row["rollout_count"] = int(row["rollout_count"]) + 1
+        for cwd in unresolved_for_rollout:
+            row = unresolved[cwd]
+            row["rollout_count"] = int(row["rollout_count"]) + 1
 
-    return [
-        row
-        for _root, row in sorted(
-            seen.items(),
-            key=lambda item: item[0].as_posix(),
-        )
-    ]
+    rows = [*seen.values(), *unresolved.values()]
+    return sorted(
+        rows,
+        key=lambda row: str(row["repo"] or row.get("candidate_cwd") or ""),
+    )
 
 
 def command_discover_repos(args: argparse.Namespace) -> int:
@@ -4825,8 +5248,9 @@ def command_discover_repos(args: argparse.Namespace) -> int:
         print(json.dumps(rows, ensure_ascii=False, indent=2, sort_keys=True))
         return 0
     for row in rows:
+        repo_label = row["repo"] or row.get("candidate_cwd") or "<unresolved>"
         print(
-            f"{row['repo']}\tlast_seen={row['last_seen']}\t"
+            f"{repo_label}\tlast_seen={row['last_seen']}\t"
             f"journals={row['journal_count']}\thooks={row['hooks_installed']}\t"
             f"adoption={row['adoption_status']}"
         )

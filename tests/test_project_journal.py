@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import importlib.util
 import json
 import os
@@ -44,6 +45,12 @@ def run_git(repo: pathlib.Path, *args: str) -> subprocess.CompletedProcess[str]:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
+
+
+def stat_with_gid(value: os.stat_result, gid: int) -> os.stat_result:
+    fields = list(value)
+    fields[5] = gid
+    return os.stat_result(fields)
 
 
 class ProjectJournalTests(unittest.TestCase):
@@ -2620,6 +2627,7 @@ class ProjectJournalTests(unittest.TestCase):
 
                 process.wait.side_effect = wait_after_signals
                 selector = mock.Mock()
+                probe_calls = 0
 
                 def signal_group(
                     process_arg: subprocess.Popen[bytes],
@@ -2640,10 +2648,19 @@ class ProjectJournalTests(unittest.TestCase):
                     process_arg: subprocess.Popen[bytes],
                     deadline: float,
                 ) -> tuple[bool, None]:
+                    nonlocal probe_calls
                     self.assertIs(process_arg, process)
                     self.assertGreater(deadline, 0)
-                    events.append(("probe", None))
-                    return group_exists, None
+                    probe_calls += 1
+                    events.append(
+                        (
+                            "post-term-probe"
+                            if probe_calls == 1
+                            else "post-kill-probe",
+                            None,
+                        )
+                    )
+                    return (group_exists if probe_calls == 1 else False), None
 
                 def observe_status(
                     process_arg: subprocess.Popen[bytes],
@@ -2695,9 +2712,10 @@ class ProjectJournalTests(unittest.TestCase):
                 expected_events = [("initial-probe", None)]
                 if initial_group_exists:
                     expected_events.append(("signal", signal.SIGTERM))
-                    expected_events.append(("probe", None))
+                    expected_events.append(("post-term-probe", None))
                 if group_exists:
                     expected_events.append(("signal", kill_signal))
+                    expected_events.append(("post-kill-probe", None))
                 expected_events.extend(
                     [
                         ("status", None),
@@ -2706,6 +2724,61 @@ class ProjectJournalTests(unittest.TestCase):
                 )
                 self.assertEqual(events, expected_events)
                 process.poll.assert_not_called()
+
+    @unittest.skipUnless(os.name == "posix", "POSIX process-group contract")
+    def test_group_cleanup_invalidates_residual_or_unprobeable_group_after_kill(
+        self,
+    ) -> None:
+        for final_probe, expected_detail in (
+            ((True, None), "bound process group remained after final SIGKILL"),
+            (
+                (True, "injected final probe failure"),
+                "failed to prove bound process-group absence after final SIGKILL",
+            ),
+        ):
+            with self.subTest(final_probe=final_probe):
+                process = mock.Mock()
+                process.pid = 12345
+                process.wait.return_value = -signal.SIGKILL
+                selector = mock.Mock()
+                with mock.patch.object(
+                    project_journal,
+                    "_bound_process_group_exists",
+                    return_value=(True, None),
+                ):
+                    with mock.patch.object(
+                        project_journal,
+                        "_signal_process_group",
+                        return_value=project_journal._ProcessSignalResult(
+                            target_existed=True
+                        ),
+                    ):
+                        with mock.patch.object(
+                            project_journal,
+                            "_discard_selector_output",
+                        ):
+                            with mock.patch.object(
+                                project_journal,
+                                "_wait_for_bound_process_group_absence",
+                                side_effect=[(True, None), final_probe],
+                            ) as wait_for_absence:
+                                with mock.patch.object(
+                                    project_journal,
+                                    "_wait_for_process_status_without_reaping",
+                                    return_value=-signal.SIGKILL,
+                                ):
+                                    with mock.patch.object(
+                                        project_journal,
+                                        "_close_selector",
+                                    ):
+                                        cleanup_error = project_journal._terminate_process_group_and_reap(
+                                            process,
+                                            selector,
+                                        )
+
+                self.assertIsNotNone(cleanup_error)
+                self.assertIn(expected_detail, cleanup_error)
+                self.assertEqual(wait_for_absence.call_count, 2)
 
     @unittest.skipUnless(os.name == "posix", "POSIX process-group contract")
     def test_process_group_cleanup_reports_final_reap_failure(self) -> None:
@@ -4516,6 +4589,131 @@ class ProjectJournalTests(unittest.TestCase):
             )
         )
 
+    def test_install_hooks_preserves_displaced_hook_when_exchange_reports_error(
+        self,
+    ) -> None:
+        repo = self.init_repo()
+        configured = run_git(
+            repo,
+            "config",
+            "--local",
+            "core.hooksPath",
+            ".githooks",
+        )
+        self.assertEqual(configured.returncode, 0, configured.stderr)
+        first = self.run_cli("install-hooks", "--repo", str(repo))
+        self.assertEqual(first.returncode, 0, first.stderr)
+        hook = repo / ".githooks/post-merge"
+        old_content = hook.read_bytes().replace(
+            project_journal.HOOK_BEGIN.encode(),
+            (
+                project_journal.HOOK_BEGIN
+                + "\n# hook displaced by error-reporting exchange"
+            ).encode(),
+            1,
+        )
+        hook.write_bytes(old_content)
+        actual_rename = project_journal._rename_hook_entry_with_flag
+        injected = False
+
+        def exchange_then_report_error(
+            directory_fd: int,
+            source: str,
+            destination: str,
+            *,
+            exchange: bool,
+        ) -> None:
+            nonlocal injected
+            actual_rename(
+                directory_fd,
+                source,
+                destination,
+                exchange=exchange,
+            )
+            if destination == "post-merge" and exchange and not injected:
+                injected = True
+                raise OSError(errno.EIO, "injected post-exchange error")
+
+        args = mock.Mock(repo=str(repo))
+        with mock.patch.object(
+            project_journal,
+            "_rename_hook_entry_with_flag",
+            side_effect=exchange_then_report_error,
+        ):
+            with self.assertRaises(
+                project_journal._HookExchangeRecoveryRequired,
+            ) as raised:
+                project_journal.command_install_hooks(args)
+
+        self.assertTrue(injected)
+        self.assertIn("preserved recovery locator", str(raised.exception))
+        self.assertIn(
+            "object-identity/content/access-policy verified", str(raised.exception)
+        )
+        self.assertIn(project_journal.HOOK_BEGIN.encode(), hook.read_bytes())
+        self.assertNotEqual(hook.read_bytes(), old_content)
+        recoveries = list(
+            (repo / ".githooks").glob(".project-journal-post-merge-*.tmp")
+        )
+        self.assertEqual(len(recoveries), 1)
+        self.assertEqual(recoveries[0].read_bytes(), old_content)
+
+    def test_install_hooks_cleans_staged_hook_only_after_uncommitted_exchange_error(
+        self,
+    ) -> None:
+        repo = self.init_repo()
+        configured = run_git(
+            repo,
+            "config",
+            "--local",
+            "core.hooksPath",
+            ".githooks",
+        )
+        self.assertEqual(configured.returncode, 0, configured.stderr)
+        first = self.run_cli("install-hooks", "--repo", str(repo))
+        self.assertEqual(first.returncode, 0, first.stderr)
+        hook = repo / ".githooks/post-merge"
+        old_content = hook.read_bytes()
+        actual_rename = project_journal._rename_hook_entry_with_flag
+        injected = False
+
+        def report_error_without_exchange(
+            directory_fd: int,
+            source: str,
+            destination: str,
+            *,
+            exchange: bool,
+        ) -> None:
+            nonlocal injected
+            if destination == "post-merge" and exchange and not injected:
+                injected = True
+                raise OSError(errno.EIO, "injected pre-exchange error")
+            actual_rename(
+                directory_fd,
+                source,
+                destination,
+                exchange=exchange,
+            )
+
+        args = mock.Mock(repo=str(repo))
+        with mock.patch.object(
+            project_journal,
+            "_rename_hook_entry_with_flag",
+            side_effect=report_error_without_exchange,
+        ):
+            with self.assertRaisesRegex(
+                project_journal.UserError,
+                "injected pre-exchange error",
+            ):
+                project_journal.command_install_hooks(args)
+
+        self.assertTrue(injected)
+        self.assertEqual(hook.read_bytes(), old_content)
+        self.assertEqual(
+            list((repo / ".githooks").glob(".project-journal-post-merge-*.tmp")),
+            [],
+        )
+
     def test_install_hooks_reports_committed_state_on_interrupt_after_unlink(
         self,
     ) -> None:
@@ -5204,6 +5402,155 @@ class ProjectJournalTests(unittest.TestCase):
                         "hook target changed after preflight",
                     ):
                         project_journal._revalidate_hook_target(binding, target)
+                finally:
+                    project_journal._close_hook_binding(binding)
+
+    def test_hook_directory_revalidation_rejects_group_only_change(self) -> None:
+        repo = self.init_repo().resolve()
+        configured = run_git(
+            repo,
+            "config",
+            "--local",
+            "core.hooksPath",
+            ".githooks",
+        )
+        self.assertEqual(configured.returncode, 0, configured.stderr)
+        installed = self.run_cli("install-hooks", "--repo", str(repo))
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        binding = project_journal._preflight_hook_targets(repo)
+        actual_fstat = os.fstat
+
+        def changed_group(fd: int) -> os.stat_result:
+            value = actual_fstat(fd)
+            if fd == binding.fd:
+                return stat_with_gid(value, value.st_gid + 1)
+            return value
+
+        try:
+            with mock.patch.object(
+                project_journal.os,
+                "fstat",
+                side_effect=changed_group,
+            ):
+                with self.assertRaisesRegex(
+                    project_journal.UserError,
+                    "identity or access policy changed",
+                ):
+                    project_journal._revalidate_hook_directory(binding)
+        finally:
+            project_journal._close_hook_binding(binding)
+
+    def test_hook_target_revalidation_rejects_group_only_change(self) -> None:
+        repo = self.init_repo().resolve()
+        configured = run_git(
+            repo,
+            "config",
+            "--local",
+            "core.hooksPath",
+            ".githooks",
+        )
+        self.assertEqual(configured.returncode, 0, configured.stderr)
+        installed = self.run_cli("install-hooks", "--repo", str(repo))
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        binding = project_journal._preflight_hook_targets(repo)
+        target = next(item for item in binding.targets if item.name == "post-merge")
+        assert target.identity is not None
+        expected_object = target.identity[:2]
+        actual_fstat = os.fstat
+        actual_stat = os.stat
+
+        def with_changed_group(value: os.stat_result) -> os.stat_result:
+            if (value.st_dev, value.st_ino) == expected_object:
+                return stat_with_gid(value, value.st_gid + 1)
+            return value
+
+        def changed_fstat(fd: int) -> os.stat_result:
+            return with_changed_group(actual_fstat(fd))
+
+        def changed_stat(
+            path: os.PathLike[str] | str | int,
+            *,
+            dir_fd: int | None = None,
+            follow_symlinks: bool = True,
+        ) -> os.stat_result:
+            return with_changed_group(
+                actual_stat(
+                    path,
+                    dir_fd=dir_fd,
+                    follow_symlinks=follow_symlinks,
+                )
+            )
+
+        try:
+            with mock.patch.object(
+                project_journal.os,
+                "fstat",
+                side_effect=changed_fstat,
+            ):
+                with mock.patch.object(
+                    project_journal.os,
+                    "stat",
+                    side_effect=changed_stat,
+                ):
+                    with self.assertRaisesRegex(
+                        project_journal.UserError,
+                        "hook target changed after preflight",
+                    ):
+                        project_journal._revalidate_hook_target(binding, target)
+        finally:
+            project_journal._close_hook_binding(binding)
+
+    @unittest.skipUnless(
+        sys.platform == "darwin",
+        "Darwin extended ACL revalidation contract",
+    )
+    def test_hook_revalidation_rejects_acl_only_directory_and_target_changes(
+        self,
+    ) -> None:
+        for subject in ("directory", "target"):
+            with self.subTest(subject=subject):
+                repo = self.init_repo(f"repo-acl-{subject}").resolve()
+                configured = run_git(
+                    repo,
+                    "config",
+                    "--local",
+                    "core.hooksPath",
+                    ".githooks",
+                )
+                self.assertEqual(configured.returncode, 0, configured.stderr)
+                installed = self.run_cli("install-hooks", "--repo", str(repo))
+                self.assertEqual(installed.returncode, 0, installed.stderr)
+                binding = project_journal._preflight_hook_targets(repo)
+                target = next(
+                    item for item in binding.targets if item.name == "post-merge"
+                )
+                changed_path = (
+                    repo / ".githooks"
+                    if subject == "directory"
+                    else repo / ".githooks/post-merge"
+                )
+                acl = subprocess.run(
+                    [
+                        "/bin/chmod",
+                        "+a",
+                        "everyone allow read",
+                        str(changed_path),
+                    ],
+                    check=False,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                self.assertEqual(acl.returncode, 0, acl.stderr)
+                try:
+                    with self.assertRaisesRegex(
+                        project_journal.UserError,
+                        "unsupported extended ACL",
+                    ):
+                        if subject == "directory":
+                            project_journal._revalidate_hook_directory(binding)
+                        else:
+                            project_journal._revalidate_hook_target(binding, target)
                 finally:
                     project_journal._close_hook_binding(binding)
 
@@ -5902,15 +6249,21 @@ class ProjectJournalTests(unittest.TestCase):
             if row["tracked_journal_adopted"] is False:
                 self.assertEqual(row["adoption_status"], "unadopted")
 
-    def test_discover_repos_isolates_repository_resolution_timeout(self) -> None:
+    def test_discover_repos_reports_resolution_errors_and_keeps_healthy_rows(
+        self,
+    ) -> None:
         healthy = self.init_repo("healthy").resolve()
         stalled = self.root / "stalled"
         stalled.mkdir()
+        unreadable = self.root / "unreadable"
+        unreadable.mkdir()
         codex_home = self.root / "codex-home"
         rollout_dir = codex_home / "sessions/2026/05/05"
         rollout_dir.mkdir(parents=True)
         (rollout_dir / "rollout-resolution-timeout.jsonl").write_text(
             json.dumps({"payload": {"cwd": str(stalled)}})
+            + "\n"
+            + json.dumps({"payload": {"cwd": str(unreadable)}})
             + "\n"
             + json.dumps({"payload": {"cwd": str(healthy)}})
             + "\n",
@@ -5929,6 +6282,11 @@ class ProjectJournalTests(unittest.TestCase):
                 raise project_journal.UserError(
                     "Git repository resolution timed out after 10 seconds"
                 )
+            if pathlib.Path(path_text) == unreadable:
+                raise OSError(
+                    errno.EACCES,
+                    "injected repository resolution access failure",
+                )
             return healthy
 
         with mock.patch.object(
@@ -5938,8 +6296,33 @@ class ProjectJournalTests(unittest.TestCase):
         ):
             rows = project_journal._discover_repos(codex_home, 9999)
 
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(pathlib.Path(rows[0]["repo"]), healthy)
+        self.assertEqual(len(rows), 3)
+        healthy_row = next(row for row in rows if row["repo"] is not None)
+        self.assertEqual(pathlib.Path(healthy_row["repo"]), healthy)
+        self.assertNotIn(
+            "repo_resolution",
+            healthy_row["discovery_error"] or {},
+        )
+        failures = {
+            pathlib.Path(row["candidate_cwd"]).name: row
+            for row in rows
+            if row["repo"] is None
+        }
+        self.assertEqual(set(failures), {"stalled", "unreadable"})
+        for row in failures.values():
+            self.assertEqual(row["discovery_status"], "inconclusive")
+            self.assertEqual(row["adoption_status"], "inconclusive")
+            self.assertIsNone(row["tracked_journal_adopted"])
+            self.assertEqual(set(row["discovery_error"]), {"repo_resolution"})
+            self.assertEqual(row["rollout_count"], 1)
+        self.assertIn(
+            "timed out",
+            failures["stalled"]["discovery_error"]["repo_resolution"]["message"],
+        )
+        self.assertIn(
+            "access failure",
+            failures["unreadable"]["discovery_error"]["repo_resolution"]["message"],
+        )
 
     def test_discover_repos_shares_resolution_budget_with_adoption(self) -> None:
         repo = self.init_repo("healthy").resolve()
