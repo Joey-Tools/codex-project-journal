@@ -86,6 +86,8 @@ GIT_CONFIG_QUERY_TIMEOUT_SECONDS = 5.0
 GIT_PROCESS_TERMINATE_GRACE_SECONDS = 0.25
 GIT_PROCESS_KILL_DRAIN_SECONDS = 1.0
 PROCESS_READ_CHUNK_BYTES = 64 * 1024
+MAX_LINUX_PROC_GROUP_SCAN_PIDS = 131_072
+MAX_LINUX_PROC_STAT_BYTES = 4096
 MINIMUM_GIT_VERSION = (2, 45, 0)
 GIT_VERSION_RE = re.compile(
     rb"\Agit version ([0-9]+)\.([0-9]+)(?:\.([0-9]+))?(?:[ .].*)?\n?\Z"
@@ -1832,11 +1834,114 @@ def _signal_process_group(
     return _ProcessSignalResult(target_existed=True)
 
 
+def _linux_process_group_has_live_nonleader(
+    pgid: int,
+    deadline: float,
+) -> tuple[bool, str | None]:
+    """Boundedly prove whether Linux exposes a live non-leader group member."""
+    required_flags = ("O_NOFOLLOW", "O_NONBLOCK")
+    missing_flags = [name for name in required_flags if not getattr(os, name, 0)]
+    if missing_flags:
+        return (
+            True,
+            "Linux process-group member proof requires " + " and ".join(missing_flags),
+        )
+    open_flags = (
+        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | os.O_NOFOLLOW | os.O_NONBLOCK
+    )
+    scanned_pids = 0
+    try:
+        entries = os.scandir("/proc")
+    except OSError as exc:
+        return True, f"failed to enumerate Linux process metadata: {exc}"
+
+    try:
+        with entries:
+            for entry in entries:
+                name = entry.name
+                if not name.isascii() or not name.isdigit():
+                    continue
+                scanned_pids += 1
+                if scanned_pids > MAX_LINUX_PROC_GROUP_SCAN_PIDS:
+                    return (
+                        True,
+                        "Linux process-group member proof exceeds "
+                        f"{MAX_LINUX_PROC_GROUP_SCAN_PIDS} PID entries",
+                    )
+                if time.monotonic() >= deadline:
+                    # Absence was not proved before the caller's deadline.
+                    # Treat the group as present so grace-period callers can
+                    # escalate and final-proof callers fail closed.
+                    return True, None
+                pid = int(name)
+                if pid == pgid:
+                    continue
+                stat_path = f"/proc/{name}/stat"
+                try:
+                    fd = os.open(stat_path, open_flags)
+                except OSError as exc:
+                    if exc.errno in {errno.ENOENT, errno.ESRCH}:
+                        continue
+                    return (
+                        True,
+                        f"failed to open Linux process metadata for PID {pid}: {exc}",
+                    )
+                try:
+                    try:
+                        raw_stat = os.read(fd, MAX_LINUX_PROC_STAT_BYTES + 1)
+                    except OSError as exc:
+                        if exc.errno in {errno.ENOENT, errno.ESRCH}:
+                            continue
+                        return (
+                            True,
+                            f"failed to read Linux process metadata for PID {pid}: "
+                            f"{exc}",
+                        )
+                finally:
+                    os.close(fd)
+                if len(raw_stat) > MAX_LINUX_PROC_STAT_BYTES:
+                    return (
+                        True,
+                        f"Linux process metadata for PID {pid} exceeds "
+                        f"{MAX_LINUX_PROC_STAT_BYTES} bytes",
+                    )
+                pid_end = raw_stat.find(b" ")
+                command_end = raw_stat.rfind(b")")
+                if (
+                    pid_end <= 0
+                    or command_end < pid_end
+                    or command_end + 2 >= len(raw_stat)
+                ):
+                    return True, f"malformed Linux process metadata for PID {pid}"
+                fields = raw_stat[command_end + 2 :].split()
+                if len(fields) < 3:
+                    return True, f"malformed Linux process metadata for PID {pid}"
+                try:
+                    recorded_pid = int(raw_stat[:pid_end])
+                    member_pgid = int(fields[2])
+                except ValueError:
+                    return True, f"malformed Linux process metadata for PID {pid}"
+                if recorded_pid != pid or len(fields[0]) != 1:
+                    return True, f"mismatched Linux process metadata for PID {pid}"
+                if member_pgid == pgid and fields[0] not in {b"Z", b"X", b"x"}:
+                    return True, None
+    except OSError as exc:
+        return True, f"failed while enumerating Linux process metadata: {exc}"
+    return False, None
+
+
 def _bound_process_group_exists(
     process: subprocess.Popen[bytes],
+    *,
+    leader_exited: bool = False,
+    deadline: float | None = None,
 ) -> tuple[bool, str | None]:
     if os.name != "posix":
         raise RuntimeError("process-group probes require POSIX")
+    if sys.platform.startswith("linux") and leader_exited:
+        if deadline is None:
+            return True, "Linux process-group member proof requires a deadline"
+        return _linux_process_group_has_live_nonleader(process.pid, deadline)
     try:
         os.killpg(process.pid, 0)
     except ProcessLookupError:
@@ -1855,9 +1960,15 @@ def _bound_process_group_exists(
 def _wait_for_bound_process_group_absence(
     process: subprocess.Popen[bytes],
     deadline: float,
+    *,
+    leader_exited: bool = False,
 ) -> tuple[bool, str | None]:
     while True:
-        exists, error = _bound_process_group_exists(process)
+        exists, error = _bound_process_group_exists(
+            process,
+            leader_exited=leader_exited,
+            deadline=deadline,
+        )
         if error is not None or not exists:
             return exists, error
         remaining = deadline - time.monotonic()
@@ -1947,6 +2058,7 @@ def _terminate_process_group_and_reap(
     process: subprocess.Popen[bytes],
     selector: selectors.BaseSelector,
     ownership: _ProcessOwnership | None = None,
+    known_returncode: int | None = None,
 ) -> str | None:
     """Clean up while the unreaped direct child still fences its PID/PGID."""
     if ownership is None:
@@ -1958,13 +2070,19 @@ def _terminate_process_group_and_reap(
         )
 
     issues: list[str] = []
-    observed_returncode: int | None = None
+    observed_returncode = known_returncode
+    leader_exited = known_returncode is not None
     kill_deadline = time.monotonic() + GIT_PROCESS_KILL_DRAIN_SECONDS
 
     if isinstance(process.returncode, int):
         observed_returncode = process.returncode
+        leader_exited = True
     elif os.name == "posix":
-        group_exists, probe_error = _bound_process_group_exists(process)
+        group_exists, probe_error = _bound_process_group_exists(
+            process,
+            leader_exited=leader_exited,
+            deadline=kill_deadline,
+        )
         if probe_error is not None:
             issues.append(f"failed to probe bound process group: {probe_error}")
         if group_exists:
@@ -1984,6 +2102,7 @@ def _terminate_process_group_and_reap(
             group_exists, probe_error = _wait_for_bound_process_group_absence(
                 process,
                 terminate_deadline,
+                leader_exited=leader_exited,
             )
         if probe_error is not None:
             issues.append(f"failed to probe bound process group: {probe_error}")
@@ -1999,6 +2118,17 @@ def _terminate_process_group_and_reap(
                 )
         kill_deadline = time.monotonic() + GIT_PROCESS_KILL_DRAIN_SECONDS
         _discard_selector_output(selector, kill_deadline)
+        try:
+            observed_returncode = _wait_for_process_status_without_reaping(
+                process,
+                kill_deadline,
+                "direct child did not exit after final process-group signal",
+            )
+            leader_exited = True
+        except _ProcessIdentityLost as exc:
+            issues.append(str(exc))
+        except UserError as exc:
+            issues.append(str(exc))
         if final_group_signal_sent:
             # The unreaped leader still fences this numeric PID/PGID. Prove the
             # group is absent before transferring ownership to reap-only; after
@@ -2007,6 +2137,7 @@ def _terminate_process_group_and_reap(
                 _wait_for_bound_process_group_absence(
                     process,
                     kill_deadline,
+                    leader_exited=leader_exited,
                 )
             )
             if final_probe_error is not None:
@@ -2016,16 +2147,6 @@ def _terminate_process_group_and_reap(
                 )
             elif final_group_exists:
                 issues.append("bound process group remained after final SIGKILL")
-        try:
-            observed_returncode = _wait_for_process_status_without_reaping(
-                process,
-                kill_deadline,
-                "direct child did not exit after final process-group signal",
-            )
-        except _ProcessIdentityLost as exc:
-            issues.append(str(exc))
-        except UserError as exc:
-            issues.append(str(exc))
     else:
         term_result = _signal_process_group(process, signal.SIGTERM)
         if term_result.error is not None:
@@ -2307,6 +2428,7 @@ def _capture_bounded_process_with_launch(
                     process,
                     selector,
                     ownership,
+                    known_returncode=returncode,
                 )
             except BaseException as cleanup_exc:
                 _close_selector(selector)
@@ -4259,6 +4381,95 @@ def _hook_snapshot_match_status(
     return f"{subject} mismatches its expected bound snapshot ({', '.join(mismatches)})"
 
 
+def _uncertain_absent_hook_rename_error(
+    binding: _HookDirectoryBinding,
+    temporary_name: str,
+    detail: str,
+) -> _HookExchangeRecoveryRequired:
+    recovery_path = binding.path / temporary_name
+    try:
+        os.fsync(binding.fd)
+    except OSError as exc:
+        detail = f"{detail}; directory fsync failed: {exc}"
+    return _HookExchangeRecoveryRequired(
+        "absent-target no-replace rename state is uncertain and cleanup is "
+        f"incomplete: {detail}; preserved recovery locator: {recovery_path}",
+        temporary_name,
+    )
+
+
+def _revalidate_failed_absent_hook_rename(
+    binding: _HookDirectoryBinding,
+    target: _HookTargetSnapshot,
+    temporary_name: str,
+    staged: _HookTargetSnapshot,
+    rename_error: OSError,
+) -> str:
+    target_snapshot: _HookTargetSnapshot | None = None
+    temporary_snapshot: _HookTargetSnapshot | None = None
+    target_error: Exception | None = None
+    temporary_error: Exception | None = None
+    try:
+        target_snapshot, _target_content = _snapshot_hook_target(
+            binding,
+            target.name,
+        )
+    except Exception as exc:
+        target_error = exc
+    try:
+        temporary_snapshot, _temporary_content = _snapshot_hook_target(
+            binding,
+            temporary_name,
+        )
+    except Exception as exc:
+        temporary_error = exc
+
+    if (
+        target_error is None
+        and temporary_error is None
+        and target_snapshot == target
+        and temporary_snapshot == staged
+    ):
+        return "uncommitted"
+
+    expected_installed = dataclasses.replace(staged, name=target.name)
+    expected_consumed = _HookTargetSnapshot(name=temporary_name, exists=False)
+    if (
+        target_error is None
+        and temporary_error is None
+        and target_snapshot == expected_installed
+        and temporary_snapshot == expected_consumed
+    ):
+        return "committed"
+
+    if target_error is not None:
+        target_status = f"target revalidation failed or is unreadable: {target_error}"
+    else:
+        assert target_snapshot is not None
+        target_status = _hook_snapshot_match_status(
+            target_snapshot,
+            expected_installed,
+            "installed target",
+        )
+    if temporary_error is not None:
+        temporary_status = (
+            f"staged-temporary revalidation failed or is unreadable: {temporary_error}"
+        )
+    else:
+        assert temporary_snapshot is not None
+        temporary_status = _hook_snapshot_match_status(
+            temporary_snapshot,
+            staged,
+            "staged temporary",
+        )
+    raise _uncertain_absent_hook_rename_error(
+        binding,
+        temporary_name,
+        f"atomic no-replace rename reported {rename_error}; {target_status}; "
+        f"{temporary_status}",
+    ) from rename_error
+
+
 def _interrupted_absent_hook_commit_note(
     binding: _HookDirectoryBinding,
     target: _HookTargetSnapshot,
@@ -4493,18 +4704,29 @@ def _commit_hook_target_atomically(
                 target.name,
                 exchange=False,
             )
-        except FileExistsError as exc:
-            commit_state.mark_cleanup_safe()
-            raise UserError(
-                f"hook target changed at atomic commit: {binding.path / target.name}"
-            ) from exc
         except OSError as exc:
-            commit_state.mark_cleanup_safe()
             if exc.errno in {errno.EEXIST, errno.ENOTEMPTY}:
+                commit_state.mark_cleanup_safe()
                 raise UserError(
                     f"hook target changed at atomic commit: "
                     f"{binding.path / target.name}"
                 ) from exc
+            rename_status = _revalidate_failed_absent_hook_rename(
+                binding,
+                target,
+                temporary_name,
+                staged,
+                exc,
+            )
+            if rename_status == "committed":
+                commit_state.mark_installed_target_committed("directory durability")
+                commit_state.mark_temporary_consumed()
+                return
+            if rename_status != "uncommitted":
+                raise RuntimeError(
+                    f"unexpected absent-target rename status {rename_status!r}"
+                )
+            commit_state.mark_cleanup_safe()
             raise
         commit_state.mark_installed_target_committed("directory durability")
         commit_state.mark_temporary_consumed()

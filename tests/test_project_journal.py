@@ -952,8 +952,14 @@ class ProjectJournalTests(unittest.TestCase):
             process: subprocess.Popen[bytes],
             selector: object,
             ownership: project_journal._ProcessOwnership,
+            known_returncode: int | None = None,
         ) -> str:
-            actual_error = actual_cleanup(process, selector, ownership)
+            actual_error = actual_cleanup(
+                process,
+                selector,
+                ownership,
+                known_returncode=known_returncode,
+            )
             details = [
                 detail
                 for detail in (
@@ -2599,6 +2605,221 @@ class ProjectJournalTests(unittest.TestCase):
         process.poll.assert_not_called()
         process.wait.assert_not_called()
 
+    def test_linux_group_member_proof_parses_live_nonleader_and_skips_zombies(
+        self,
+    ) -> None:
+        pgid = 12345
+        entries = mock.MagicMock()
+        entry_names = (str(pgid), "12346", "12347", "self", "net")
+        proc_entries = []
+        for name in entry_names:
+            entry = mock.Mock()
+            entry.name = name
+            proc_entries.append(entry)
+        entries.__iter__.return_value = iter(proc_entries)
+        stat_by_fd = {
+            12346: b"12346 (zombie worker) Z 1 12345 12345 0 0 0\n",
+            12347: b"12347 (live ) worker) S 1 12345 12345 0 0 0\n",
+        }
+
+        def open_stat(path: str, _flags: int) -> int:
+            return int(path.removeprefix("/proc/").removesuffix("/stat"))
+
+        with mock.patch.object(
+            project_journal.os,
+            "scandir",
+            return_value=entries,
+        ):
+            with mock.patch.object(
+                project_journal.os,
+                "open",
+                side_effect=open_stat,
+            ) as open_file:
+                with mock.patch.object(
+                    project_journal.os,
+                    "read",
+                    side_effect=lambda fd, _limit: stat_by_fd[fd],
+                ):
+                    with mock.patch.object(project_journal.os, "close") as close_file:
+                        with mock.patch.object(
+                            project_journal.time,
+                            "monotonic",
+                            return_value=0.0,
+                        ):
+                            exists, error = (
+                                project_journal._linux_process_group_has_live_nonleader(
+                                    pgid,
+                                    1.0,
+                                )
+                            )
+
+        self.assertTrue(exists)
+        self.assertIsNone(error)
+        opened_paths = [call.args[0] for call in open_file.call_args_list]
+        self.assertNotIn(f"/proc/{pgid}/stat", opened_paths)
+        self.assertEqual(
+            opened_paths,
+            ["/proc/12346/stat", "/proc/12347/stat"],
+        )
+        self.assertEqual(
+            [call.args[0] for call in close_file.call_args_list],
+            [12346, 12347],
+        )
+
+    def test_linux_group_member_proof_deadline_keeps_group_present(self) -> None:
+        entries = mock.MagicMock()
+        entry = mock.Mock()
+        entry.name = "12346"
+        entries.__iter__.return_value = iter([entry])
+
+        with mock.patch.object(
+            project_journal.os,
+            "scandir",
+            return_value=entries,
+        ):
+            with mock.patch.object(
+                project_journal.time,
+                "monotonic",
+                return_value=1.0,
+            ):
+                exists, error = project_journal._linux_process_group_has_live_nonleader(
+                    12345,
+                    1.0,
+                )
+
+        self.assertTrue(exists)
+        self.assertIsNone(error)
+
+    def test_linux_group_member_proof_reports_unreadable_proc_entry(self) -> None:
+        entries = mock.MagicMock()
+        entry = mock.Mock()
+        entry.name = "12346"
+        entries.__iter__.return_value = iter([entry])
+
+        with mock.patch.object(
+            project_journal.os,
+            "scandir",
+            return_value=entries,
+        ):
+            with mock.patch.object(
+                project_journal.os,
+                "open",
+                side_effect=OSError(errno.EACCES, "injected unreadable stat"),
+            ):
+                with mock.patch.object(
+                    project_journal.time,
+                    "monotonic",
+                    return_value=0.0,
+                ):
+                    exists, error = (
+                        project_journal._linux_process_group_has_live_nonleader(
+                            12345,
+                            1.0,
+                        )
+                    )
+
+        self.assertTrue(exists)
+        self.assertIsNotNone(error)
+        assert error is not None
+        self.assertIn("failed to open Linux process metadata", error)
+        self.assertIn("injected unreadable stat", error)
+
+    @unittest.skipUnless(
+        sys.platform.startswith("linux") and hasattr(os, "WNOWAIT"),
+        "Linux WNOWAIT process-group member proof",
+    )
+    def test_linux_cleanup_ignores_exited_leader_without_descendants(self) -> None:
+        actual_signal = project_journal._signal_process_group
+        with mock.patch.object(
+            project_journal,
+            "_signal_process_group",
+            wraps=actual_signal,
+        ) as signal_group:
+            result = self.capture_process(
+                [sys.executable, "-c", "pass"],
+                timeout_seconds=5,
+                stdout_limit=1024,
+            )
+
+        self.assertEqual(result.returncode, 0)
+        signal_group.assert_not_called()
+
+    @unittest.skipUnless(
+        sys.platform.startswith("linux") and hasattr(os, "WNOWAIT"),
+        "Linux WNOWAIT process-group member proof",
+    )
+    def test_linux_cleanup_detects_and_kills_live_descendant(self) -> None:
+        ready = self.root / "linux-group-child-ready"
+        marker = self.root / "linux-group-child-survived"
+        child = self.root / "linux-group-child.py"
+        child.write_text(
+            textwrap.dedent(
+                """\
+                import pathlib
+                import signal
+                import sys
+                import time
+
+                signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                pathlib.Path(sys.argv[1]).write_text("ready", encoding="utf-8")
+                time.sleep(1.5)
+                pathlib.Path(sys.argv[2]).write_text("survived", encoding="utf-8")
+                """
+            ),
+            encoding="utf-8",
+        )
+        leader = self.root / "linux-group-leader.py"
+        leader.write_text(
+            textwrap.dedent(
+                """\
+                import pathlib
+                import subprocess
+                import sys
+                import time
+
+                subprocess.Popen(
+                    [sys.executable, sys.argv[1], sys.argv[2], sys.argv[3]],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                ready = pathlib.Path(sys.argv[2])
+                deadline = time.monotonic() + 5
+                while not ready.exists():
+                    if time.monotonic() >= deadline:
+                        raise SystemExit("descendant did not become ready")
+                    time.sleep(0.005)
+                """
+            ),
+            encoding="utf-8",
+        )
+        actual_signal = project_journal._signal_process_group
+        with mock.patch.object(
+            project_journal,
+            "_signal_process_group",
+            wraps=actual_signal,
+        ) as signal_group:
+            result = self.capture_process(
+                [
+                    sys.executable,
+                    str(leader),
+                    str(child),
+                    str(ready),
+                    str(marker),
+                ],
+                timeout_seconds=5,
+                stdout_limit=1024,
+            )
+
+        self.assertEqual(result.returncode, 0)
+        signals = [call.args[1] for call in signal_group.call_args_list]
+        self.assertEqual(
+            signals,
+            [signal.SIGTERM, getattr(signal, "SIGKILL", signal.SIGTERM)],
+        )
+        time.sleep(1.6)
+        self.assertFalse(marker.exists())
+
     @unittest.skipUnless(os.name == "posix", "POSIX process-group contract")
     def test_group_cleanup_keeps_leader_fence_and_orders_final_signal(
         self,
@@ -2639,18 +2860,29 @@ class ProjectJournalTests(unittest.TestCase):
 
                 def initial_probe(
                     process_arg: subprocess.Popen[bytes],
+                    *,
+                    leader_exited: bool,
+                    deadline: float | None,
                 ) -> tuple[bool, None]:
                     self.assertIs(process_arg, process)
+                    self.assertFalse(leader_exited)
+                    self.assertIsNotNone(deadline)
                     events.append(("initial-probe", None))
                     return initial_group_exists, None
 
                 def probe_group(
                     process_arg: subprocess.Popen[bytes],
                     deadline: float,
+                    *,
+                    leader_exited: bool,
                 ) -> tuple[bool, None]:
                     nonlocal probe_calls
                     self.assertIs(process_arg, process)
                     self.assertGreater(deadline, 0)
+                    if probe_calls == 0:
+                        self.assertFalse(leader_exited)
+                    else:
+                        self.assertTrue(leader_exited)
                     probe_calls += 1
                     events.append(
                         (
@@ -2715,13 +2947,14 @@ class ProjectJournalTests(unittest.TestCase):
                     expected_events.append(("post-term-probe", None))
                 if group_exists:
                     expected_events.append(("signal", kill_signal))
-                    expected_events.append(("post-kill-probe", None))
                 expected_events.extend(
                     [
                         ("status", None),
-                        ("wait", None),
                     ]
                 )
+                if group_exists:
+                    expected_events.append(("post-kill-probe", None))
+                expected_events.append(("wait", None))
                 self.assertEqual(events, expected_events)
                 process.poll.assert_not_called()
 
@@ -3141,8 +3374,14 @@ class ProjectJournalTests(unittest.TestCase):
             process: subprocess.Popen[bytes],
             selector: object,
             ownership: project_journal._ProcessOwnership,
+            known_returncode: int | None = None,
         ) -> str:
-            actual_error = original_cleanup(process, selector, ownership)
+            actual_error = original_cleanup(
+                process,
+                selector,
+                ownership,
+                known_returncode=known_returncode,
+            )
             details = [
                 detail
                 for detail in (
@@ -4835,6 +5074,178 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertIn("object-identity/content/access-policy verified", notes)
         self.assertIn("no displaced-hook recovery object exists", notes)
         self.assertNotIn("recovery locator", notes)
+
+    def test_install_hooks_continues_after_committed_absent_rename_reports_eio(
+        self,
+    ) -> None:
+        repo = self.init_repo()
+        configured = run_git(
+            repo,
+            "config",
+            "--local",
+            "core.hooksPath",
+            ".githooks",
+        )
+        self.assertEqual(configured.returncode, 0, configured.stderr)
+        actual_rename = project_journal._rename_hook_entry_with_flag
+        injected = False
+
+        def rename_then_report_error(
+            directory_fd: int,
+            source: str,
+            destination: str,
+            *,
+            exchange: bool,
+        ) -> None:
+            nonlocal injected
+            actual_rename(
+                directory_fd,
+                source,
+                destination,
+                exchange=exchange,
+            )
+            if destination == "post-merge" and not exchange and not injected:
+                injected = True
+                raise OSError(errno.EIO, "injected post-rename error")
+
+        args = mock.Mock(repo=str(repo))
+        with mock.patch.object(
+            project_journal,
+            "_rename_hook_entry_with_flag",
+            side_effect=rename_then_report_error,
+        ):
+            result = project_journal.command_install_hooks(args)
+
+        self.assertEqual(result, 0)
+        self.assertTrue(injected)
+        hook = repo / ".githooks/post-merge"
+        self.assertIn(
+            project_journal.HOOK_BEGIN,
+            hook.read_text(encoding="utf-8"),
+        )
+        self.assertEqual(
+            list((repo / ".githooks").glob(".project-journal-post-merge-*.tmp")),
+            [],
+        )
+
+    def test_install_hooks_cleans_staged_absent_hook_after_proven_uncommitted_eio(
+        self,
+    ) -> None:
+        repo = self.init_repo()
+        configured = run_git(
+            repo,
+            "config",
+            "--local",
+            "core.hooksPath",
+            ".githooks",
+        )
+        self.assertEqual(configured.returncode, 0, configured.stderr)
+        actual_rename = project_journal._rename_hook_entry_with_flag
+        injected = False
+
+        def report_error_before_rename(
+            directory_fd: int,
+            source: str,
+            destination: str,
+            *,
+            exchange: bool,
+        ) -> None:
+            nonlocal injected
+            if destination == "post-merge" and not exchange and not injected:
+                injected = True
+                raise OSError(errno.EIO, "injected pre-rename error")
+            actual_rename(
+                directory_fd,
+                source,
+                destination,
+                exchange=exchange,
+            )
+
+        args = mock.Mock(repo=str(repo))
+        with mock.patch.object(
+            project_journal,
+            "_rename_hook_entry_with_flag",
+            side_effect=report_error_before_rename,
+        ):
+            with self.assertRaisesRegex(
+                project_journal.UserError,
+                "injected pre-rename error",
+            ):
+                project_journal.command_install_hooks(args)
+
+        self.assertTrue(injected)
+        self.assertFalse((repo / ".githooks/post-merge").exists())
+        self.assertEqual(
+            list((repo / ".githooks").glob(".project-journal-post-merge-*.tmp")),
+            [],
+        )
+
+    def test_install_hooks_preserves_locator_for_uncertain_absent_rename_eio(
+        self,
+    ) -> None:
+        repo = self.init_repo()
+        configured = run_git(
+            repo,
+            "config",
+            "--local",
+            "core.hooksPath",
+            ".githooks",
+        )
+        self.assertEqual(configured.returncode, 0, configured.stderr)
+        actual_rename = project_journal._rename_hook_entry_with_flag
+        injected = False
+
+        def race_target_then_report_error(
+            directory_fd: int,
+            source: str,
+            destination: str,
+            *,
+            exchange: bool,
+        ) -> None:
+            nonlocal injected
+            if destination == "post-merge" and not exchange and not injected:
+                injected = True
+                (repo / ".githooks/post-merge").write_text(
+                    "third-party hook\n",
+                    encoding="utf-8",
+                )
+                raise OSError(errno.EIO, "injected uncertain rename error")
+            actual_rename(
+                directory_fd,
+                source,
+                destination,
+                exchange=exchange,
+            )
+
+        args = mock.Mock(repo=str(repo))
+        with mock.patch.object(
+            project_journal,
+            "_rename_hook_entry_with_flag",
+            side_effect=race_target_then_report_error,
+        ):
+            with self.assertRaises(
+                project_journal._HookExchangeRecoveryRequired,
+            ) as raised:
+                project_journal.command_install_hooks(args)
+
+        self.assertTrue(injected)
+        self.assertEqual(
+            (repo / ".githooks/post-merge").read_text(encoding="utf-8"),
+            "third-party hook\n",
+        )
+        message = str(raised.exception)
+        self.assertIn("state is uncertain", message)
+        self.assertIn("installed target mismatches", message)
+        self.assertIn(
+            "staged temporary remains object-identity/content/access-policy verified",
+            message,
+        )
+        self.assertIn("preserved recovery locator", message)
+        recoveries = list(
+            (repo / ".githooks").glob(".project-journal-post-merge-*.tmp")
+        )
+        self.assertEqual(len(recoveries), 1)
+        self.assertIn(project_journal.HOOK_BEGIN.encode(), recoveries[0].read_bytes())
 
     def test_install_hooks_reports_post_commit_directory_fsync_failure(
         self,
