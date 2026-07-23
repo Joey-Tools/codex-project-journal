@@ -6,10 +6,13 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import datetime as dt
+import errno
+import hashlib
 import json
 import os
 import pathlib
 import re
+import secrets
 import selectors
 import shlex
 import shutil
@@ -69,6 +72,7 @@ MAX_GIT_STDERR_BYTES = 64 * 1024
 MAX_GIT_VERSION_OUTPUT_BYTES = 4096
 MAX_GLOBAL_GIT_CONFIG_OUTPUT_BYTES = 16 * 1024
 MAX_GLOBAL_GIT_CONFIG_SOURCE_BYTES = 1024 * 1024
+MAX_EXISTING_HOOK_BYTES = 1024 * 1024
 GIT_INDEX_SNAPSHOT_TIMEOUT_SECONDS = 10.0
 GIT_CAT_FILE_BATCH_TIMEOUT_SECONDS = 10.0
 GIT_ADOPTION_VALIDATION_TIMEOUT_SECONDS = 10.0
@@ -192,7 +196,28 @@ class _ProcessSignalResult:
 @dataclasses.dataclass(frozen=True)
 class _GitRuntime:
     executable: pathlib.Path
+    source_executable: pathlib.Path
     version: tuple[int, int, int]
+    digest: str
+    file_identity: tuple[int, int, int, int, int]
+    directory_identity: tuple[int, int, int, int]
+    snapshot_owner: tempfile.TemporaryDirectory[str]
+
+
+@dataclasses.dataclass(frozen=True)
+class _HookTargetSnapshot:
+    name: str
+    exists: bool
+    identity: tuple[int, int, int, int, int] | None = None
+    digest: str | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class _HookDirectoryBinding:
+    path: pathlib.Path
+    fd: int
+    identity: tuple[int, int, int, int]
+    targets: tuple[_HookTargetSnapshot, ...]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -284,6 +309,68 @@ _GIT_RUNTIME: _GitRuntime | None = None
 _GIT_RUNTIME_ERROR: UnsupportedGitVersion | None = None
 
 
+def _file_identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_uid,
+        stat.S_IMODE(value.st_mode),
+        value.st_size,
+    )
+
+
+def _directory_identity(value: os.stat_result) -> tuple[int, int, int, int]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_uid,
+        stat.S_IMODE(value.st_mode),
+    )
+
+
+def _hash_open_file(fd: int) -> str:
+    digest = hashlib.sha256()
+    os.lseek(fd, 0, os.SEEK_SET)
+    while True:
+        chunk = os.read(fd, PROCESS_READ_CHUNK_BYTES)
+        if not chunk:
+            break
+        digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _verify_git_runtime_snapshot(runtime: _GitRuntime) -> None:
+    try:
+        directory_stat = os.stat(runtime.executable.parent, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(directory_stat.st_mode)
+            or _directory_identity(directory_stat) != runtime.directory_identity
+            or directory_stat.st_uid != os.geteuid()
+            or stat.S_IMODE(directory_stat.st_mode) != 0o700
+        ):
+            raise OSError("owner-private snapshot directory identity changed")
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(runtime.executable, flags)
+        try:
+            file_stat = os.fstat(fd)
+            if (
+                not stat.S_ISREG(file_stat.st_mode)
+                or _file_identity(file_stat) != runtime.file_identity
+                or file_stat.st_uid != os.geteuid()
+                or stat.S_IMODE(file_stat.st_mode) != 0o500
+            ):
+                raise OSError("owner-private Git snapshot identity changed")
+            if _hash_open_file(fd) != runtime.digest:
+                raise OSError("owner-private Git snapshot content changed")
+        finally:
+            os.close(fd)
+    except OSError as exc:
+        raise UnsupportedGitVersion(
+            f"verified Git runtime snapshot is no longer trustworthy: {exc}"
+        ) from exc
+
+
 def _git_environment() -> dict[str, str]:
     env = {key: os.environ[key] for key in GIT_ENV_PASSTHROUGH if key in os.environ}
     env.update(SAFE_GIT_ENV)
@@ -300,11 +387,43 @@ def _global_config_git_environment() -> dict[str, str]:
     return env
 
 
+def _system_config_git_environment() -> dict[str, str]:
+    env = {
+        key: os.environ[key]
+        for key in (
+            "LANG",
+            "LC_ALL",
+            "LC_CTYPE",
+            "PATH",
+            "SYSTEMROOT",
+            "TEMP",
+            "TMP",
+            "TMPDIR",
+        )
+        if key in os.environ
+    }
+    env.update(SAFE_GIT_ENV)
+    env.pop("GIT_CONFIG_NOSYSTEM", None)
+    configured_path = os.environ.get("GIT_CONFIG_SYSTEM")
+    if configured_path is None:
+        env.pop("GIT_CONFIG_SYSTEM", None)
+    else:
+        env["GIT_CONFIG_SYSTEM"] = configured_path
+    return env
+
+
 def _fixed_git_executable() -> pathlib.Path:
+    global _GIT_RUNTIME_ERROR
+
     if _GIT_RUNTIME_ERROR is not None:
         raise _GIT_RUNTIME_ERROR
     if _GIT_RUNTIME is None:
         raise UnsupportedGitVersion("Git runtime validation did not complete")
+    try:
+        _verify_git_runtime_snapshot(_GIT_RUNTIME)
+    except UnsupportedGitVersion as exc:
+        _GIT_RUNTIME_ERROR = exc
+        raise
     return _GIT_RUNTIME.executable
 
 
@@ -1424,6 +1543,81 @@ def _capture_bounded_process(
     )
 
 
+def _snapshot_git_executable(
+    source: pathlib.Path,
+) -> tuple[
+    pathlib.Path,
+    str,
+    tuple[int, int, int, int, int],
+    tuple[int, int, int, int],
+    tempfile.TemporaryDirectory[str],
+]:
+    owner = tempfile.TemporaryDirectory(prefix="project-journal-git-runtime-")
+    directory = pathlib.Path(owner.name).resolve()
+    os.chmod(directory, 0o700)
+    snapshot = directory / "git"
+    source_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    source_flags |= getattr(os, "O_NOFOLLOW", 0)
+    destination_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    destination_flags |= getattr(os, "O_CLOEXEC", 0)
+    destination_flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        source_fd = os.open(source, source_flags)
+        try:
+            source_before = os.fstat(source_fd)
+            if not stat.S_ISREG(source_before.st_mode):
+                raise OSError("selected Git executable is not a regular file")
+            destination_fd = os.open(snapshot, destination_flags, 0o600)
+            digest = hashlib.sha256()
+            try:
+                while True:
+                    chunk = os.read(source_fd, PROCESS_READ_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+                    offset = 0
+                    while offset < len(chunk):
+                        written = os.write(destination_fd, chunk[offset:])
+                        if written <= 0:
+                            raise OSError("short write while snapshotting Git")
+                        offset += written
+                os.fsync(destination_fd)
+                os.fchmod(destination_fd, 0o500)
+                destination_stat = os.fstat(destination_fd)
+            finally:
+                os.close(destination_fd)
+            source_after = os.fstat(source_fd)
+        finally:
+            os.close(source_fd)
+
+        source_signals = (
+            "st_dev",
+            "st_ino",
+            "st_mode",
+            "st_size",
+            "st_mtime_ns",
+            "st_ctime_ns",
+        )
+        if any(
+            getattr(source_before, name) != getattr(source_after, name)
+            for name in source_signals
+        ):
+            raise OSError("selected Git executable changed while being snapshotted")
+        if destination_stat.st_size != source_after.st_size:
+            raise OSError("Git runtime snapshot size does not match its source")
+        directory_stat = os.stat(directory, follow_symlinks=False)
+        return (
+            snapshot,
+            digest.hexdigest(),
+            _file_identity(destination_stat),
+            _directory_identity(directory_stat),
+            owner,
+        )
+    except BaseException:
+        owner.cleanup()
+        raise
+
+
 def _initialize_git_runtime() -> None:
     global _GIT_RUNTIME
     global _GIT_RUNTIME_ERROR
@@ -1453,6 +1647,20 @@ def _initialize_git_runtime() -> None:
         )
         return
 
+    try:
+        (
+            snapshot,
+            digest,
+            snapshot_identity,
+            directory_identity,
+            snapshot_owner,
+        ) = _snapshot_git_executable(executable)
+    except OSError as exc:
+        _GIT_RUNTIME_ERROR = UnsupportedGitVersion(
+            f"failed to create an owner-private Git runtime snapshot: {exc}"
+        )
+        return
+
     version_env = {
         key: os.environ[key]
         for key in (
@@ -1470,7 +1678,7 @@ def _initialize_git_runtime() -> None:
     version_env.update(SAFE_GIT_ENV)
     try:
         result = _capture_bounded_process(
-            [str(executable), "--version"],
+            [str(snapshot), "--version"],
             env=version_env,
             timeout_seconds=GIT_VERSION_TIMEOUT_SECONDS,
             stdout_limit=MAX_GIT_VERSION_OUTPUT_BYTES,
@@ -1488,11 +1696,13 @@ def _initialize_git_runtime() -> None:
             operation="Git version probe",
         )
     except UserError as exc:
+        snapshot_owner.cleanup()
         _GIT_RUNTIME_ERROR = UnsupportedGitVersion(
             f"failed the bounded credential-free Git version gate: {exc}"
         )
         return
     if result.returncode != 0:
+        snapshot_owner.cleanup()
         detail = (
             result.stderr.decode("utf-8", errors="replace").strip()
             or result.stdout.decode("utf-8", errors="replace").strip()
@@ -1504,19 +1714,35 @@ def _initialize_git_runtime() -> None:
         return
     match = GIT_VERSION_RE.fullmatch(result.stdout)
     if match is None:
+        snapshot_owner.cleanup()
         _GIT_RUNTIME_ERROR = UnsupportedGitVersion(
             "Git version probe returned an unsupported response"
         )
         return
     version = tuple(int(part or 0) for part in match.groups())
     if version < MINIMUM_GIT_VERSION:
+        snapshot_owner.cleanup()
         actual = ".".join(str(part) for part in version)
         minimum = ".".join(str(part) for part in MINIMUM_GIT_VERSION[:2])
         _GIT_RUNTIME_ERROR = UnsupportedGitVersion(
             f"Git >= {minimum} is required; selected {executable} reports {actual}"
         )
         return
-    _GIT_RUNTIME = _GitRuntime(executable=executable, version=version)
+    _GIT_RUNTIME = _GitRuntime(
+        executable=snapshot,
+        source_executable=executable,
+        version=version,
+        digest=digest,
+        file_identity=snapshot_identity,
+        directory_identity=directory_identity,
+        snapshot_owner=snapshot_owner,
+    )
+    try:
+        _verify_git_runtime_snapshot(_GIT_RUNTIME)
+    except UnsupportedGitVersion as exc:
+        snapshot_owner.cleanup()
+        _GIT_RUNTIME = None
+        _GIT_RUNTIME_ERROR = exc
 
 
 def _tracked_index_journal_snapshot(
@@ -2112,6 +2338,22 @@ def _global_git_config_paths() -> list[pathlib.Path]:
     ]
 
 
+def _parse_git_config_records(output: bytes, label: str) -> list[tuple[str, str]]:
+    if output and not output.endswith(b"\0"):
+        raise UserError(f"{label} returned malformed framing")
+    try:
+        records = [value.decode("utf-8") for value in output.split(b"\0") if value]
+    except UnicodeDecodeError as exc:
+        raise UserError(f"{label} returned non-UTF-8 data") from exc
+    entries: list[tuple[str, str]] = []
+    for record in records:
+        key, separator, value = record.partition("\n")
+        if not separator or not key:
+            raise UserError(f"{label} returned malformed records")
+        entries.append((key.lower(), value))
+    return entries
+
+
 def _global_git_config_entries(config_path: pathlib.Path) -> list[tuple[str, str]]:
     try:
         with config_path.open("rb") as source:
@@ -2179,24 +2421,109 @@ def _global_git_config_entries(config_path: pathlib.Path) -> list[tuple[str, str
             or f"exit {result.returncode}"
         )
         raise UserError(f"failed to inspect global Git config safely: {detail}")
-    if result.stdout and not result.stdout.endswith(b"\0"):
-        raise UserError("global Git config query returned malformed framing")
-    try:
-        records = [
-            value.decode("utf-8") for value in result.stdout.split(b"\0") if value
-        ]
-    except UnicodeDecodeError as exc:
-        raise UserError("global Git config query returned non-UTF-8 data") from exc
-    entries: list[tuple[str, str]] = []
-    for record in records:
-        key, separator, value = record.partition("\n")
-        if not separator or not key:
-            raise UserError("global Git config query returned malformed records")
-        entries.append((key.lower(), value))
-    return entries
+    return _parse_git_config_records(result.stdout, "global Git config query")
+
+
+def _git_env_flag_enabled(name: str) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return False
+    return value.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _system_git_config_entries() -> list[tuple[str, str]]:
+    if _git_env_flag_enabled("GIT_CONFIG_NOSYSTEM"):
+        return []
+
+    configured_path = os.environ.get("GIT_CONFIG_SYSTEM")
+    if configured_path is not None:
+        if not configured_path:
+            raise UserError(
+                "GIT_CONFIG_SYSTEM is empty; cannot prove the actual system "
+                "core.hooksPath configuration safely"
+            )
+        path = pathlib.Path(configured_path).expanduser()
+        if not path.is_absolute():
+            path = pathlib.Path.cwd() / path
+        path = path.resolve()
+        if path == pathlib.Path(os.devnull).resolve():
+            return []
+        try:
+            path_stat = path.stat()
+        except OSError as exc:
+            raise UserError(
+                f"failed to inspect system Git config {path}: {exc}"
+            ) from exc
+        if not stat.S_ISREG(path_stat.st_mode):
+            raise UserError(f"system Git config is not a regular file: {path}")
+        return _global_git_config_entries(path)
+
+    command = [
+        str(_fixed_git_executable()),
+        "--no-pager",
+        "--no-optional-locks",
+        "config",
+        "--system",
+        "--no-includes",
+        "--null",
+        "--list",
+    ]
+    result = _capture_bounded_process(
+        command,
+        env=_system_config_git_environment(),
+        timeout_seconds=GIT_CONFIG_QUERY_TIMEOUT_SECONDS,
+        stdout_limit=MAX_GLOBAL_GIT_CONFIG_OUTPUT_BYTES,
+        stderr_limit=MAX_GIT_STDERR_BYTES,
+        stdout_overflow_error=(
+            "system Git config query stdout exceeds "
+            f"{MAX_GLOBAL_GIT_CONFIG_OUTPUT_BYTES} bytes"
+        ),
+        stderr_overflow_error=(
+            f"system Git config query stderr exceeds {MAX_GIT_STDERR_BYTES} bytes"
+        ),
+        timeout_error=(
+            f"system Git config query timed out after "
+            f"{GIT_CONFIG_QUERY_TIMEOUT_SECONDS:g} seconds"
+        ),
+        operation="system Git config query",
+    )
+    if result.returncode != 0:
+        detail = (
+            result.stderr.decode("utf-8", errors="replace").strip()
+            or f"exit {result.returncode}"
+        )
+        raise UserError(f"failed to inspect system Git config safely: {detail}")
+    return _parse_git_config_records(result.stdout, "system Git config query")
 
 
 def _preflight_global_hooks_config(repo: pathlib.Path) -> None:
+    system_entries = _system_git_config_entries()
+    system_hooks = [value for key, value in system_entries if key == "core.hookspath"]
+    system_includes = [
+        key
+        for key, _value in system_entries
+        if key == "include.path"
+        or (key.startswith("includeif.") and key.endswith(".path"))
+    ]
+    git_executable = shlex.quote(str(_fixed_git_executable()))
+    repo_arg = shlex.quote(str(repo))
+    instruction = (
+        f"{git_executable} -C {repo_arg} config --local core.hooksPath .githooks"
+    )
+    if system_hooks:
+        raise UserError(
+            "system core.hooksPath is set, so installing into the default "
+            "repository hook directory would not be used by actual Git; "
+            f"set an explicit repo-local override first, for example: {instruction}"
+        )
+    if system_includes:
+        raise UserError(
+            "system Git config contains include directives; project_journal.py "
+            "does not follow system includes while resolving core.hooksPath, so "
+            "the effective hook directory cannot be proved safely; set an explicit "
+            f"repo-local override first, for example: {instruction}"
+        )
+
     entries: list[tuple[str, str]] = []
     for config_path in _global_git_config_paths():
         if not config_path.exists():
@@ -2220,11 +2547,6 @@ def _preflight_global_hooks_config(repo: pathlib.Path) -> None:
     if not hooks_values and not include_keys:
         return
 
-    git_executable = shlex.quote(str(_fixed_git_executable()))
-    repo_arg = shlex.quote(str(repo))
-    instruction = (
-        f"{git_executable} -C {repo_arg} config --local core.hooksPath .githooks"
-    )
     if hooks_values:
         raise UserError(
             "global core.hooksPath is set, so installing into the default "
@@ -2259,51 +2581,260 @@ def _hook_path(repo: pathlib.Path, name: str) -> pathlib.Path:
     return _hooks_dir(repo) / name
 
 
-def _preflight_hook_targets(repo: pathlib.Path) -> list[pathlib.Path]:
-    hook_paths = [_hook_path(repo, name) for name in HOOK_NAMES]
-    for hook_path in hook_paths:
-        if hook_path.is_symlink():
-            raise UserError(
-                f"{hook_path} is a symlink; refusing to overwrite hook links"
-            )
-        if not hook_path.exists():
-            continue
-        existing = hook_path.read_text(encoding="utf-8", errors="replace")
-        if HOOK_BEGIN not in existing or HOOK_END not in existing:
-            raise UserError(
-                f"{hook_path} already exists and is not managed by project_journal.py"
-            )
-        before, _marker, rest = existing.partition(HOOK_BEGIN)
-        _managed, _end_marker, after = rest.partition(HOOK_END)
-        before_lines = [line for line in before.splitlines() if line.strip()]
-        if before_lines not in ([], ["#!/bin/sh"]) or after.strip():
-            raise UserError(
-                f"{hook_path} contains unmanaged content outside the project journal marker block"
-            )
-    return hook_paths
+def _validate_hook_directory_stat(
+    path: pathlib.Path,
+    value: os.stat_result,
+) -> tuple[int, int, int, int]:
+    if not stat.S_ISDIR(value.st_mode):
+        raise UserError(f"hook directory is not a directory: {path}")
+    mode = stat.S_IMODE(value.st_mode)
+    if value.st_uid != os.geteuid() or mode & 0o022:
+        raise UserError(
+            f"hook directory must be owned by the current user and not "
+            f"group/world writable: {path}"
+        )
+    return _directory_identity(value)
 
 
-def _install_hook(hook_path: pathlib.Path) -> pathlib.Path:
-    hook_path.parent.mkdir(parents=True, exist_ok=True)
-    if hook_path.is_symlink():
-        raise UserError(f"{hook_path} is a symlink; refusing to overwrite hook links")
-    if hook_path.exists():
-        existing = hook_path.read_text(encoding="utf-8", errors="replace")
-        if HOOK_BEGIN not in existing or HOOK_END not in existing:
+def _revalidate_hook_directory(binding: _HookDirectoryBinding) -> None:
+    try:
+        descriptor_stat = os.fstat(binding.fd)
+        path_stat = os.stat(binding.path, follow_symlinks=False)
+    except OSError as exc:
+        raise UserError(
+            f"hook directory became unavailable during installation: {exc}"
+        ) from exc
+    descriptor_identity = _validate_hook_directory_stat(
+        binding.path,
+        descriptor_stat,
+    )
+    path_identity = _validate_hook_directory_stat(binding.path, path_stat)
+    if descriptor_identity != binding.identity or path_identity != binding.identity:
+        raise UserError(
+            f"hook directory identity or access policy changed during "
+            f"installation: {binding.path}"
+        )
+
+
+def _hook_target_identity(value: os.stat_result) -> tuple[int, ...]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_uid,
+        stat.S_IMODE(value.st_mode),
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
+def _snapshot_hook_target(
+    binding: _HookDirectoryBinding,
+    name: str,
+) -> tuple[_HookTargetSnapshot, bytes | None]:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(name, flags, dir_fd=binding.fd)
+    except FileNotFoundError:
+        return _HookTargetSnapshot(name=name, exists=False), None
+    except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.EMLINK}:
             raise UserError(
-                f"{hook_path} already exists and is not managed by project_journal.py"
+                f"{binding.path / name} is a symlink; refusing to overwrite hook links"
+            ) from exc
+        raise UserError(
+            f"failed to open hook target {binding.path / name}: {exc}"
+        ) from exc
+
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode):
+            raise UserError(f"hook target is not a regular file: {binding.path / name}")
+        if before.st_size > MAX_EXISTING_HOOK_BYTES:
+            raise UserError(
+                f"hook target exceeds {MAX_EXISTING_HOOK_BYTES} bytes: "
+                f"{binding.path / name}"
             )
-    hook_path.write_text(_hook_body(), encoding="utf-8")
-    mode = hook_path.stat().st_mode
-    hook_path.chmod(mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-    return hook_path
+        content = bytearray()
+        while len(content) <= MAX_EXISTING_HOOK_BYTES:
+            chunk = os.read(
+                fd,
+                min(
+                    PROCESS_READ_CHUNK_BYTES,
+                    MAX_EXISTING_HOOK_BYTES + 1 - len(content),
+                ),
+            )
+            if not chunk:
+                break
+            content.extend(chunk)
+        after = os.fstat(fd)
+    finally:
+        os.close(fd)
+    if len(content) > MAX_EXISTING_HOOK_BYTES:
+        raise UserError(
+            f"hook target exceeds {MAX_EXISTING_HOOK_BYTES} bytes: "
+            f"{binding.path / name}"
+        )
+    identity = _hook_target_identity(before)
+    if _hook_target_identity(after) != identity:
+        raise UserError(
+            f"hook target changed while being inspected: {binding.path / name}"
+        )
+    raw = bytes(content)
+    return (
+        _HookTargetSnapshot(
+            name=name,
+            exists=True,
+            identity=identity,
+            digest=hashlib.sha256(raw).hexdigest(),
+        ),
+        raw,
+    )
+
+
+def _validate_managed_hook(path: pathlib.Path, content: bytes) -> None:
+    existing = content.decode("utf-8", errors="replace")
+    if HOOK_BEGIN not in existing or HOOK_END not in existing:
+        raise UserError(
+            f"{path} already exists and is not managed by project_journal.py"
+        )
+    before, _marker, rest = existing.partition(HOOK_BEGIN)
+    _managed, _end_marker, after = rest.partition(HOOK_END)
+    before_lines = [line for line in before.splitlines() if line.strip()]
+    if before_lines not in ([], ["#!/bin/sh"]) or after.strip():
+        raise UserError(
+            f"{path} contains unmanaged content outside the project journal marker block"
+        )
+
+
+def _revalidate_hook_target(
+    binding: _HookDirectoryBinding,
+    expected: _HookTargetSnapshot,
+) -> None:
+    actual, _content = _snapshot_hook_target(binding, expected.name)
+    if actual != expected:
+        raise UserError(
+            f"hook target changed after preflight: {binding.path / expected.name}"
+        )
+
+
+def _preflight_hook_targets(repo: pathlib.Path) -> _HookDirectoryBinding:
+    hooks_dir = _hooks_dir(repo)
+    hooks_dir.mkdir(parents=True, exist_ok=True)
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(hooks_dir, flags)
+    except OSError as exc:
+        raise UserError(f"failed to bind hook directory {hooks_dir}: {exc}") from exc
+    binding: _HookDirectoryBinding | None = None
+    try:
+        descriptor_stat = os.fstat(fd)
+        path_stat = os.stat(hooks_dir, follow_symlinks=False)
+        descriptor_identity = _validate_hook_directory_stat(
+            hooks_dir,
+            descriptor_stat,
+        )
+        path_identity = _validate_hook_directory_stat(hooks_dir, path_stat)
+        if descriptor_identity != path_identity:
+            raise UserError(f"hook directory changed while being bound: {hooks_dir}")
+        provisional = _HookDirectoryBinding(
+            path=hooks_dir,
+            fd=fd,
+            identity=descriptor_identity,
+            targets=(),
+        )
+        targets: list[_HookTargetSnapshot] = []
+        for name in HOOK_NAMES:
+            target, content = _snapshot_hook_target(provisional, name)
+            if content is not None:
+                _validate_managed_hook(hooks_dir / name, content)
+            targets.append(target)
+        binding = dataclasses.replace(provisional, targets=tuple(targets))
+        _revalidate_hook_directory(binding)
+        return binding
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _write_all(fd: int, content: bytes) -> None:
+    offset = 0
+    while offset < len(content):
+        written = os.write(fd, content[offset:])
+        if written <= 0:
+            raise OSError("short write while staging hook")
+        offset += written
+
+
+def _install_hook(
+    binding: _HookDirectoryBinding,
+    target: _HookTargetSnapshot,
+) -> pathlib.Path:
+    _revalidate_hook_directory(binding)
+    _revalidate_hook_target(binding, target)
+    content = _hook_body().encode("utf-8")
+    temporary_name = f".project-journal-{target.name}-{secrets.token_hex(12)}.tmp"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    temporary_created = False
+    try:
+        temporary_fd = os.open(temporary_name, flags, 0o600, dir_fd=binding.fd)
+        temporary_created = True
+        try:
+            _write_all(temporary_fd, content)
+            os.fsync(temporary_fd)
+            os.fchmod(temporary_fd, 0o755)
+            os.fsync(temporary_fd)
+        finally:
+            os.close(temporary_fd)
+        _revalidate_hook_directory(binding)
+        _revalidate_hook_target(binding, target)
+        os.replace(
+            temporary_name,
+            target.name,
+            src_dir_fd=binding.fd,
+            dst_dir_fd=binding.fd,
+        )
+        temporary_created = False
+        os.fsync(binding.fd)
+        _revalidate_hook_directory(binding)
+        installed, installed_content = _snapshot_hook_target(binding, target.name)
+        if (
+            not installed.exists
+            or installed_content != content
+            or installed.identity is None
+            or installed.identity[3] != 0o755
+        ):
+            raise UserError(
+                f"hook target failed post-write verification: "
+                f"{binding.path / target.name}"
+            )
+    except OSError as exc:
+        raise UserError(
+            f"failed to install hook {binding.path / target.name}: {exc}"
+        ) from exc
+    finally:
+        if temporary_created:
+            try:
+                os.unlink(temporary_name, dir_fd=binding.fd)
+            except FileNotFoundError:
+                pass
+    return binding.path / target.name
 
 
 def command_install_hooks(args: argparse.Namespace) -> int:
     repo = _resolve_repo(args.repo)
-    hook_paths = _preflight_hook_targets(repo)
-    _ensure_exclude(repo, DEFAULT_INDEX.as_posix())
-    installed = [_install_hook(path) for path in hook_paths]
+    binding = _preflight_hook_targets(repo)
+    try:
+        _ensure_exclude(repo, DEFAULT_INDEX.as_posix())
+        _revalidate_hook_directory(binding)
+        installed = [_install_hook(binding, target) for target in binding.targets]
+    finally:
+        os.close(binding.fd)
     for path in installed:
         print(path)
     return 0
@@ -2534,6 +3065,64 @@ def _discover_adoption_status(repo: pathlib.Path) -> dict[str, Any]:
     }
 
 
+def _discovery_error(exc: BaseException) -> dict[str, str]:
+    return {
+        "code": getattr(exc, "code", "repo_discovery_failed"),
+        "message": str(exc),
+    }
+
+
+def _enrich_discovered_repo(
+    root: pathlib.Path,
+    row: dict[str, Any],
+    script: pathlib.Path,
+) -> None:
+    journal_root = root / JOURNAL_ROOT
+    index_rel = DEFAULT_INDEX.as_posix()
+    adoption = _discover_adoption_status(root)
+    try:
+        journal_count = len(_journal_paths(root))
+        index_ignored = _is_excluded(root, index_rel)
+        hooks_installed = _has_hook_marker(root)
+    except (OSError, UserError) as exc:
+        error = _discovery_error(exc)
+        adoption = {
+            "adoption_status": "inconclusive",
+            "adoption_error": error,
+            "tracked_journal_adopted": None,
+            "tracked_non_generated_journal_count": None,
+            "valid_tracked_journal_count": None,
+        }
+        journal_count = None
+        index_ignored = None
+        hooks_installed = None
+        discovery_status = "inconclusive"
+        discovery_error: dict[str, str] | None = error
+    else:
+        discovery_status = (
+            "inconclusive"
+            if adoption["adoption_status"] == "inconclusive"
+            else "complete"
+        )
+        discovery_error = (
+            adoption["adoption_error"] if discovery_status == "inconclusive" else None
+        )
+    row.update(
+        {
+            "has_journal_dir": journal_root.is_dir(),
+            "journal_count": journal_count,
+            "has_index": (root / index_rel).is_file(),
+            "index_ignored": index_ignored,
+            "hooks_installed": hooks_installed,
+            "discovery_status": discovery_status,
+            "discovery_error": discovery_error,
+            "install_command": f"{shlex.quote(sys.executable)} {shlex.quote(str(script))} install-hooks --repo {shlex.quote(str(root))}",
+            "generate_command": f"{shlex.quote(sys.executable)} {shlex.quote(str(script))} generate --repo {shlex.quote(str(root))} --output {index_rel} --ensure-exclude",
+            **adoption,
+        }
+    )
+
+
 def _discover_repos(codex_home: pathlib.Path, since_days: int) -> list[dict[str, Any]]:
     sessions = codex_home / "sessions"
     if not sessions.exists():
@@ -2569,21 +3158,7 @@ def _discover_repos(codex_home: pathlib.Path, since_days: int) -> list[dict[str,
 
     results: list[dict[str, Any]] = []
     for root, row in sorted(seen.items(), key=lambda item: item[0].as_posix()):
-        journal_root = root / JOURNAL_ROOT
-        index_rel = DEFAULT_INDEX.as_posix()
-        adoption = _discover_adoption_status(root)
-        row.update(
-            {
-                "has_journal_dir": journal_root.is_dir(),
-                "journal_count": len(_journal_paths(root)),
-                "has_index": (root / index_rel).is_file(),
-                "index_ignored": _is_excluded(root, index_rel),
-                "hooks_installed": _has_hook_marker(root),
-                "install_command": f"{shlex.quote(sys.executable)} {shlex.quote(str(script))} install-hooks --repo {shlex.quote(str(root))}",
-                "generate_command": f"{shlex.quote(sys.executable)} {shlex.quote(str(script))} generate --repo {shlex.quote(str(root))} --output {index_rel} --ensure-exclude",
-                **adoption,
-            }
-        )
+        _enrich_discovered_repo(root, row, script)
         results.append(row)
     return results
 

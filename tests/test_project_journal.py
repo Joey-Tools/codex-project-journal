@@ -353,6 +353,9 @@ class ProjectJournalTests(unittest.TestCase):
         assert runtime is not None
         self.assertTrue(runtime.executable.is_absolute())
         self.assertEqual(runtime.executable, runtime.executable.resolve())
+        self.assertNotEqual(runtime.executable, runtime.source_executable)
+        self.assertEqual(runtime.executable.stat().st_mode & 0o777, 0o500)
+        self.assertEqual(runtime.executable.parent.stat().st_mode & 0o777, 0o700)
         self.assertGreaterEqual(runtime.version, project_journal.MINIMUM_GIT_VERSION)
         command = project_journal._git_command(
             self.root,
@@ -360,6 +363,71 @@ class ProjectJournalTests(unittest.TestCase):
             "--show-toplevel",
         )
         self.assertEqual(command[0], str(runtime.executable))
+
+    def test_git_gate_executes_bound_snapshot_after_source_replacement_and_rewrite(
+        self,
+    ) -> None:
+        old_runtime = project_journal._GIT_RUNTIME
+        old_error = project_journal._GIT_RUNTIME_ERROR
+        fake_git = self.root / "git"
+        safe_script = textwrap.dedent(
+            """\
+            #!/bin/sh
+            if [ "$1" = "--version" ]; then
+              printf 'git version 2.45.1\\n'
+            else
+              printf 'safe-snapshot\\n'
+            fi
+            """
+        )
+        malicious_script = textwrap.dedent(
+            """\
+            #!/bin/sh
+            printf 'replaced-source\\n'
+            """
+        )
+
+        try:
+            for mutation in ("replacement", "same-inode-rewrite"):
+                with self.subTest(mutation=mutation):
+                    fake_git.write_text(safe_script, encoding="utf-8")
+                    fake_git.chmod(0o755)
+                    project_journal._GIT_RUNTIME = None
+                    project_journal._GIT_RUNTIME_ERROR = None
+                    with mock.patch.object(
+                        project_journal.shutil,
+                        "which",
+                        return_value=str(fake_git),
+                    ):
+                        project_journal._initialize_git_runtime()
+                    runtime = project_journal._GIT_RUNTIME
+                    self.assertIsNotNone(runtime)
+                    assert runtime is not None
+
+                    if mutation == "replacement":
+                        replacement = self.root / "replacement-git"
+                        replacement.write_text(malicious_script, encoding="utf-8")
+                        replacement.chmod(0o755)
+                        os.replace(replacement, fake_git)
+                    else:
+                        original_inode = fake_git.stat().st_ino
+                        fake_git.write_text(malicious_script, encoding="utf-8")
+                        fake_git.chmod(0o755)
+                        self.assertEqual(fake_git.stat().st_ino, original_inode)
+
+                    result = subprocess.run(
+                        [str(project_journal._fixed_git_executable()), "probe"],
+                        check=False,
+                        text=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout, "safe-snapshot\n")
+                    runtime.snapshot_owner.cleanup()
+        finally:
+            project_journal._GIT_RUNTIME = old_runtime
+            project_journal._GIT_RUNTIME_ERROR = old_error
 
     def test_old_git_fails_closed_and_discovery_reports_inconclusive(
         self,
@@ -2328,9 +2396,11 @@ class ProjectJournalTests(unittest.TestCase):
             "`inconclusive` carries a structured `adoption_error` and null adoption fields",
             skill,
         )
-        self.assertIn("actual global Git config", skill)
+        self.assertIn("system and global Git configuration", skill)
         self.assertIn("without following includes", skill)
         self.assertIn("explicit repo-local `core.hooksPath`", skill)
+        self.assertIn("revalidates the snapshot identity and SHA-256", skill)
+        self.assertIn("atomically replaces targets relative to the descriptor", skill)
         self.assertIn(
             "leave `docs/PROJECT_STATE.md`, `docs/PROJECT_TODO.md`, and `docs/project_journal/` unchanged",
             skill,
@@ -2400,7 +2470,10 @@ class ProjectJournalTests(unittest.TestCase):
             readme,
         )
         self.assertIn("ignores ambient Git control/configuration redirections", readme)
-        self.assertIn("requires a bounded credential-free version result", readme)
+        self.assertIn(
+            "requires that exact snapshot to return a bounded credential-free",
+            readme,
+        )
         self.assertIn("byte, record, and stderr bounds", readme)
         self.assertIn("one bounded `git cat-file --batch` session", readme)
         self.assertIn("one absolute monotonic deadline", readme)
@@ -2410,7 +2483,9 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertIn("Explicit cleanup ownership states", readme)
         self.assertIn("never signals a numeric PGID after the final reap", readme)
         self.assertIn("reports `cleanup-incomplete`", readme)
-        self.assertIn("global `core.hooksPath`", readme)
+        self.assertIn("system and global Git configuration", readme)
+        self.assertIn("descriptor-relative atomic replacement", readme)
+        self.assertIn("structured `discovery_error`", readme)
         self.assertIn("`adopted`, `unadopted`, or `inconclusive`", readme)
         self.assertIn(
             "explicit product need justifies first adoption",
@@ -2702,6 +2777,118 @@ class ProjectJournalTests(unittest.TestCase):
                         "#!/bin/sh\necho keep-me\n",
                     )
 
+    def test_install_hooks_atomic_replace_does_not_follow_racing_target_symlink(
+        self,
+    ) -> None:
+        repo = self.init_repo()
+        configured = run_git(
+            repo,
+            "config",
+            "--local",
+            "core.hooksPath",
+            ".githooks",
+        )
+        self.assertEqual(configured.returncode, 0, configured.stderr)
+        first = self.run_cli("install-hooks", "--repo", str(repo))
+        self.assertEqual(first.returncode, 0, first.stderr)
+        outside = self.root / "outside-hook"
+        outside.write_text("keep-me\n", encoding="utf-8")
+        actual_replace = os.replace
+        raced = False
+
+        def replace_with_target_race(
+            source: str,
+            destination: str,
+            *,
+            src_dir_fd: int,
+            dst_dir_fd: int,
+        ) -> None:
+            nonlocal raced
+            if destination == "post-merge" and not raced:
+                raced = True
+                target = repo / ".githooks/post-merge"
+                target.unlink()
+                target.symlink_to(outside)
+            actual_replace(
+                source,
+                destination,
+                src_dir_fd=src_dir_fd,
+                dst_dir_fd=dst_dir_fd,
+            )
+
+        args = mock.Mock(repo=str(repo))
+        with mock.patch.object(
+            project_journal.os,
+            "replace",
+            side_effect=replace_with_target_race,
+        ):
+            result = project_journal.command_install_hooks(args)
+
+        self.assertEqual(result, 0)
+        self.assertTrue(raced)
+        installed = repo / ".githooks/post-merge"
+        self.assertFalse(installed.is_symlink())
+        self.assertIn(
+            project_journal.HOOK_BEGIN,
+            installed.read_text(encoding="utf-8"),
+        )
+        self.assertEqual(outside.read_text(encoding="utf-8"), "keep-me\n")
+
+    def test_install_hooks_detects_racing_parent_replacement(self) -> None:
+        repo = self.init_repo()
+        configured = run_git(
+            repo,
+            "config",
+            "--local",
+            "core.hooksPath",
+            ".githooks",
+        )
+        self.assertEqual(configured.returncode, 0, configured.stderr)
+        first = self.run_cli("install-hooks", "--repo", str(repo))
+        self.assertEqual(first.returncode, 0, first.stderr)
+        hooks_dir = repo / ".githooks"
+        moved_hooks = repo / ".githooks-validated-object"
+        actual_replace = os.replace
+        raced = False
+
+        def replace_with_parent_race(
+            source: str,
+            destination: str,
+            *,
+            src_dir_fd: int,
+            dst_dir_fd: int,
+        ) -> None:
+            nonlocal raced
+            if destination == "post-merge" and not raced:
+                raced = True
+                hooks_dir.rename(moved_hooks)
+                hooks_dir.mkdir()
+            actual_replace(
+                source,
+                destination,
+                src_dir_fd=src_dir_fd,
+                dst_dir_fd=dst_dir_fd,
+            )
+
+        args = mock.Mock(repo=str(repo))
+        with mock.patch.object(
+            project_journal.os,
+            "replace",
+            side_effect=replace_with_parent_race,
+        ):
+            with self.assertRaisesRegex(
+                project_journal.UserError,
+                "identity or access policy changed",
+            ):
+                project_journal.command_install_hooks(args)
+
+        self.assertTrue(raced)
+        self.assertFalse((hooks_dir / "post-merge").exists())
+        self.assertIn(
+            project_journal.HOOK_BEGIN,
+            (moved_hooks / "post-merge").read_text(encoding="utf-8"),
+        )
+
     def test_install_hooks_refuses_symlinked_default_hooks_dir(self) -> None:
         repo = self.init_repo()
         hooks_dir = repo / ".git/hooks"
@@ -2886,6 +3073,78 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertIn("config --local core.hooksPath .githooks", result.stderr)
         self.assertFalse((repo / ".git/hooks/post-merge").exists())
 
+    def test_install_hooks_refuses_actual_system_hooks_path_until_local_override(
+        self,
+    ) -> None:
+        repo = self.init_repo()
+        system_config = self.root / "system-gitconfig"
+        system_hooks = self.root / "system-hooks"
+        system_config.write_text(
+            f"[core]\n    hooksPath = {system_hooks}\n",
+            encoding="utf-8",
+        )
+        system_env = {
+            "GIT_CONFIG_NOSYSTEM": "0",
+            "GIT_CONFIG_SYSTEM": str(system_config),
+            "GIT_CONFIG_GLOBAL": os.devnull,
+        }
+
+        refused = self.run_cli(
+            "install-hooks",
+            "--repo",
+            str(repo),
+            env=system_env,
+        )
+
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("system core.hooksPath is set", refused.stderr)
+        self.assertIn("config --local core.hooksPath .githooks", refused.stderr)
+        self.assertFalse((repo / ".git/hooks/post-merge").exists())
+        self.assertFalse((system_hooks / "post-merge").exists())
+
+        configured = run_git(
+            repo,
+            "config",
+            "--local",
+            "core.hooksPath",
+            ".githooks",
+        )
+        self.assertEqual(configured.returncode, 0, configured.stderr)
+        installed = self.run_cli(
+            "install-hooks",
+            "--repo",
+            str(repo),
+            env=system_env,
+        )
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        self.assertTrue((repo / ".githooks/post-merge").exists())
+
+    def test_install_hooks_refuses_unfollowed_system_include(self) -> None:
+        repo = self.init_repo()
+        system_config = self.root / "system-gitconfig"
+        unrelated = self.root / "must-not-be-read"
+        unrelated.write_text("[invalid\n", encoding="utf-8")
+        system_config.write_text(
+            f"[include]\n    path = {unrelated}\n",
+            encoding="utf-8",
+        )
+
+        result = self.run_cli(
+            "install-hooks",
+            "--repo",
+            str(repo),
+            env={
+                "GIT_CONFIG_NOSYSTEM": "0",
+                "GIT_CONFIG_SYSTEM": str(system_config),
+                "GIT_CONFIG_GLOBAL": os.devnull,
+            },
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("does not follow system includes", result.stderr)
+        self.assertIn("config --local core.hooksPath .githooks", result.stderr)
+        self.assertFalse((repo / ".git/hooks/post-merge").exists())
+
     def test_install_hooks_accepts_explicitly_disabled_global_config(self) -> None:
         repo = self.init_repo()
 
@@ -3053,6 +3312,67 @@ class ProjectJournalTests(unittest.TestCase):
         for row in rows.values():
             if row["tracked_journal_adopted"] is False:
                 self.assertEqual(row["adoption_status"], "unadopted")
+
+    def test_discover_repos_isolates_worktree_journal_count_limit(self) -> None:
+        healthy = self.init_repo("healthy")
+        healthy_journal = self.write_journal(
+            healthy,
+            "docs/project_journal/2026/05/2026-05-05-healthy-a1b2c3.md",
+            entry_id="20260505-a1b2c3",
+            title="Healthy",
+            status="active",
+            updated="2026-05-05",
+        )
+        add = run_git(
+            healthy,
+            "add",
+            "--",
+            str(healthy_journal.relative_to(healthy)),
+        )
+        self.assertEqual(add.returncode, 0, add.stderr)
+
+        oversized = self.init_repo("oversized")
+        journal_dir = oversized / "docs/project_journal/2026/05"
+        journal_dir.mkdir(parents=True)
+        for index in range(project_journal.MAX_JOURNAL_ENTRIES + 1):
+            (journal_dir / f"entry-{index:04d}.md").touch()
+
+        codex_home = self.root / "codex-home"
+        rollout_dir = codex_home / "sessions/2026/05/05"
+        rollout_dir.mkdir(parents=True)
+        (rollout_dir / "rollout-count-limit.jsonl").write_text(
+            json.dumps({"payload": {"cwd": str(healthy)}})
+            + "\n"
+            + json.dumps({"payload": {"cwd": str(oversized)}})
+            + "\n",
+            encoding="utf-8",
+        )
+
+        result = self.run_cli(
+            "discover-repos",
+            "--codex-home",
+            str(codex_home),
+            "--since-days",
+            "9999",
+            "--json",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = {
+            pathlib.Path(row["repo"]).name: row for row in json.loads(result.stdout)
+        }
+        self.assertEqual(set(rows), {"healthy", "oversized"})
+        self.assertEqual(rows["healthy"]["discovery_status"], "complete")
+        self.assertEqual(rows["healthy"]["journal_count"], 1)
+        self.assertEqual(rows["healthy"]["adoption_status"], "adopted")
+        self.assertEqual(rows["oversized"]["discovery_status"], "inconclusive")
+        self.assertEqual(
+            rows["oversized"]["discovery_error"]["code"],
+            "journal_semantic_limit_exceeded",
+        )
+        self.assertEqual(rows["oversized"]["adoption_status"], "inconclusive")
+        self.assertIsNone(rows["oversized"]["journal_count"])
+        self.assertIsNone(rows["oversized"]["hooks_installed"])
 
     def test_discover_repos_resolves_deleted_rollout_cwd_from_existing_parent(
         self,
