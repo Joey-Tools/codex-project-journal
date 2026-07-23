@@ -318,26 +318,47 @@ class _HookDirectoryBinding:
 @dataclasses.dataclass
 class _HookCommitState:
     phase: str = "staged-cleanup-safe"
+    pending_step: str | None = None
 
     @property
     def must_preserve_temporary(self) -> bool:
         return self.phase == "exchange-may-have-committed"
 
     @property
+    def absent_rename_may_have_committed(self) -> bool:
+        return self.phase == "absent-rename-may-have-committed"
+
+    @property
     def installed_target_committed(self) -> bool:
         return self.phase == "installed-target-committed"
 
+    def begin_absent_rename(self) -> None:
+        self.phase = "absent-rename-may-have-committed"
+        self.pending_step = "atomic no-replace rename"
+
     def begin_exchange(self) -> None:
         self.phase = "exchange-may-have-committed"
+        self.pending_step = "atomic exchange"
 
     def mark_cleanup_safe(self) -> None:
         self.phase = "staged-cleanup-safe"
+        self.pending_step = None
 
-    def mark_installed_target_committed(self) -> None:
+    def mark_installed_target_committed(self, pending_step: str) -> None:
         self.phase = "installed-target-committed"
+        self.pending_step = pending_step
 
     def mark_temporary_consumed(self) -> None:
-        self.phase = "temporary-consumed"
+        if self.installed_target_committed:
+            self.pending_step = "directory durability"
+
+    def mark_directory_durable(self) -> None:
+        if self.installed_target_committed:
+            self.pending_step = "final installed-target verification"
+
+    def mark_verified(self) -> None:
+        if self.installed_target_committed:
+            self.pending_step = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -3889,7 +3910,7 @@ def _interrupted_hook_exchange_recovery_note(
     durability_error: str | None = None
     try:
         os.fsync(binding.fd)
-    except OSError as exc:
+    except BaseException as exc:
         durability_error = str(exc)
 
     expected = dataclasses.replace(target, name=temporary_name)
@@ -3913,6 +3934,103 @@ def _interrupted_hook_exchange_recovery_note(
     return f"hook exchange may have committed; {verification}: {recovery_path}"
 
 
+def _hook_snapshot_match_status(
+    actual: _HookTargetSnapshot,
+    expected: _HookTargetSnapshot,
+    subject: str,
+) -> str:
+    if not actual.exists:
+        return f"{subject} is missing"
+    if actual == expected:
+        return f"{subject} remains object-identity/content/access-policy verified"
+
+    mismatches: list[str] = []
+    if actual.identity is None or expected.identity is None:
+        mismatches.append("object identity")
+    else:
+        if actual.identity[:3] != expected.identity[:3]:
+            mismatches.append("object identity/type")
+        if actual.identity[3:5] != expected.identity[3:5]:
+            mismatches.append("ownership/access policy")
+        if actual.identity[5] != expected.identity[5]:
+            mismatches.append("content size")
+    if actual.digest != expected.digest:
+        mismatches.append("content digest")
+    if not mismatches:
+        mismatches.append("snapshot metadata")
+    return f"{subject} mismatches the committed staged hook ({', '.join(mismatches)})"
+
+
+def _interrupted_absent_hook_commit_note(
+    binding: _HookDirectoryBinding,
+    target: _HookTargetSnapshot,
+    temporary_name: str,
+    staged: _HookTargetSnapshot,
+) -> str:
+    durability_error: str | None = None
+    try:
+        os.fsync(binding.fd)
+    except BaseException as exc:
+        durability_error = str(exc)
+
+    expected_installed = dataclasses.replace(staged, name=target.name)
+    installed_matches = False
+    try:
+        installed, _installed_content = _snapshot_hook_target(
+            binding,
+            target.name,
+        )
+    except BaseException as exc:
+        installed_status = (
+            f"installed-target revalidation failed or is unreadable: {exc}"
+        )
+    else:
+        installed_status = _hook_snapshot_match_status(
+            installed,
+            expected_installed,
+            "installed target",
+        )
+        installed_matches = installed == expected_installed
+
+    temporary_missing = False
+    try:
+        temporary, _temporary_content = _snapshot_hook_target(
+            binding,
+            temporary_name,
+        )
+    except BaseException as exc:
+        temporary_status = (
+            f"staged-temporary revalidation failed or is unreadable: {exc}"
+        )
+    else:
+        if not temporary.exists:
+            temporary_missing = True
+            temporary_status = (
+                "transaction temporary was consumed; no displaced-hook "
+                "recovery object exists"
+            )
+        elif temporary == staged:
+            temporary_status = (
+                f"staged temporary remains at cleanup locator: "
+                f"{binding.path / temporary_name}"
+            )
+        else:
+            temporary_status = (
+                "temporary entry mismatches the staged hook; no displaced-hook "
+                f"recovery object is claimed: {binding.path / temporary_name}"
+            )
+
+    commit_status = (
+        "absent-target no-replace rename committed"
+        if installed_matches and temporary_missing
+        else "absent-target no-replace rename may have committed"
+    )
+    detail = f"{commit_status}; {installed_status}; {temporary_status}"
+    if durability_error is not None:
+        detail += f"; directory durability is unverified: {durability_error}"
+    return detail
+
+
 def _interrupted_hook_post_commit_note(
     binding: _HookDirectoryBinding,
     target: _HookTargetSnapshot,
@@ -3923,7 +4041,7 @@ def _interrupted_hook_post_commit_note(
     durability_error: str | None = None
     try:
         os.fsync(binding.fd)
-    except OSError as exc:
+    except BaseException as exc:
         durability_error = str(exc)
 
     expected_installed = dataclasses.replace(staged, name=target.name)
@@ -3933,38 +4051,60 @@ def _interrupted_hook_post_commit_note(
             target.name,
         )
     except BaseException as exc:
-        installed_status = f"installed-target revalidation is unverified: {exc}"
-    else:
         installed_status = (
-            "installed target remains identity/content verified"
-            if installed == expected_installed
-            else "installed target no longer matches the committed staged hook"
+            f"installed-target revalidation failed or is unreadable: {exc}"
+        )
+    else:
+        installed_status = _hook_snapshot_match_status(
+            installed,
+            expected_installed,
+            "installed target",
         )
 
-    expected_displaced = dataclasses.replace(target, name=temporary_name)
     try:
-        displaced, _displaced_content = _snapshot_hook_target(
+        temporary, _temporary_content = _snapshot_hook_target(
             binding,
             temporary_name,
         )
     except BaseException as exc:
-        cleanup_status = f"displaced-hook cleanup is unverified: {exc}"
+        cleanup_status = f"temporary-entry revalidation failed or is unreadable: {exc}"
     else:
-        if not displaced.exists:
-            cleanup_status = "displaced-hook cleanup completed"
-        elif displaced == expected_displaced:
-            cleanup_status = (
-                f"displaced-hook cleanup was interrupted; retained cleanup "
-                f"locator: {cleanup_path}"
-            )
+        if target.exists:
+            expected_temporary = dataclasses.replace(target, name=temporary_name)
+            if not temporary.exists:
+                cleanup_status = (
+                    "displaced-hook cleanup completed; transaction temporary "
+                    "was consumed and no recovery object exists"
+                )
+            elif temporary == expected_temporary:
+                cleanup_status = (
+                    f"displaced-hook cleanup was interrupted; retained cleanup "
+                    f"locator: {cleanup_path}"
+                )
+            else:
+                cleanup_status = (
+                    f"temporary entry mismatches the verified displaced hook; "
+                    f"no recovery identity is claimed: {cleanup_path}"
+                )
         else:
-            cleanup_status = (
-                f"displaced-hook cleanup object does not match the verified "
-                f"displaced hook: {cleanup_path}"
-            )
+            if not temporary.exists:
+                cleanup_status = (
+                    "transaction temporary was consumed by the committed "
+                    "no-replace rename; no displaced-hook recovery object exists"
+                )
+            elif temporary == staged:
+                cleanup_status = (
+                    f"staged temporary unexpectedly remains at cleanup locator: "
+                    f"{cleanup_path}"
+                )
+            else:
+                cleanup_status = (
+                    "temporary entry mismatches the staged hook; no "
+                    f"displaced-hook recovery object is claimed: {cleanup_path}"
+                )
 
     detail = (
-        f"hook exchange reached the verified installed-target state; "
+        f"hook installation reached the installed-target-committed state; "
         f"{installed_status}; {cleanup_status}"
     )
     if durability_error is not None:
@@ -3980,6 +4120,7 @@ def _commit_hook_target_atomically(
     commit_state: _HookCommitState,
 ) -> None:
     if not target.exists:
+        commit_state.begin_absent_rename()
         try:
             _rename_hook_entry_with_flag(
                 binding.fd,
@@ -4000,6 +4141,7 @@ def _commit_hook_target_atomically(
                     f"{binding.path / target.name}"
                 ) from exc
             raise
+        commit_state.mark_installed_target_committed("directory durability")
         commit_state.mark_temporary_consumed()
         return
 
@@ -4048,7 +4190,7 @@ def _commit_hook_target_atomically(
                 temporary_name,
                 "the installed target does not match the staged hook before cleanup",
             )
-        commit_state.mark_installed_target_committed()
+        commit_state.mark_installed_target_committed("displaced-hook cleanup")
         os.unlink(temporary_name, dir_fd=binding.fd)
         commit_state.mark_temporary_consumed()
         return
@@ -4160,22 +4302,41 @@ def _install_hook(
         )
         temporary_created = False
         os.fsync(binding.fd)
+        commit_state.mark_directory_durable()
         _revalidate_hook_directory(binding)
         installed, installed_content = _snapshot_hook_target(binding, target.name)
-        if (
-            not installed.exists
-            or installed_content != content
-            or installed.identity is None
-            or installed.identity[4] != 0o755
-        ):
+        expected_installed = dataclasses.replace(staged, name=target.name)
+        if installed != expected_installed or installed_content != content:
+            status = _hook_snapshot_match_status(
+                installed,
+                expected_installed,
+                "installed target",
+            )
+            if installed == expected_installed and installed_content != content:
+                status = (
+                    "installed target mismatches the committed staged hook "
+                    "(exact content bytes)"
+                )
             raise UserError(
                 f"hook target failed post-write verification: "
-                f"{binding.path / target.name}"
+                f"{binding.path / target.name}: {status}"
             )
+        commit_state.mark_verified()
     except _HookExchangeRecoveryRequired:
         temporary_created = False
         raise
     except OSError as exc:
+        if commit_state.absent_rename_may_have_committed:
+            temporary_created = False
+            detail = _interrupted_absent_hook_commit_note(
+                binding,
+                target,
+                temporary_name,
+                staged,
+            )
+            raise UserError(
+                f"absent-target hook rename may have committed: {exc}; {detail}"
+            ) from exc
         if commit_state.must_preserve_temporary:
             temporary_created = False
             recovery = binding.path / temporary_name
@@ -4198,15 +4359,44 @@ def _install_hook(
                 temporary_name,
                 staged,
             )
+            pending_step = commit_state.pending_step or "post-commit verification"
             raise UserError(
-                f"hook cleanup failed after the installed target committed: "
+                f"hook target installation committed, but {pending_step} is "
+                f"incomplete: "
                 f"{exc}; {detail}"
             ) from exc
         raise UserError(
             f"failed to install hook {binding.path / target.name}: {exc}"
         ) from exc
+    except Exception as exc:
+        if commit_state.installed_target_committed:
+            temporary_created = False
+            detail = _interrupted_hook_post_commit_note(
+                binding,
+                target,
+                temporary_name,
+                staged,
+            )
+            pending_step = commit_state.pending_step or "post-commit verification"
+            raise UserError(
+                f"hook target installation committed, but {pending_step} is "
+                f"incomplete: "
+                f"{exc}; {detail}"
+            ) from exc
+        raise
     except BaseException as exc:
-        if commit_state.must_preserve_temporary:
+        if commit_state.absent_rename_may_have_committed:
+            temporary_created = False
+            detail = _interrupted_absent_hook_commit_note(
+                binding,
+                target,
+                temporary_name,
+                staged,
+            )
+            add_note = getattr(exc, "add_note", None)
+            if add_note is not None:
+                add_note(detail)
+        elif commit_state.must_preserve_temporary:
             temporary_created = False
             detail = _interrupted_hook_exchange_recovery_note(
                 binding,
@@ -4226,7 +4416,11 @@ def _install_hook(
             )
             add_note = getattr(exc, "add_note", None)
             if add_note is not None:
-                add_note(detail)
+                pending_step = commit_state.pending_step or "post-commit verification"
+                add_note(
+                    f"hook target installation committed, but {pending_step} "
+                    f"is incomplete after interruption; {detail}"
+                )
         raise
     finally:
         if temporary_created:
@@ -4461,26 +4655,17 @@ def _unique_preserving_order(values: list[str]) -> list[str]:
 
 def _has_hook_marker(repo: pathlib.Path) -> bool:
     for name in HOOK_NAMES:
-        try:
-            hook = _hook_path(repo, name)
-        except UserError:
-            return False
+        hook = _hook_path(repo, name)
         if not hook.exists():
             return False
-        try:
-            content = hook.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            return False
+        content = hook.read_text(encoding="utf-8", errors="replace")
         if HOOK_BEGIN not in content or HOOK_END not in content:
             return False
     return True
 
 
-def _is_excluded(repo: pathlib.Path, rel: str) -> bool | None:
-    try:
-        exclude = _git_path(repo, "info/exclude")
-    except UserError:
-        return None
+def _is_excluded(repo: pathlib.Path, rel: str) -> bool:
+    exclude = _git_path(repo, "info/exclude")
     if not exclude.exists():
         return False
     return rel in exclude.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -4532,26 +4717,31 @@ def _enrich_discovered_repo(
     journal_root = root / JOURNAL_ROOT
     index_rel = DEFAULT_INDEX.as_posix()
     adoption = _discover_adoption_status(root, deadline=deadline)
+    auxiliary_errors: dict[str, dict[str, str]] = {}
+
     try:
         journal_count = len(_journal_paths(root))
+    except (OSError, UserError) as exc:
+        journal_count = None
+        auxiliary_errors["journal_count"] = _discovery_error(exc)
+
+    try:
         index_ignored = _is_excluded(root, index_rel)
+    except (OSError, UserError) as exc:
+        index_ignored = None
+        auxiliary_errors["index_ignored"] = _discovery_error(exc)
+
+    try:
         hooks_installed = _has_hook_marker(root)
     except (OSError, UserError) as exc:
-        error = _discovery_error(exc)
-        journal_count = None
-        index_ignored = None
         hooks_installed = None
-        discovery_status = "inconclusive"
-        discovery_error: dict[str, str] | None = error
-    else:
-        discovery_status = (
-            "inconclusive"
-            if adoption["adoption_status"] == "inconclusive"
-            else "complete"
-        )
-        discovery_error = (
-            adoption["adoption_error"] if discovery_status == "inconclusive" else None
-        )
+        auxiliary_errors["hooks_installed"] = _discovery_error(exc)
+
+    discovery_status = (
+        "inconclusive"
+        if auxiliary_errors or adoption["adoption_status"] == "inconclusive"
+        else "complete"
+    )
     row.update(
         {
             "has_journal_dir": journal_root.is_dir(),
@@ -4560,7 +4750,7 @@ def _enrich_discovered_repo(
             "index_ignored": index_ignored,
             "hooks_installed": hooks_installed,
             "discovery_status": discovery_status,
-            "discovery_error": discovery_error,
+            "discovery_error": auxiliary_errors or None,
             "install_command": f"{shlex.quote(sys.executable)} {shlex.quote(str(script))} install-hooks --repo {shlex.quote(str(root))}",
             "generate_command": f"{shlex.quote(sys.executable)} {shlex.quote(str(script))} generate --repo {shlex.quote(str(root))} --output {index_rel} --ensure-exclude",
             **adoption,

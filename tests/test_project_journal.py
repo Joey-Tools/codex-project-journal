@@ -4575,10 +4575,314 @@ class ProjectJournalTests(unittest.TestCase):
         )
         notes = getattr(raised.exception, "__notes__", ())
         self.assertTrue(
-            any("verified installed-target state" in note for note in notes),
+            any("installed-target-committed state" in note for note in notes),
         )
         self.assertTrue(any("cleanup completed" in note for note in notes))
         self.assertFalse(any("recovery locator" in note for note in notes))
+
+    def test_install_hooks_reports_committed_absent_target_on_rename_interrupt(
+        self,
+    ) -> None:
+        repo = self.init_repo()
+        configured = run_git(
+            repo,
+            "config",
+            "--local",
+            "core.hooksPath",
+            ".githooks",
+        )
+        self.assertEqual(configured.returncode, 0, configured.stderr)
+        actual_rename = project_journal._rename_hook_entry_with_flag
+        interrupted = False
+
+        def rename_then_interrupt(
+            directory_fd: int,
+            source: str,
+            destination: str,
+            *,
+            exchange: bool,
+        ) -> None:
+            nonlocal interrupted
+            actual_rename(
+                directory_fd,
+                source,
+                destination,
+                exchange=exchange,
+            )
+            if destination == "post-merge" and not exchange and not interrupted:
+                interrupted = True
+                raise KeyboardInterrupt("injected after committed no-replace rename")
+
+        args = mock.Mock(repo=str(repo))
+        with mock.patch.object(
+            project_journal,
+            "_rename_hook_entry_with_flag",
+            side_effect=rename_then_interrupt,
+        ):
+            with self.assertRaises(KeyboardInterrupt) as raised:
+                project_journal.command_install_hooks(args)
+
+        self.assertTrue(interrupted)
+        hook = repo / ".githooks/post-merge"
+        self.assertIn(
+            project_journal.HOOK_BEGIN,
+            hook.read_text(encoding="utf-8"),
+        )
+        self.assertEqual(
+            list((repo / ".githooks").glob(".project-journal-post-merge-*.tmp")),
+            [],
+        )
+        notes = "\n".join(getattr(raised.exception, "__notes__", ()))
+        self.assertIn("no-replace rename committed", notes)
+        self.assertIn("object-identity/content/access-policy verified", notes)
+        self.assertIn("no displaced-hook recovery object exists", notes)
+        self.assertNotIn("recovery locator", notes)
+
+    def test_install_hooks_reports_post_commit_directory_fsync_failure(
+        self,
+    ) -> None:
+        for initially_exists in (False, True):
+            with self.subTest(initially_exists=initially_exists):
+                repo = self.init_repo(f"repo-fsync-{initially_exists}")
+                configured = run_git(
+                    repo,
+                    "config",
+                    "--local",
+                    "core.hooksPath",
+                    ".githooks",
+                )
+                self.assertEqual(configured.returncode, 0, configured.stderr)
+                if initially_exists:
+                    first = self.run_cli("install-hooks", "--repo", str(repo))
+                    self.assertEqual(first.returncode, 0, first.stderr)
+
+                actual_commit = project_journal._commit_hook_target_atomically
+                actual_fsync = project_journal.os.fsync
+                commit_returned = False
+
+                def commit_and_mark(
+                    binding: project_journal._HookDirectoryBinding,
+                    target: project_journal._HookTargetSnapshot,
+                    temporary_name: str,
+                    staged: project_journal._HookTargetSnapshot,
+                    commit_state: project_journal._HookCommitState,
+                ) -> None:
+                    nonlocal commit_returned
+                    actual_commit(
+                        binding,
+                        target,
+                        temporary_name,
+                        staged,
+                        commit_state,
+                    )
+                    if target.name == "post-merge":
+                        commit_returned = True
+
+                def fail_post_commit_directory_fsync(fd: int) -> None:
+                    if commit_returned and stat.S_ISDIR(os.fstat(fd).st_mode):
+                        raise OSError("injected post-commit directory fsync failure")
+                    actual_fsync(fd)
+
+                args = mock.Mock(repo=str(repo))
+                with mock.patch.object(
+                    project_journal,
+                    "_commit_hook_target_atomically",
+                    side_effect=commit_and_mark,
+                ):
+                    with mock.patch.object(
+                        project_journal.os,
+                        "fsync",
+                        side_effect=fail_post_commit_directory_fsync,
+                    ):
+                        with self.assertRaises(
+                            project_journal.UserError,
+                        ) as raised:
+                            project_journal.command_install_hooks(args)
+
+                message = str(raised.exception)
+                self.assertIn("hook target installation committed", message)
+                self.assertIn("directory durability is incomplete", message)
+                self.assertIn(
+                    "injected post-commit directory fsync failure",
+                    message,
+                )
+                self.assertIn(
+                    "object-identity/content/access-policy verified",
+                    message,
+                )
+                self.assertNotIn("failed to install hook", message)
+                self.assertNotIn("recovery locator", message)
+                self.assertIn(
+                    project_journal.HOOK_BEGIN,
+                    (repo / ".githooks/post-merge").read_text(encoding="utf-8"),
+                )
+
+    def test_install_hooks_reports_post_commit_verification_failure(
+        self,
+    ) -> None:
+        for initially_exists in (False, True):
+            with self.subTest(initially_exists=initially_exists):
+                repo = self.init_repo(f"repo-verify-{initially_exists}")
+                configured = run_git(
+                    repo,
+                    "config",
+                    "--local",
+                    "core.hooksPath",
+                    ".githooks",
+                )
+                self.assertEqual(configured.returncode, 0, configured.stderr)
+                if initially_exists:
+                    first = self.run_cli("install-hooks", "--repo", str(repo))
+                    self.assertEqual(first.returncode, 0, first.stderr)
+
+                actual_commit = project_journal._commit_hook_target_atomically
+                actual_snapshot = project_journal._snapshot_hook_target
+                commit_returned = False
+                injected = False
+
+                def commit_and_mark(
+                    binding: project_journal._HookDirectoryBinding,
+                    target: project_journal._HookTargetSnapshot,
+                    temporary_name: str,
+                    staged: project_journal._HookTargetSnapshot,
+                    commit_state: project_journal._HookCommitState,
+                ) -> None:
+                    nonlocal commit_returned
+                    actual_commit(
+                        binding,
+                        target,
+                        temporary_name,
+                        staged,
+                        commit_state,
+                    )
+                    if target.name == "post-merge":
+                        commit_returned = True
+
+                def fail_final_snapshot(
+                    binding: project_journal._HookDirectoryBinding,
+                    name: str,
+                ) -> tuple[project_journal._HookTargetSnapshot, bytes | None]:
+                    nonlocal injected
+                    if commit_returned and name == "post-merge" and not injected:
+                        injected = True
+                        raise project_journal.UserError(
+                            "injected final installed-target verification failure"
+                        )
+                    return actual_snapshot(binding, name)
+
+                args = mock.Mock(repo=str(repo))
+                with mock.patch.object(
+                    project_journal,
+                    "_commit_hook_target_atomically",
+                    side_effect=commit_and_mark,
+                ):
+                    with mock.patch.object(
+                        project_journal,
+                        "_snapshot_hook_target",
+                        side_effect=fail_final_snapshot,
+                    ):
+                        with self.assertRaises(
+                            project_journal.UserError,
+                        ) as raised:
+                            project_journal.command_install_hooks(args)
+
+                self.assertTrue(injected)
+                message = str(raised.exception)
+                self.assertIn("hook target installation committed", message)
+                self.assertIn(
+                    "final installed-target verification is incomplete",
+                    message,
+                )
+                self.assertIn(
+                    "injected final installed-target verification failure",
+                    message,
+                )
+                self.assertIn(
+                    "object-identity/content/access-policy verified",
+                    message,
+                )
+                self.assertNotIn("recovery locator", message)
+
+    def test_install_hooks_reports_post_commit_verification_interrupt(
+        self,
+    ) -> None:
+        for initially_exists in (False, True):
+            with self.subTest(initially_exists=initially_exists):
+                repo = self.init_repo(f"repo-interrupt-{initially_exists}")
+                configured = run_git(
+                    repo,
+                    "config",
+                    "--local",
+                    "core.hooksPath",
+                    ".githooks",
+                )
+                self.assertEqual(configured.returncode, 0, configured.stderr)
+                if initially_exists:
+                    first = self.run_cli("install-hooks", "--repo", str(repo))
+                    self.assertEqual(first.returncode, 0, first.stderr)
+
+                actual_commit = project_journal._commit_hook_target_atomically
+                actual_snapshot = project_journal._snapshot_hook_target
+                commit_returned = False
+                interrupted = False
+
+                def commit_and_mark(
+                    binding: project_journal._HookDirectoryBinding,
+                    target: project_journal._HookTargetSnapshot,
+                    temporary_name: str,
+                    staged: project_journal._HookTargetSnapshot,
+                    commit_state: project_journal._HookCommitState,
+                ) -> None:
+                    nonlocal commit_returned
+                    actual_commit(
+                        binding,
+                        target,
+                        temporary_name,
+                        staged,
+                        commit_state,
+                    )
+                    if target.name == "post-merge":
+                        commit_returned = True
+
+                def interrupt_final_snapshot(
+                    binding: project_journal._HookDirectoryBinding,
+                    name: str,
+                ) -> tuple[project_journal._HookTargetSnapshot, bytes | None]:
+                    nonlocal interrupted
+                    if commit_returned and name == "post-merge" and not interrupted:
+                        interrupted = True
+                        raise KeyboardInterrupt(
+                            "injected final installed-target verification interrupt"
+                        )
+                    return actual_snapshot(binding, name)
+
+                args = mock.Mock(repo=str(repo))
+                with mock.patch.object(
+                    project_journal,
+                    "_commit_hook_target_atomically",
+                    side_effect=commit_and_mark,
+                ):
+                    with mock.patch.object(
+                        project_journal,
+                        "_snapshot_hook_target",
+                        side_effect=interrupt_final_snapshot,
+                    ):
+                        with self.assertRaises(KeyboardInterrupt) as raised:
+                            project_journal.command_install_hooks(args)
+
+                self.assertTrue(interrupted)
+                notes = "\n".join(getattr(raised.exception, "__notes__", ()))
+                self.assertIn("hook target installation committed", notes)
+                self.assertIn(
+                    "final installed-target verification is incomplete "
+                    "after interruption",
+                    notes,
+                )
+                self.assertIn(
+                    "object-identity/content/access-policy verified",
+                    notes,
+                )
+                self.assertNotIn("recovery locator", notes)
 
     def test_hook_target_fifo_is_rejected_without_blocking(self) -> None:
         repo = self.init_repo()
@@ -5409,6 +5713,115 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertEqual(rows[0]["rollout_count"], 1)
         self.assertFalse(rows[0]["hooks_installed"])
 
+    def test_discover_repos_reports_unresolved_hook_config_as_auxiliary_error(
+        self,
+    ) -> None:
+        repo = self.init_repo()
+        journal = self.write_journal(
+            repo,
+            "docs/project_journal/2026/05/2026-05-05-alpha-a1b2c3.md",
+            entry_id="20260505-a1b2c3",
+            title="Alpha Work",
+            status="active",
+            updated="2026-05-05",
+        )
+        added = run_git(
+            repo,
+            "add",
+            "--",
+            str(journal.relative_to(repo)),
+        )
+        self.assertEqual(added.returncode, 0, added.stderr)
+
+        codex_home = self.root / "codex-home"
+        rollout_dir = codex_home / "sessions/2026/05/05"
+        rollout_dir.mkdir(parents=True)
+        (rollout_dir / "rollout-unresolved-hook-config.jsonl").write_text(
+            json.dumps({"payload": {"cwd": str(repo)}}) + "\n",
+            encoding="utf-8",
+        )
+        env = os.environ.copy()
+        env["HOME"] = str(self.home)
+        for name in (
+            "GIT_CONFIG_GLOBAL",
+            "GIT_CONFIG_NOSYSTEM",
+            "GIT_CONFIG_SYSTEM",
+            "XDG_CONFIG_HOME",
+        ):
+            env.pop(name, None)
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPT),
+                "discover-repos",
+                "--codex-home",
+                str(codex_home),
+                "--since-days",
+                "9999",
+                "--json",
+            ],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = json.loads(result.stdout)
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row["adoption_status"], "adopted")
+        self.assertIsNone(row["adoption_error"])
+        self.assertTrue(row["tracked_journal_adopted"])
+        self.assertEqual(row["valid_tracked_journal_count"], 1)
+        self.assertEqual(row["journal_count"], 1)
+        self.assertFalse(row["index_ignored"])
+        self.assertIsNone(row["hooks_installed"])
+        self.assertEqual(row["discovery_status"], "inconclusive")
+        self.assertEqual(set(row["discovery_error"]), {"hooks_installed"})
+        hook_error = row["discovery_error"]["hooks_installed"]
+        self.assertEqual(hook_error["code"], "repo_discovery_failed")
+        self.assertIn(
+            "implicit system Git config path cannot be proved safely",
+            hook_error["message"],
+        )
+
+    def test_enrich_discovered_repo_isolates_exclude_failure(self) -> None:
+        repo = self.init_repo().resolve()
+        configured = run_git(
+            repo,
+            "config",
+            "--local",
+            "core.hooksPath",
+            ".githooks",
+        )
+        self.assertEqual(configured.returncode, 0, configured.stderr)
+        row: dict[str, object] = {"repo": str(repo)}
+
+        with mock.patch.object(
+            project_journal,
+            "_is_excluded",
+            side_effect=project_journal.UserError("injected exclude lookup failure"),
+        ):
+            project_journal._enrich_discovered_repo(repo, row, SCRIPT)
+
+        self.assertEqual(row["adoption_status"], "unadopted")
+        self.assertIsNone(row["adoption_error"])
+        self.assertEqual(row["journal_count"], 0)
+        self.assertIsNone(row["index_ignored"])
+        self.assertFalse(row["hooks_installed"])
+        self.assertEqual(row["discovery_status"], "inconclusive")
+        discovery_error = row["discovery_error"]
+        self.assertIsInstance(discovery_error, dict)
+        assert isinstance(discovery_error, dict)
+        self.assertEqual(set(discovery_error), {"index_ignored"})
+        self.assertIn(
+            "injected exclude lookup failure",
+            discovery_error["index_ignored"]["message"],
+        )
+
     def test_discover_repos_keeps_healthy_rows_when_adoption_is_inconclusive(
         self,
     ) -> None:
@@ -5667,7 +6080,7 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertEqual(rows["healthy"]["adoption_status"], "adopted")
         self.assertEqual(rows["oversized"]["discovery_status"], "inconclusive")
         self.assertEqual(
-            rows["oversized"]["discovery_error"]["code"],
+            rows["oversized"]["discovery_error"]["journal_count"]["code"],
             "journal_semantic_limit_exceeded",
         )
         self.assertEqual(rows["oversized"]["adoption_status"], "adopted")
@@ -5675,7 +6088,8 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertTrue(rows["oversized"]["tracked_journal_adopted"])
         self.assertEqual(rows["oversized"]["valid_tracked_journal_count"], 1)
         self.assertIsNone(rows["oversized"]["journal_count"])
-        self.assertIsNone(rows["oversized"]["hooks_installed"])
+        self.assertFalse(rows["oversized"]["index_ignored"])
+        self.assertFalse(rows["oversized"]["hooks_installed"])
 
     def test_discover_repos_resolves_deleted_rollout_cwd_from_existing_parent(
         self,
