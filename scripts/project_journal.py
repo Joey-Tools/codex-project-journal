@@ -201,6 +201,36 @@ def _journal_paths(repo: pathlib.Path) -> list[pathlib.Path]:
     return sorted(paths)
 
 
+def _tracked_journal_paths(repo: pathlib.Path) -> list[pathlib.Path]:
+    result = _run_git(
+        repo,
+        "ls-files",
+        "-z",
+        "--",
+        JOURNAL_ROOT.as_posix(),
+    )
+    if result.returncode != 0:
+        detail = (
+            result.stderr.strip()
+            or result.stdout.strip()
+            or "tracked journal lookup failed"
+        )
+        raise UserError(f"failed to list tracked journal entries: {detail}")
+
+    paths: list[pathlib.Path] = []
+    for rel_path in result.stdout.split("\0"):
+        if not rel_path:
+            continue
+        pure_path = pathlib.PurePosixPath(rel_path)
+        if pure_path == DEFAULT_INDEX or pure_path.suffix != ".md":
+            continue
+        path = repo.joinpath(*pure_path.parts)
+        if path.is_symlink() or not path.is_file() or _is_generated_index(path):
+            continue
+        paths.append(path)
+    return sorted(paths)
+
+
 def _is_generated_index(path: pathlib.Path) -> bool:
     try:
         lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -213,10 +243,12 @@ def _is_generated_index(path: pathlib.Path) -> bool:
     )
 
 
-def _load_entries(repo: pathlib.Path) -> tuple[list[JournalEntry], list[str]]:
+def _load_entries_from_paths(
+    repo: pathlib.Path, paths: list[pathlib.Path]
+) -> tuple[list[JournalEntry], list[str]]:
     entries: list[JournalEntry] = []
     issues: list[str] = []
-    for path in _journal_paths(repo):
+    for path in paths:
         rel_path = path.relative_to(repo).as_posix()
         try:
             fields = _parse_frontmatter(path)
@@ -226,6 +258,26 @@ def _load_entries(repo: pathlib.Path) -> tuple[list[JournalEntry], list[str]]:
         entries.append(JournalEntry(path=path, rel_path=rel_path, fields=fields))
     issues.extend(_validate_entries(entries))
     return entries, issues
+
+
+def _load_entries(repo: pathlib.Path) -> tuple[list[JournalEntry], list[str]]:
+    return _load_entries_from_paths(repo, _journal_paths(repo))
+
+
+def _tracked_journal_adoption(repo: pathlib.Path) -> dict[str, Any]:
+    paths = _tracked_journal_paths(repo)
+    entries, issues = _load_entries_from_paths(repo, paths)
+    invalid_paths = {
+        entry.rel_path
+        for entry in entries
+        if any(issue.startswith(f"{entry.rel_path}:") for issue in issues)
+    }
+    valid_count = sum(entry.rel_path not in invalid_paths for entry in entries)
+    return {
+        "tracked_journal_adopted": valid_count > 0,
+        "tracked_non_generated_journal_count": len(paths),
+        "valid_tracked_journal_count": valid_count,
+    }
 
 
 def _validate_date(value: str) -> bool:
@@ -389,6 +441,13 @@ def command_validate(args: argparse.Namespace) -> int:
             print(issue, file=sys.stderr)
         return 1
     print("Project journal validation passed.")
+    return 0
+
+
+def command_adoption_status(args: argparse.Namespace) -> int:
+    repo = _resolve_repo(args.repo)
+    status = {"repo": str(repo), **_tracked_journal_adoption(repo)}
+    print(json.dumps(status, ensure_ascii=False, indent=2, sort_keys=True))
     return 0
 
 
@@ -765,6 +824,7 @@ def _discover_repos(codex_home: pathlib.Path, since_days: int) -> list[dict[str,
     for root, row in sorted(seen.items(), key=lambda item: item[0].as_posix()):
         journal_root = root / JOURNAL_ROOT
         index_rel = DEFAULT_INDEX.as_posix()
+        adoption = _tracked_journal_adoption(root)
         row.update(
             {
                 "has_journal_dir": journal_root.is_dir(),
@@ -774,6 +834,7 @@ def _discover_repos(codex_home: pathlib.Path, since_days: int) -> list[dict[str,
                 "hooks_installed": _has_hook_marker(root),
                 "install_command": f"{shlex.quote(sys.executable)} {shlex.quote(str(script))} install-hooks --repo {shlex.quote(str(root))}",
                 "generate_command": f"{shlex.quote(sys.executable)} {shlex.quote(str(script))} generate --repo {shlex.quote(str(root))} --output {index_rel} --ensure-exclude",
+                **adoption,
             }
         )
         results.append(row)
@@ -811,6 +872,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     validate.add_argument("--repo", required=True)
     validate.set_defaults(func=command_validate)
+
+    adoption = subparsers.add_parser(
+        "adoption-status",
+        help="Report valid tracked journal evidence for adoption checks.",
+    )
+    adoption.add_argument("--repo", required=True)
+    adoption.set_defaults(func=command_adoption_status)
 
     hooks = subparsers.add_parser(
         "install-hooks", help="Install local Git hooks for index refresh."

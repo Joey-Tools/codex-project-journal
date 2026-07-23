@@ -1,6 +1,7 @@
 # Project Journal Templates
 
-Use these templates only after the repo has adopted project journals, repo policy requires them, or an explicit product need justifies first adoption.
+Use these templates only after repo policy requires project journals, at least one valid tracked non-generated journal entry establishes adoption, or an explicit product need justifies first adoption.
+An empty journal directory, untracked entry, or generated `INDEX.md` does not establish adoption.
 Choose templates independently: do not create `PROJECT_STATE`, `PROJECT_TODO`, and a workstream journal as a bundle when a smaller layer satisfies the need.
 
 ## Minimal `docs/PROJECT_STATE.md`
@@ -83,8 +84,8 @@ superseded_by:
 
 ## Writing Rules
 
-- In an adopted or explicitly required workflow, `PROJECT_STATE` is the short repo memory for repo-wide state and recovery.
-- In an adopted or explicitly required workflow, `PROJECT_TODO` is the cross-workstream actionable backlog for repo-root visibility.
+- When repo policy requires the workflow or a valid tracked non-generated entry establishes adoption, `PROJECT_STATE` is the short repo memory for repo-wide state and recovery.
+- When repo policy requires the workflow or a valid tracked non-generated entry establishes adoption, `PROJECT_TODO` is the cross-workstream actionable backlog for repo-root visibility.
 - `docs/project_journal/YYYY/MM/*.md` is the durable per-workstream source of truth and the default place for ordinary PR/thread state once the workflow applies.
 - An unadopted repo needs an explicit product need before any of these trackers is introduced; general preference for journaling is not enough.
 - Create or update only the smallest applicable layer. Do not create both top-level trackers merely because one or a workstream journal is needed.

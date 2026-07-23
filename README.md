@@ -1,7 +1,8 @@
 # Codex Project Journal
 
-Public Codex skill and helper scripts for lightweight per-workstream project journals in repositories that have adopted the workflow or have an explicit durable-state need.
+Public Codex skill and helper scripts for lightweight per-workstream project journals in repositories whose policy requires the workflow, that contain a valid tracked non-generated journal entry, or that have an explicit durable-state need.
 The skill does not bootstrap trackers, generated indexes, or local hooks across repositories by default.
+An empty `docs/project_journal/` directory or generated `INDEX.md` does not establish adoption.
 
 ## Test
 

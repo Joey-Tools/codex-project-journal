@@ -1,6 +1,6 @@
 ---
 name: project-journal
-description: Maintain repository project journals and their optional local tooling. Use only when the repo already uses `docs/project_journal/`, repo policy requires this workflow, or a task spans Codex sessions, a PR, or a durable workstream. Require an explicit product need before introducing the first tracker into an unadopted repo. Update the smallest applicable journal layer, preserve squash-merge target-branch semantics, and generate indexes or install hooks only when their workflows need them.
+description: Maintain repository project journals and their optional local tooling. Use only when repo policy requires this workflow, the repo has at least one valid tracked non-generated entry under `docs/project_journal/`, or a task spans Codex sessions, a PR, or a durable workstream. Require an explicit product need before introducing the first tracker into an unadopted repo. Update the smallest applicable journal layer, preserve squash-merge target-branch semantics, and generate indexes or install hooks only when their workflows need them.
 ---
 
 # Project Journal
@@ -9,6 +9,7 @@ description: Maintain repository project journals and their optional local tooli
 
 Keep repo memory lightweight, durable, and low-conflict.
 Treat project journals as an adopted or explicitly justified repo workflow, not as a default bootstrap for every repository.
+Treat the workflow as adopted only when repo policy requires it or at least one valid tracked non-generated journal entry exists.
 Within that workflow, use per-workstream journal files under `docs/project_journal/YYYY/MM/` as the dynamic source of truth for a task, thread, PR, blocker, or handoff.
 Use an existing or explicitly needed `PROJECT_STATE` only for stable repo-wide pulse, recovery pointers, and global blockers; use an existing or explicitly needed `PROJECT_TODO` only for cross-workstream actionable backlog.
 Treat the generated `docs/project_journal/INDEX.md` as a local ignored convenience artifact, not as source of truth.
@@ -17,14 +18,15 @@ Treat the generated `docs/project_journal/INDEX.md` as a local ignored convenien
 
 1. Decide whether the workflow applies and whether first adoption is justified.
 - Read the repo `AGENTS.md`, existing docs, and the user request.
-- Auto-trigger this skill only when the repo already uses `docs/project_journal/`, repo policy requires project journaling, or the task spans Codex sessions, a PR, or a durable workstream.
+- Auto-trigger this skill only when repo policy requires project journaling, the bundled helper reports a valid tracked non-generated journal entry, or the task spans Codex sessions, a PR, or a durable workstream.
+- Run the bundled helper's `adoption-status --repo <path>` command to inspect tracked journal evidence. Directory presence, untracked files, and an empty or generated-`INDEX.md`-only directory do not establish adoption.
 - If a spanning task is the only trigger and the repo has neither an adopted journal nor a policy requirement, treat the trigger as a reason to assess durable state, not as permission to create files.
 - Before introducing the first tracker into an unadopted repo, identify an explicit product need in the user request or established project workflow for repo-owned coordination, recovery, or backlog state. General preference for journaling is not enough.
 - If that need is absent, use the current task, PR, issue, or handoff channel and leave `docs/PROJECT_STATE.md`, `docs/PROJECT_TODO.md`, and `docs/project_journal/` unchanged.
 - If the repo has a stronger equivalent tracker or the user chooses another mechanism, follow it instead.
 
 2. Recover context before planning.
-- If the repo already uses `docs/project_journal/`, read only the relevant workstream entries before planning.
+- If the workflow is adopted, read only the relevant workstream entries before planning.
 - Read `PROJECT_STATE` and `PROJECT_TODO` when they exist and are relevant; do not create a missing counterpart merely because one exists.
 - Reuse existing section names, task labels, and terminology.
 - Keep top-level trackers short and stable; do not append ordinary PR/thread changelog noise to `PROJECT_STATE` or `PROJECT_TODO`.
@@ -38,6 +40,7 @@ Treat the generated `docs/project_journal/INDEX.md` as a local ignored convenien
 When invoking the helper from a target repo, resolve the script relative to the loaded skill directory and call it with `python3`, for example:
 
 ```bash
+python3 "<loaded-skill-dir>/scripts/project_journal.py" adoption-status --repo <path>
 python3 "<loaded-skill-dir>/scripts/project_journal.py" validate --repo <path>
 ```
 
@@ -109,6 +112,7 @@ Do not report the journal validator as unavailable merely because `<target-repo>
 ## Guardrails
 
 - Do not assume every Joey repository should adopt project journals.
+- Do not treat an empty `docs/project_journal/`, untracked entries, or a generated `INDEX.md` as adoption evidence.
 - Do not bootstrap `PROJECT_STATE`, `PROJECT_TODO`, or `docs/project_journal/` without the first-adoption product-need gate.
 - Do not create a missing top-level companion file solely for symmetry.
 - Keep any top-level tracker concise and stable, not exhaustive.

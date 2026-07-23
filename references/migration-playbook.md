@@ -7,6 +7,8 @@ performing a second broad file migration.
 Treat this as an explicit adoption or maintenance workflow. Do not start a
 migration merely because a repository belongs to Joey or lacks the current
 journal layout.
+An empty `docs/project_journal/` directory or generated `INDEX.md` is not
+adoption evidence; require repo policy or a valid tracked non-generated entry.
 
 ## Candidate Filtering
 

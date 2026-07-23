@@ -14,6 +14,7 @@ import unittest
 
 SCRIPT = pathlib.Path(__file__).resolve().parents[1] / "scripts" / "project_journal.py"
 SKILL_MD = pathlib.Path(__file__).resolve().parents[1] / "SKILL.md"
+README_MD = pathlib.Path(__file__).resolve().parents[1] / "README.md"
 OPENAI_YAML = pathlib.Path(__file__).resolve().parents[1] / "agents" / "openai.yaml"
 TEMPLATES_MD = (
     pathlib.Path(__file__).resolve().parents[1] / "references" / "templates.md"
@@ -79,6 +80,11 @@ class ProjectJournalTests(unittest.TestCase):
             stderr=subprocess.PIPE,
             env=base_env,
         )
+
+    def adoption_status(self, repo: pathlib.Path) -> dict[str, object]:
+        result = self.run_cli("adoption-status", "--repo", str(repo))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
 
     def write_journal(
         self,
@@ -204,6 +210,83 @@ class ProjectJournalTests(unittest.TestCase):
         validate = self.run_cli("validate", "--repo", str(repo))
         self.assertEqual(validate.returncode, 0, validate.stderr)
 
+    def test_adoption_status_rejects_empty_journal_directory(self) -> None:
+        repo = self.init_repo()
+        (repo / "docs/project_journal").mkdir(parents=True)
+
+        status = self.adoption_status(repo)
+
+        self.assertFalse(status["tracked_journal_adopted"])
+        self.assertEqual(status["tracked_non_generated_journal_count"], 0)
+        self.assertEqual(status["valid_tracked_journal_count"], 0)
+
+    def test_adoption_status_rejects_generated_index_only_directory(self) -> None:
+        repo = self.init_repo()
+        generate = self.run_cli(
+            "generate",
+            "--repo",
+            str(repo),
+            "--output",
+            "docs/project_journal/INDEX.md",
+            "--ensure-exclude",
+        )
+        self.assertEqual(generate.returncode, 0, generate.stderr)
+        force_add = run_git(
+            repo,
+            "add",
+            "-f",
+            "--",
+            "docs/project_journal/INDEX.md",
+        )
+        self.assertEqual(force_add.returncode, 0, force_add.stderr)
+
+        status = self.adoption_status(repo)
+
+        self.assertFalse(status["tracked_journal_adopted"])
+        self.assertEqual(status["tracked_non_generated_journal_count"], 0)
+        self.assertEqual(status["valid_tracked_journal_count"], 0)
+
+    def test_adoption_status_requires_valid_tracked_journal_entry(self) -> None:
+        repo = self.init_repo()
+        journal = self.write_journal(
+            repo,
+            "docs/project_journal/2026/05/2026-05-05-alpha-a1b2c3.md",
+            entry_id="20260505-a1b2c3",
+            title="Alpha Work",
+            status="active",
+            updated="2026-05-05",
+        )
+
+        untracked = self.adoption_status(repo)
+        self.assertFalse(untracked["tracked_journal_adopted"])
+
+        add = run_git(repo, "add", "--", str(journal.relative_to(repo)))
+        self.assertEqual(add.returncode, 0, add.stderr)
+        tracked = self.adoption_status(repo)
+
+        self.assertTrue(tracked["tracked_journal_adopted"])
+        self.assertEqual(tracked["tracked_non_generated_journal_count"], 1)
+        self.assertEqual(tracked["valid_tracked_journal_count"], 1)
+
+    def test_adoption_status_rejects_invalid_tracked_journal_entry(self) -> None:
+        repo = self.init_repo()
+        journal = self.write_journal(
+            repo,
+            "docs/project_journal/2026/05/2026-05-05-invalid-a1b2c3.md",
+            entry_id="20260505-a1b2c3",
+            title="Invalid Work",
+            status="paused",
+            updated="2026-05-05",
+        )
+        add = run_git(repo, "add", "--", str(journal.relative_to(repo)))
+        self.assertEqual(add.returncode, 0, add.stderr)
+
+        status = self.adoption_status(repo)
+
+        self.assertFalse(status["tracked_journal_adopted"])
+        self.assertEqual(status["tracked_non_generated_journal_count"], 1)
+        self.assertEqual(status["valid_tracked_journal_count"], 0)
+
     def test_validate_rejects_invalid_status_and_broken_superseded_link(self) -> None:
         repo = self.init_repo()
         self.write_journal(
@@ -274,8 +357,11 @@ class ProjectJournalTests(unittest.TestCase):
         skill = SKILL_MD.read_text(encoding="utf-8")
         frontmatter = skill.split("---", 2)[1]
 
-        self.assertIn("Use only when the repo already uses", frontmatter)
-        self.assertIn("repo policy requires this workflow", frontmatter)
+        self.assertIn("Use only when repo policy requires this workflow", frontmatter)
+        self.assertIn(
+            "at least one valid tracked non-generated entry",
+            frontmatter,
+        )
         self.assertIn(
             "a task spans Codex sessions, a PR, or a durable workstream",
             frontmatter,
@@ -286,6 +372,11 @@ class ProjectJournalTests(unittest.TestCase):
         )
         self.assertIn(
             "treat the trigger as a reason to assess durable state, not as permission to create files",
+            skill,
+        )
+        self.assertIn("adoption-status --repo <path>", skill)
+        self.assertIn(
+            "Directory presence, untracked files, and an empty or generated-`INDEX.md`-only directory do not establish adoption",
             skill,
         )
         self.assertIn(
@@ -334,20 +425,34 @@ class ProjectJournalTests(unittest.TestCase):
         )
 
     def test_skill_metadata_and_references_preserve_adoption_gate(self) -> None:
+        readme = README_MD.read_text(encoding="utf-8")
         openai_yaml = OPENAI_YAML.read_text(encoding="utf-8")
         templates = TEMPLATES_MD.read_text(encoding="utf-8")
         migration = MIGRATION_PLAYBOOK_MD.read_text(encoding="utf-8")
 
         self.assertIn("$project-journal", openai_yaml)
         self.assertIn("smallest applicable journal layer", openai_yaml)
+        self.assertIn("repo policy requires journaling", openai_yaml)
         self.assertIn(
-            "repo has adopted or requires the workflow",
+            "valid tracked non-generated journal entry proves adoption",
             openai_yaml,
         )
         self.assertIn("task has an explicit durable-state need", openai_yaml)
         self.assertNotIn("ignored local journal index", openai_yaml)
         self.assertIn(
+            "valid tracked non-generated journal entry",
+            readme,
+        )
+        self.assertIn(
+            "generated `INDEX.md` does not establish adoption",
+            readme,
+        )
+        self.assertIn(
             "explicit product need justifies first adoption",
+            templates,
+        )
+        self.assertIn(
+            "valid tracked non-generated journal entry establishes adoption",
             templates,
         )
         self.assertIn(
@@ -360,6 +465,10 @@ class ProjectJournalTests(unittest.TestCase):
         )
         self.assertIn(
             "migration merely because a repository belongs to Joey",
+            migration,
+        )
+        self.assertIn(
+            "generated `INDEX.md` is not",
             migration,
         )
 
@@ -704,6 +813,8 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertEqual(pathlib.Path(rows[0]["repo"]), repo.resolve())
         self.assertTrue(rows[0]["has_journal_dir"])
         self.assertEqual(rows[0]["journal_count"], 1)
+        self.assertFalse(rows[0]["tracked_journal_adopted"])
+        self.assertEqual(rows[0]["valid_tracked_journal_count"], 0)
         self.assertEqual(rows[0]["rollout_count"], 1)
         self.assertFalse(rows[0]["hooks_installed"])
 
