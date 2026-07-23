@@ -7,6 +7,7 @@ import pathlib
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -63,7 +64,10 @@ class ProjectJournalTests(unittest.TestCase):
         return repo
 
     def run_cli(
-        self, *args: str, env: dict[str, str] | None = None
+        self,
+        *args: str,
+        env: dict[str, str] | None = None,
+        timeout_seconds: float | None = None,
     ) -> subprocess.CompletedProcess[str]:
         base_env = {
             "PATH": os.environ.get("PATH", ""),
@@ -79,6 +83,7 @@ class ProjectJournalTests(unittest.TestCase):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             env=base_env,
+            timeout=timeout_seconds,
         )
 
     def adoption_status(self, repo: pathlib.Path) -> dict[str, object]:
@@ -106,6 +111,49 @@ class ProjectJournalTests(unittest.TestCase):
             stdout_overflow_error="test stdout exceeds limit",
             stderr_overflow_error="test stderr exceeds limit",
             timeout_error="test process timed out",
+        )
+
+    def make_fake_git_runtime(
+        self,
+        name: str,
+    ) -> project_journal._GitRuntime:
+        source = self.root / f"{name}-source"
+        source.write_text(
+            textwrap.dedent(
+                """\
+                #!/bin/sh
+                if [ "$1" = "probe" ]; then
+                  printf 'safe-launch\\n'
+                  exit 0
+                fi
+                printf 'unexpected invocation\\n' >&2
+                exit 91
+                """
+            ),
+            encoding="utf-8",
+        )
+        source.chmod(0o755)
+        (
+            snapshot,
+            digest,
+            snapshot_identity,
+            directory_identity,
+            snapshot_owner,
+        ) = project_journal._snapshot_git_executable(
+            source,
+            expected_source_identity=project_journal._git_source_identity(
+                source.stat()
+            ),
+            deadline=time.monotonic() + 5,
+        )
+        return project_journal._GitRuntime(
+            executable=snapshot,
+            source_executable=source,
+            version=(2, 45, 1),
+            digest=digest,
+            file_identity=snapshot_identity,
+            directory_identity=directory_identity,
+            snapshot_owner=snapshot_owner,
         )
 
     def write_journal(
@@ -501,6 +549,774 @@ class ProjectJournalTests(unittest.TestCase):
                         str(project_journal._GIT_RUNTIME_ERROR),
                     )
                     capture.assert_not_called()
+        finally:
+            runtime = project_journal._GIT_RUNTIME
+            if runtime is not None and runtime is not old_runtime:
+                runtime.snapshot_owner.cleanup()
+            project_journal._GIT_RUNTIME = old_runtime
+            project_journal._GIT_RUNTIME_ERROR = old_error
+
+    def test_git_launch_executes_verified_copy_after_runtime_path_replacement(
+        self,
+    ) -> None:
+        runtime = self.make_fake_git_runtime("launch-replacement")
+        actual_popen = subprocess.Popen
+        attacker = self.root / "attacker-git"
+        attacker.write_text(
+            "#!/bin/sh\nprintf 'attacker-executed\\n'\n",
+            encoding="utf-8",
+        )
+        attacker.chmod(0o755)
+        observed_launch: pathlib.Path | None = None
+
+        def replace_runtime_before_popen(
+            argv: list[str],
+            *args: object,
+            **kwargs: object,
+        ) -> subprocess.Popen[bytes]:
+            nonlocal observed_launch
+            self.assertEqual(pathlib.Path(argv[0]), runtime.executable)
+            observed_launch = pathlib.Path(str(kwargs["executable"]))
+            self.assertNotEqual(observed_launch, runtime.executable)
+            self.assertEqual(observed_launch.stat().st_mode & 0o777, 0o500)
+            self.assertEqual(observed_launch.parent.stat().st_mode & 0o777, 0o500)
+            os.replace(attacker, runtime.executable)
+            return actual_popen(argv, *args, **kwargs)
+
+        try:
+            with mock.patch.object(
+                project_journal.subprocess,
+                "Popen",
+                side_effect=replace_runtime_before_popen,
+            ):
+                result = project_journal._capture_bounded_process(
+                    [str(runtime.executable), "probe"],
+                    env={"PATH": os.environ.get("PATH", "")},
+                    verified_runtime=runtime,
+                    timeout_seconds=2,
+                    stdout_limit=1024,
+                    stderr_limit=1024,
+                    stdout_overflow_error="stdout overflow",
+                    stderr_overflow_error="stderr overflow",
+                    timeout_error="launch timed out",
+                    operation="replacement-bound Git launch",
+                )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, b"safe-launch\n")
+            self.assertIsNotNone(observed_launch)
+            assert observed_launch is not None
+            self.assertFalse(observed_launch.exists())
+            self.assertEqual(
+                runtime.executable.read_text(encoding="utf-8"),
+                "#!/bin/sh\nprintf 'attacker-executed\\n'\n",
+            )
+        finally:
+            runtime.snapshot_owner.cleanup()
+
+    def test_git_launch_executes_verified_copy_after_runtime_path_becomes_fifo(
+        self,
+    ) -> None:
+        runtime = self.make_fake_git_runtime("launch-fifo")
+        actual_popen = subprocess.Popen
+        observed_launch: pathlib.Path | None = None
+        timeout_seconds = 2.0
+
+        def replace_runtime_with_fifo_before_popen(
+            argv: list[str],
+            *args: object,
+            **kwargs: object,
+        ) -> subprocess.Popen[bytes]:
+            nonlocal observed_launch
+            self.assertEqual(pathlib.Path(argv[0]), runtime.executable)
+            observed_launch = pathlib.Path(str(kwargs["executable"]))
+            self.assertNotEqual(observed_launch, runtime.executable)
+            runtime.executable.unlink()
+            os.mkfifo(runtime.executable)
+            return actual_popen(argv, *args, **kwargs)
+
+        try:
+            started = time.monotonic()
+            with mock.patch.object(
+                project_journal.subprocess,
+                "Popen",
+                side_effect=replace_runtime_with_fifo_before_popen,
+            ):
+                result = project_journal._capture_bounded_process(
+                    [str(runtime.executable), "probe"],
+                    env={"PATH": os.environ.get("PATH", "")},
+                    verified_runtime=runtime,
+                    timeout_seconds=timeout_seconds,
+                    stdout_limit=1024,
+                    stderr_limit=1024,
+                    stdout_overflow_error="stdout overflow",
+                    stderr_overflow_error="stderr overflow",
+                    timeout_error="launch timed out",
+                    operation="FIFO-bound Git launch",
+                )
+
+            self.assertLess(time.monotonic() - started, timeout_seconds)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, b"safe-launch\n")
+            self.assertTrue(stat.S_ISFIFO(runtime.executable.stat().st_mode))
+            self.assertIsNotNone(observed_launch)
+            assert observed_launch is not None
+            self.assertFalse(observed_launch.exists())
+        finally:
+            runtime.snapshot_owner.cleanup()
+
+    def test_git_launch_directory_blocks_executable_replacement_before_popen(
+        self,
+    ) -> None:
+        runtime = self.make_fake_git_runtime("launch-path-replacement")
+        actual_popen = subprocess.Popen
+        attacker = self.root / "launch-path-attacker"
+        attacker.write_text(
+            "#!/bin/sh\nprintf 'attacker-executed\\n'\n",
+            encoding="utf-8",
+        )
+        attacker.chmod(0o755)
+
+        def attempt_launch_replacement(
+            argv: list[str],
+            *args: object,
+            **kwargs: object,
+        ) -> subprocess.Popen[bytes]:
+            launch_path = pathlib.Path(str(kwargs["executable"]))
+            self.assertEqual(pathlib.Path(argv[0]), runtime.executable)
+            self.assertEqual(launch_path.parent.stat().st_mode & 0o777, 0o500)
+            with self.assertRaises(PermissionError):
+                os.replace(attacker, launch_path)
+            return actual_popen(argv, *args, **kwargs)
+
+        try:
+            with mock.patch.object(
+                project_journal.subprocess,
+                "Popen",
+                side_effect=attempt_launch_replacement,
+            ):
+                result = project_journal._capture_bounded_process(
+                    [str(runtime.executable), "probe"],
+                    env={"PATH": os.environ.get("PATH", "")},
+                    verified_runtime=runtime,
+                    timeout_seconds=2,
+                    stdout_limit=1024,
+                    stderr_limit=1024,
+                    stdout_overflow_error="stdout overflow",
+                    stderr_overflow_error="stderr overflow",
+                    timeout_error="launch timed out",
+                    operation="replacement-resistant Git launch",
+                )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, b"safe-launch\n")
+            self.assertTrue(attacker.exists())
+        finally:
+            runtime.snapshot_owner.cleanup()
+
+    def test_git_launch_directory_blocks_destination_replacement_before_reread(
+        self,
+    ) -> None:
+        runtime = self.make_fake_git_runtime("launch-copy-replacement")
+        actual_open = os.open
+        attacker = self.root / "launch-copy-attacker"
+        attacker.write_text(
+            "#!/bin/sh\nprintf 'attacker-executed\\n'\n",
+            encoding="utf-8",
+        )
+        attacker.chmod(0o755)
+        replacement_attempted = False
+
+        def attempt_launch_replacement_before_reread(
+            path: os.PathLike[str] | str,
+            flags: int,
+            mode: int = 0o777,
+            *,
+            dir_fd: int | None = None,
+        ) -> int:
+            nonlocal replacement_attempted
+            candidate = pathlib.Path(path)
+            if (
+                not replacement_attempted
+                and candidate.name == "git"
+                and candidate.parent.name.startswith("project-journal-git-launch-")
+                and (flags & os.O_ACCMODE) == os.O_RDONLY
+            ):
+                replacement_attempted = True
+                self.assertTrue(flags & project_journal.os.O_NONBLOCK)
+                self.assertTrue(flags & project_journal.os.O_NOFOLLOW)
+                self.assertEqual(candidate.parent.stat().st_mode & 0o777, 0o500)
+                with self.assertRaises(PermissionError):
+                    os.replace(attacker, candidate)
+            return actual_open(path, flags, mode, dir_fd=dir_fd)
+
+        try:
+            with mock.patch.object(
+                project_journal.os,
+                "open",
+                side_effect=attempt_launch_replacement_before_reread,
+            ):
+                result = project_journal._capture_bounded_process(
+                    [str(runtime.executable), "probe"],
+                    env={"PATH": os.environ.get("PATH", "")},
+                    verified_runtime=runtime,
+                    timeout_seconds=2,
+                    stdout_limit=1024,
+                    stderr_limit=1024,
+                    stdout_overflow_error="stdout overflow",
+                    stderr_overflow_error="stderr overflow",
+                    timeout_error="launch timed out",
+                    operation="replacement-resistant Git reread",
+                )
+
+            self.assertTrue(replacement_attempted)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, b"safe-launch\n")
+            self.assertTrue(attacker.exists())
+        finally:
+            runtime.snapshot_owner.cleanup()
+
+    def test_git_launch_rejects_replacement_immediately_before_directory_lock(
+        self,
+    ) -> None:
+        runtime = self.make_fake_git_runtime("launch-prelock-replacement")
+        actual_chmod = os.chmod
+        attacker = self.root / "launch-prelock-attacker"
+        attacker.write_text(
+            "#!/bin/sh\nprintf 'attacker-executed\\n'\n",
+            encoding="utf-8",
+        )
+        attacker.chmod(0o500)
+        replaced = False
+
+        def replace_launch_before_directory_lock(
+            path: os.PathLike[str] | str,
+            mode: int,
+            *,
+            dir_fd: int | None = None,
+            follow_symlinks: bool = True,
+        ) -> None:
+            nonlocal replaced
+            candidate = pathlib.Path(path)
+            if (
+                not replaced
+                and mode == 0o500
+                and candidate.name.startswith("project-journal-git-launch-")
+            ):
+                os.replace(attacker, candidate / "git")
+                replaced = True
+            actual_chmod(
+                path,
+                mode,
+                dir_fd=dir_fd,
+                follow_symlinks=follow_symlinks,
+            )
+
+        try:
+            with mock.patch.object(
+                project_journal.os,
+                "chmod",
+                side_effect=replace_launch_before_directory_lock,
+            ):
+                with mock.patch.object(project_journal.subprocess, "Popen") as popen:
+                    with self.assertRaisesRegex(
+                        project_journal.UnsupportedGitVersion,
+                        "launch identity changed",
+                    ):
+                        project_journal._capture_bounded_process(
+                            [str(runtime.executable), "probe"],
+                            env={"PATH": os.environ.get("PATH", "")},
+                            verified_runtime=runtime,
+                            timeout_seconds=2,
+                            stdout_limit=1024,
+                            stderr_limit=1024,
+                            stdout_overflow_error="stdout overflow",
+                            stderr_overflow_error="stderr overflow",
+                            timeout_error="launch timed out",
+                            operation="pre-lock tampered Git launch",
+                        )
+
+            self.assertTrue(replaced)
+            popen.assert_not_called()
+        finally:
+            runtime.snapshot_owner.cleanup()
+
+    def test_git_launch_rejects_fifo_before_binding_without_starting_process(
+        self,
+    ) -> None:
+        runtime = self.make_fake_git_runtime("launch-prebound-fifo")
+        runtime.executable.unlink()
+        os.mkfifo(runtime.executable)
+
+        try:
+            started = time.monotonic()
+            with mock.patch.object(project_journal.subprocess, "Popen") as popen:
+                with self.assertRaisesRegex(
+                    project_journal.UnsupportedGitVersion,
+                    "verified bytes",
+                ):
+                    project_journal._capture_bounded_process(
+                        [str(runtime.executable), "probe"],
+                        env={"PATH": os.environ.get("PATH", "")},
+                        verified_runtime=runtime,
+                        timeout_seconds=2,
+                        stdout_limit=1024,
+                        stderr_limit=1024,
+                        stdout_overflow_error="stdout overflow",
+                        stderr_overflow_error="stderr overflow",
+                        timeout_error="launch timed out",
+                        operation="pre-bound FIFO Git launch",
+                    )
+
+            self.assertLess(time.monotonic() - started, 1.0)
+            popen.assert_not_called()
+        finally:
+            runtime.snapshot_owner.cleanup()
+
+    def test_git_launch_copy_consumes_the_process_shared_deadline(self) -> None:
+        runtime = self.make_fake_git_runtime("launch-shared-deadline")
+        actual_read = os.read
+        clock = {"now": 100.0}
+        advanced = False
+
+        def advance_during_launch_copy(fd: int, size: int) -> bytes:
+            nonlocal advanced
+            chunk = actual_read(fd, size)
+            if chunk and not advanced:
+                advanced = True
+                clock["now"] = 103.0
+            return chunk
+
+        try:
+            with mock.patch.object(
+                project_journal.time,
+                "monotonic",
+                side_effect=lambda: clock["now"],
+            ):
+                with mock.patch.object(
+                    project_journal.os,
+                    "read",
+                    side_effect=advance_during_launch_copy,
+                ):
+                    with mock.patch.object(
+                        project_journal.subprocess, "Popen"
+                    ) as popen:
+                        with self.assertRaisesRegex(
+                            project_journal.UserError,
+                            "launch shared deadline",
+                        ):
+                            project_journal._capture_bounded_process(
+                                [str(runtime.executable), "probe"],
+                                env={"PATH": os.environ.get("PATH", "")},
+                                verified_runtime=runtime,
+                                timeout_seconds=2,
+                                stdout_limit=1024,
+                                stderr_limit=1024,
+                                stdout_overflow_error="stdout overflow",
+                                stderr_overflow_error="stderr overflow",
+                                timeout_error="launch shared deadline",
+                                operation="deadline-bound Git launch",
+                            )
+
+            self.assertTrue(advanced)
+            popen.assert_not_called()
+        finally:
+            runtime.snapshot_owner.cleanup()
+
+    @unittest.skipUnless(os.name == "posix", "POSIX process-group contract")
+    def test_git_launch_is_retained_when_child_terminal_state_is_unverified(
+        self,
+    ) -> None:
+        runtime = self.make_fake_git_runtime("launch-retained")
+        actual_cleanup = project_journal._terminate_process_group_and_reap
+        actual_popen = subprocess.Popen
+        observed_launch: pathlib.Path | None = None
+
+        def capture_launch(
+            argv: list[str],
+            *args: object,
+            **kwargs: object,
+        ) -> subprocess.Popen[bytes]:
+            nonlocal observed_launch
+            observed_launch = pathlib.Path(str(kwargs["executable"]))
+            return actual_popen(argv, *args, **kwargs)
+
+        def cleanup_then_report(
+            process: subprocess.Popen[bytes],
+            selector: object,
+            ownership: project_journal._ProcessOwnership,
+        ) -> str:
+            actual_error = actual_cleanup(process, selector, ownership)
+            details = [
+                detail
+                for detail in (
+                    actual_error,
+                    "simulated unverified terminal state",
+                )
+                if detail
+            ]
+            return "; ".join(details)
+
+        try:
+            with mock.patch.object(
+                project_journal.subprocess,
+                "Popen",
+                side_effect=capture_launch,
+            ):
+                with mock.patch.object(
+                    project_journal,
+                    "_terminate_process_group_and_reap",
+                    side_effect=cleanup_then_report,
+                ):
+                    with self.assertRaises(project_journal.UserError) as raised:
+                        project_journal._capture_bounded_process(
+                            [str(runtime.executable), "probe"],
+                            env={"PATH": os.environ.get("PATH", "")},
+                            verified_runtime=runtime,
+                            timeout_seconds=2,
+                            stdout_limit=1024,
+                            stderr_limit=1024,
+                            stdout_overflow_error="stdout overflow",
+                            stderr_overflow_error="stderr overflow",
+                            timeout_error="launch timed out",
+                            operation="retained Git launch",
+                        )
+
+            self.assertIn("simulated unverified terminal state", str(raised.exception))
+            self.assertIn("retained launch locator", str(raised.exception))
+            self.assertIsNotNone(observed_launch)
+            assert observed_launch is not None
+            self.assertIn(str(observed_launch.parent), str(raised.exception))
+            self.assertTrue(observed_launch.exists())
+            self.assertEqual(observed_launch.parent.stat().st_mode & 0o777, 0o500)
+        finally:
+            if observed_launch is not None and observed_launch.parent.exists():
+                os.chmod(observed_launch.parent, 0o700)
+                shutil.rmtree(observed_launch.parent)
+            runtime.snapshot_owner.cleanup()
+
+    @unittest.skipUnless(os.name == "posix", "POSIX process-group contract")
+    def test_git_launch_is_retained_after_process_identity_loss(self) -> None:
+        runtime = self.make_fake_git_runtime("launch-identity-loss")
+        actual_popen = subprocess.Popen
+        spawned: list[subprocess.Popen[bytes]] = []
+        observed_launch: pathlib.Path | None = None
+
+        def capture_launch(
+            argv: list[str],
+            *args: object,
+            **kwargs: object,
+        ) -> subprocess.Popen[bytes]:
+            nonlocal observed_launch
+            observed_launch = pathlib.Path(str(kwargs["executable"]))
+            process = actual_popen(argv, *args, **kwargs)
+            spawned.append(process)
+            return process
+
+        try:
+            with mock.patch.object(
+                project_journal.subprocess,
+                "Popen",
+                side_effect=capture_launch,
+            ):
+                with mock.patch.object(
+                    project_journal,
+                    "_wait_for_process_status_without_reaping",
+                    side_effect=project_journal._ProcessIdentityLost(
+                        "simulated bound child identity loss"
+                    ),
+                ):
+                    with self.assertRaises(project_journal.UserError) as raised:
+                        project_journal._capture_bounded_process(
+                            [str(runtime.executable), "probe"],
+                            env={"PATH": os.environ.get("PATH", "")},
+                            verified_runtime=runtime,
+                            timeout_seconds=2,
+                            stdout_limit=1024,
+                            stderr_limit=1024,
+                            stdout_overflow_error="stdout overflow",
+                            stderr_overflow_error="stderr overflow",
+                            timeout_error="launch timed out",
+                            operation="identity-lost Git launch",
+                        )
+
+            self.assertIn(
+                "simulated bound child identity loss",
+                str(raised.exception),
+            )
+            self.assertIn("retained launch locator", str(raised.exception))
+            self.assertIsNotNone(observed_launch)
+            assert observed_launch is not None
+            self.assertIn(str(observed_launch.parent), str(raised.exception))
+            self.assertTrue(observed_launch.exists())
+        finally:
+            for process in spawned:
+                process.wait(timeout=5)
+            if observed_launch is not None and observed_launch.parent.exists():
+                os.chmod(observed_launch.parent, 0o700)
+                shutil.rmtree(observed_launch.parent)
+            runtime.snapshot_owner.cleanup()
+
+    def test_git_launch_cleanup_failure_preserves_original_error(self) -> None:
+        runtime = self.make_fake_git_runtime("launch-cleanup-error")
+        actual_cleanup = project_journal._GitLaunchCopy.cleanup
+
+        def cleanup_then_fail(
+            launch: project_journal._GitLaunchCopy,
+        ) -> None:
+            actual_cleanup(launch)
+            raise OSError("simulated launch cleanup failure")
+
+        try:
+            with mock.patch.object(
+                project_journal._GitLaunchCopy,
+                "cleanup",
+                side_effect=cleanup_then_fail,
+                autospec=True,
+            ):
+                with self.assertRaises(project_journal.UserError) as raised:
+                    project_journal._capture_bounded_process(
+                        [str(runtime.executable), "probe"],
+                        env={"PATH": os.environ.get("PATH", "")},
+                        verified_runtime=runtime,
+                        timeout_seconds=2,
+                        stdout_limit=0,
+                        stderr_limit=1024,
+                        stdout_overflow_error="original stdout overflow",
+                        stderr_overflow_error="stderr overflow",
+                        timeout_error="launch timed out",
+                        operation="cleanup-failing Git launch",
+                    )
+
+            self.assertIn("original stdout overflow", str(raised.exception))
+            self.assertIn("launch-copy cleanup-incomplete", str(raised.exception))
+            self.assertIn(
+                "simulated launch cleanup failure",
+                str(raised.exception),
+            )
+        finally:
+            runtime.snapshot_owner.cleanup()
+
+    def test_git_launch_is_cleaned_when_selector_creation_is_interrupted(
+        self,
+    ) -> None:
+        runtime = self.make_fake_git_runtime("launch-selector-interrupt")
+        actual_mkdtemp = tempfile.mkdtemp
+        launch_directories: list[pathlib.Path] = []
+
+        def capture_launch_directory(*args: object, **kwargs: object) -> str:
+            directory = actual_mkdtemp(*args, **kwargs)
+            if pathlib.Path(directory).name.startswith("project-journal-git-launch-"):
+                launch_directories.append(pathlib.Path(directory))
+            return directory
+
+        try:
+            with mock.patch.object(
+                project_journal.tempfile,
+                "mkdtemp",
+                side_effect=capture_launch_directory,
+            ):
+                with mock.patch.object(
+                    project_journal.selectors,
+                    "DefaultSelector",
+                    side_effect=KeyboardInterrupt(
+                        "injected selector creation interruption"
+                    ),
+                ):
+                    with self.assertRaises(KeyboardInterrupt):
+                        project_journal._capture_bounded_process(
+                            [str(runtime.executable), "probe"],
+                            env={"PATH": os.environ.get("PATH", "")},
+                            verified_runtime=runtime,
+                            timeout_seconds=2,
+                            stdout_limit=1024,
+                            stderr_limit=1024,
+                            stdout_overflow_error="stdout overflow",
+                            stderr_overflow_error="stderr overflow",
+                            timeout_error="launch timed out",
+                            operation="selector-interrupted Git launch",
+                        )
+
+            self.assertEqual(len(launch_directories), 1)
+            self.assertFalse(launch_directories[0].exists())
+        finally:
+            for directory in launch_directories:
+                if directory.exists():
+                    os.chmod(directory, 0o700)
+                    shutil.rmtree(directory)
+            runtime.snapshot_owner.cleanup()
+
+    def test_git_launch_is_retained_when_process_start_is_interrupted(
+        self,
+    ) -> None:
+        runtime = self.make_fake_git_runtime("launch-popen-interrupt")
+        observed_launch: pathlib.Path | None = None
+
+        def interrupt_process_start(
+            argv: list[str],
+            *args: object,
+            **kwargs: object,
+        ) -> subprocess.Popen[bytes]:
+            nonlocal observed_launch
+            observed_launch = pathlib.Path(str(kwargs["executable"]))
+            raise KeyboardInterrupt("injected process-start interruption")
+
+        try:
+            with mock.patch.object(
+                project_journal.subprocess,
+                "Popen",
+                side_effect=interrupt_process_start,
+            ):
+                with self.assertRaises(KeyboardInterrupt) as raised:
+                    project_journal._capture_bounded_process(
+                        [str(runtime.executable), "probe"],
+                        env={"PATH": os.environ.get("PATH", "")},
+                        verified_runtime=runtime,
+                        timeout_seconds=2,
+                        stdout_limit=1024,
+                        stderr_limit=1024,
+                        stdout_overflow_error="stdout overflow",
+                        stderr_overflow_error="stderr overflow",
+                        timeout_error="launch timed out",
+                        operation="process-start-interrupted Git launch",
+                    )
+
+            self.assertIsNotNone(observed_launch)
+            assert observed_launch is not None
+            self.assertTrue(observed_launch.exists())
+            detail = "\n".join(getattr(raised.exception, "__notes__", ()))
+            self.assertIn("lifecycle state is unverified", detail)
+            self.assertIn(str(observed_launch.parent), detail)
+        finally:
+            if observed_launch is not None and observed_launch.parent.exists():
+                os.chmod(observed_launch.parent, 0o700)
+                shutil.rmtree(observed_launch.parent)
+            runtime.snapshot_owner.cleanup()
+
+    def test_git_launch_is_cleaned_when_ownership_setup_is_interrupted(
+        self,
+    ) -> None:
+        runtime = self.make_fake_git_runtime("launch-ownership-handoff")
+        actual_mkdtemp = tempfile.mkdtemp
+        launch_directories: list[pathlib.Path] = []
+
+        def capture_launch_directory(*args: object, **kwargs: object) -> str:
+            directory = actual_mkdtemp(*args, **kwargs)
+            if pathlib.Path(directory).name.startswith("project-journal-git-launch-"):
+                launch_directories.append(pathlib.Path(directory))
+            return directory
+
+        try:
+            with mock.patch.object(
+                project_journal.tempfile,
+                "mkdtemp",
+                side_effect=capture_launch_directory,
+            ):
+                with mock.patch.object(
+                    project_journal._ProcessOwnership,
+                    "for_process",
+                    side_effect=KeyboardInterrupt(
+                        "injected pre-Popen ownership interruption"
+                    ),
+                ):
+                    with mock.patch.object(
+                        project_journal.subprocess,
+                        "Popen",
+                    ) as popen:
+                        with self.assertRaises(KeyboardInterrupt):
+                            project_journal._capture_bounded_process(
+                                [str(runtime.executable), "probe"],
+                                env={"PATH": os.environ.get("PATH", "")},
+                                verified_runtime=runtime,
+                                timeout_seconds=2,
+                                stdout_limit=1024,
+                                stderr_limit=1024,
+                                stdout_overflow_error="stdout overflow",
+                                stderr_overflow_error="stderr overflow",
+                                timeout_error="launch timed out",
+                                operation="ownership-setup Git launch",
+                            )
+
+            popen.assert_not_called()
+            self.assertEqual(len(launch_directories), 1)
+            self.assertFalse(launch_directories[0].exists())
+        finally:
+            for directory in launch_directories:
+                if directory.exists():
+                    os.chmod(directory, 0o700)
+                    shutil.rmtree(directory)
+            runtime.snapshot_owner.cleanup()
+
+    def test_git_version_gate_executes_bound_copy_during_snapshot_replacement(
+        self,
+    ) -> None:
+        old_runtime = project_journal._GIT_RUNTIME
+        old_error = project_journal._GIT_RUNTIME_ERROR
+        fake_git = self.root / "version-gate-git"
+        fake_git.write_text(
+            "#!/bin/sh\nprintf 'git version 2.45.1\\n'\n",
+            encoding="utf-8",
+        )
+        fake_git.chmod(0o755)
+        attacker = self.root / "version-gate-attacker"
+        attacker.write_text(
+            "#!/bin/sh\nprintf 'git version 1.0.0\\n'\n",
+            encoding="utf-8",
+        )
+        attacker.chmod(0o755)
+        actual_popen = subprocess.Popen
+        replaced = False
+
+        def replace_snapshot_during_version_gate(
+            argv: list[str],
+            *args: object,
+            **kwargs: object,
+        ) -> subprocess.Popen[bytes]:
+            nonlocal replaced
+            snapshot = pathlib.Path(argv[0])
+            launch = pathlib.Path(str(kwargs["executable"]))
+            backup = snapshot.with_name("verified-snapshot-backup")
+            self.assertNotEqual(launch, snapshot)
+            os.replace(snapshot, backup)
+            os.replace(attacker, snapshot)
+            replaced = True
+            try:
+                return actual_popen(argv, *args, **kwargs)
+            finally:
+                snapshot.unlink()
+                os.replace(backup, snapshot)
+
+        project_journal._GIT_RUNTIME = None
+        project_journal._GIT_RUNTIME_ERROR = None
+        try:
+            with mock.patch.object(
+                project_journal.shutil,
+                "which",
+                return_value=str(fake_git),
+            ):
+                with mock.patch.object(
+                    project_journal.subprocess,
+                    "Popen",
+                    side_effect=replace_snapshot_during_version_gate,
+                ):
+                    with mock.patch.object(
+                        project_journal,
+                        "_verify_git_runtime_snapshot",
+                        wraps=project_journal._verify_git_runtime_snapshot,
+                    ) as verify:
+                        project_journal._initialize_git_runtime()
+
+            self.assertTrue(replaced)
+            self.assertIsNotNone(verify.call_args.kwargs["deadline"])
+            self.assertEqual(
+                verify.call_args.kwargs["deadline_error"],
+                "selected Git executable snapshot exceeded its shared deadline",
+            )
+            self.assertIsNone(project_journal._GIT_RUNTIME_ERROR)
+            runtime = project_journal._GIT_RUNTIME
+            self.assertIsNotNone(runtime)
+            assert runtime is not None
+            self.assertEqual(runtime.version, (2, 45, 1))
         finally:
             runtime = project_journal._GIT_RUNTIME
             if runtime is not None and runtime is not old_runtime:
@@ -2939,9 +3755,29 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertIn("system and global Git configuration", skill)
         self.assertIn("without following includes", skill)
         self.assertIn("explicit repo-local `core.hooksPath`", skill)
-        self.assertIn("revalidates the snapshot identity and SHA-256", skill)
+        self.assertIn(
+            "distinguishes identity, content, and access-policy changes",
+            skill,
+        )
+        self.assertIn(
+            "verified descriptor bytes into a fresh owner-private command launch",
+            skill,
+        )
+        self.assertIn(
+            "repeats descriptor/path identity, access, size, and digest validation",
+            skill,
+        )
+        self.assertIn(
+            "an unverified terminal retains and reports the locator",
+            skill,
+        )
         self.assertIn("native no-replace or exchange rename semantics", skill)
         self.assertIn("reported recovery locator", skill)
+        self.assertIn("installed-target-committed state", skill)
+        self.assertIn(
+            "completed cleanup and never claims a missing recovery object",
+            skill,
+        )
         self.assertIn("required `O_NOFOLLOW|O_NONBLOCK`", skill)
         self.assertIn("every ancestor identity/access policy", skill)
         self.assertIn("allowing timestamp-only transitions", skill)
@@ -3019,7 +3855,19 @@ class ProjectJournalTests(unittest.TestCase):
         )
         self.assertIn("ignores ambient Git control/configuration redirections", readme)
         self.assertIn(
-            "requires that exact snapshot to return a bounded credential-free",
+            "requires those exact bytes to return a bounded credential-free",
+            readme,
+        )
+        self.assertIn(
+            "verified descriptor bytes into a fresh owner-private command launch",
+            readme,
+        )
+        self.assertIn(
+            "locks the launch directory against ordinary replacement",
+            readme,
+        )
+        self.assertIn(
+            "retains and reports its locator",
             readme,
         )
         self.assertIn("byte, record, and stderr bounds", readme)
@@ -3033,6 +3881,11 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertIn("reports `cleanup-incomplete`", readme)
         self.assertIn("system and global Git configuration", readme)
         self.assertIn("native no-replace or exchange rename semantics", readme)
+        self.assertIn("installed-target-committed state", readme)
+        self.assertIn(
+            "completed cleanup and never claims a missing recovery object",
+            readme,
+        )
         self.assertIn("bind the complete absolute path", readme)
         self.assertIn("structured `discovery_error`", readme)
         self.assertIn("duplicate-ID group invalidation", readme)
@@ -3663,15 +4516,85 @@ class ProjectJournalTests(unittest.TestCase):
             )
         )
 
+    def test_install_hooks_reports_committed_state_on_interrupt_after_unlink(
+        self,
+    ) -> None:
+        repo = self.init_repo()
+        configured = run_git(
+            repo,
+            "config",
+            "--local",
+            "core.hooksPath",
+            ".githooks",
+        )
+        self.assertEqual(configured.returncode, 0, configured.stderr)
+        first = self.run_cli("install-hooks", "--repo", str(repo))
+        self.assertEqual(first.returncode, 0, first.stderr)
+        hook = repo / ".githooks/post-merge"
+        old_content = hook.read_bytes().replace(
+            project_journal.HOOK_BEGIN.encode(),
+            (
+                project_journal.HOOK_BEGIN + "\n# transaction-owned previous hook"
+            ).encode(),
+            1,
+        )
+        hook.write_bytes(old_content)
+        actual_unlink = project_journal.os.unlink
+        interrupted = False
+
+        def unlink_then_interrupt(
+            path: os.PathLike[str] | str,
+            *,
+            dir_fd: int | None = None,
+        ) -> None:
+            nonlocal interrupted
+            actual_unlink(path, dir_fd=dir_fd)
+            if (
+                isinstance(path, str)
+                and path.startswith(".project-journal-post-merge-")
+                and not interrupted
+            ):
+                interrupted = True
+                raise KeyboardInterrupt("injected after displaced-hook unlink")
+
+        args = mock.Mock(repo=str(repo))
+        with mock.patch.object(
+            project_journal.os,
+            "unlink",
+            side_effect=unlink_then_interrupt,
+        ):
+            with self.assertRaises(KeyboardInterrupt) as raised:
+                project_journal.command_install_hooks(args)
+
+        self.assertTrue(interrupted)
+        self.assertNotEqual(hook.read_bytes(), old_content)
+        self.assertIn(project_journal.HOOK_BEGIN.encode(), hook.read_bytes())
+        self.assertEqual(
+            list((repo / ".githooks").glob(".project-journal-post-merge-*.tmp")),
+            [],
+        )
+        notes = getattr(raised.exception, "__notes__", ())
+        self.assertTrue(
+            any("verified installed-target state" in note for note in notes),
+        )
+        self.assertTrue(any("cleanup completed" in note for note in notes))
+        self.assertFalse(any("recovery locator" in note for note in notes))
+
     def test_hook_target_fifo_is_rejected_without_blocking(self) -> None:
         repo = self.init_repo()
         fifo = repo / ".git/hooks/post-checkout"
         os.mkfifo(fifo)
+        timeout_seconds = 5.0
 
         started = time.monotonic()
-        result = self.run_cli("install-hooks", "--repo", str(repo))
+        result = self.run_cli(
+            "install-hooks",
+            "--repo",
+            str(repo),
+            timeout_seconds=timeout_seconds,
+        )
 
-        self.assertLess(time.monotonic() - started, 2.0)
+        self.assertLess(time.monotonic() - started, timeout_seconds)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("not a regular file", result.stderr)
 

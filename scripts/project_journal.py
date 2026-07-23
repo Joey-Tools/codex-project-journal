@@ -223,6 +223,59 @@ class _GitRuntime:
     snapshot_owner: tempfile.TemporaryDirectory[str]
 
 
+@dataclasses.dataclass
+class _GitLaunchCopy:
+    executable: pathlib.Path
+    directory: pathlib.Path
+    cleanup_safe: bool = dataclasses.field(default=False, init=False, repr=False)
+
+    def mark_cleanup_safe(self) -> None:
+        self.cleanup_safe = True
+
+    def cleanup(self) -> None:
+        try:
+            os.chmod(self.directory, 0o700)
+        except FileNotFoundError:
+            return
+        shutil.rmtree(self.directory)
+
+
+def _report_git_launch_issue(
+    active_error: BaseException | None,
+    message: str,
+    *,
+    cause: BaseException | None = None,
+) -> None:
+    if active_error is None:
+        if cause is not None and not isinstance(cause, Exception):
+            add_note = getattr(cause, "add_note", None)
+            if add_note is not None:
+                add_note(message)
+            raise cause
+        raise UserError(message) from cause
+    if isinstance(active_error, Exception):
+        raise UserError(f"{active_error}; {message}") from active_error
+    add_note = getattr(active_error, "add_note", None)
+    if add_note is not None:
+        add_note(message)
+
+
+def _cleanup_git_launch_after_terminal(
+    launch: _GitLaunchCopy,
+    operation: str,
+    active_error: BaseException | None,
+) -> None:
+    try:
+        launch.cleanup()
+    except BaseException as exc:
+        _report_git_launch_issue(
+            active_error,
+            f"{operation} launch-copy cleanup-incomplete at locator "
+            f"{launch.directory}: {exc}",
+            cause=exc,
+        )
+
+
 @dataclasses.dataclass(frozen=True)
 class _HookTargetSnapshot:
     name: str
@@ -270,11 +323,18 @@ class _HookCommitState:
     def must_preserve_temporary(self) -> bool:
         return self.phase == "exchange-may-have-committed"
 
+    @property
+    def installed_target_committed(self) -> bool:
+        return self.phase == "installed-target-committed"
+
     def begin_exchange(self) -> None:
         self.phase = "exchange-may-have-committed"
 
     def mark_cleanup_safe(self) -> None:
         self.phase = "staged-cleanup-safe"
+
+    def mark_installed_target_committed(self) -> None:
+        self.phase = "installed-target-committed"
 
     def mark_temporary_consumed(self) -> None:
         self.phase = "temporary-consumed"
@@ -495,40 +555,154 @@ def _secure_read_regular_path(
         os.close(fd)
 
 
-def _hash_open_file(fd: int) -> str:
+def _hash_open_file(
+    fd: int,
+    *,
+    deadline: float | None = None,
+    deadline_error: str = "Git runtime verification exceeded its shared deadline",
+    byte_limit: int = MAX_GIT_EXECUTABLE_BYTES,
+) -> tuple[str, int]:
     digest = hashlib.sha256()
+    total = 0
     os.lseek(fd, 0, os.SEEK_SET)
     while True:
+        _check_deadline(deadline, deadline_error)
         chunk = os.read(fd, PROCESS_READ_CHUNK_BYTES)
         if not chunk:
             break
+        total += len(chunk)
+        if total > byte_limit:
+            raise OSError(f"owner-private Git snapshot exceeds {byte_limit} bytes")
         digest.update(chunk)
-    return digest.hexdigest()
+    _check_deadline(deadline, deadline_error)
+    return digest.hexdigest(), total
 
 
-def _verify_git_runtime_snapshot(runtime: _GitRuntime) -> None:
-    try:
-        directory_stat = os.stat(runtime.executable.parent, follow_symlinks=False)
+def _revalidate_git_runtime_directory(
+    runtime: _GitRuntime,
+    *,
+    deadline: float | None = None,
+    deadline_error: str = "Git runtime verification exceeded its shared deadline",
+) -> None:
+    _check_deadline(deadline, deadline_error)
+    directory_stat = os.stat(runtime.executable.parent, follow_symlinks=False)
+    _check_deadline(deadline, deadline_error)
+    expected_dev, expected_ino, expected_uid, expected_mode = runtime.directory_identity
+    if (
+        not stat.S_ISDIR(directory_stat.st_mode)
+        or directory_stat.st_dev != expected_dev
+        or directory_stat.st_ino != expected_ino
+    ):
+        raise OSError("owner-private Git snapshot directory identity changed")
+    if (
+        directory_stat.st_uid != expected_uid
+        or stat.S_IMODE(directory_stat.st_mode) != expected_mode
+        or directory_stat.st_uid != os.geteuid()
+        or stat.S_IMODE(directory_stat.st_mode) != 0o700
+    ):
+        raise OSError("owner-private Git snapshot directory access policy changed")
+
+
+def _revalidate_open_git_runtime_snapshot(
+    runtime: _GitRuntime,
+    fd: int,
+    *,
+    deadline: float | None = None,
+    deadline_error: str = "Git runtime verification exceeded its shared deadline",
+) -> None:
+    _check_deadline(deadline, deadline_error)
+    descriptor_stat = os.fstat(fd)
+    _check_deadline(deadline, deadline_error)
+    path_stat = os.stat(runtime.executable, follow_symlinks=False)
+    _check_deadline(deadline, deadline_error)
+    expected_dev, expected_ino, expected_uid, expected_mode, expected_size = (
+        runtime.file_identity
+    )
+    for value in (descriptor_stat, path_stat):
         if (
-            not stat.S_ISDIR(directory_stat.st_mode)
-            or _directory_identity(directory_stat) != runtime.directory_identity
-            or directory_stat.st_uid != os.geteuid()
-            or stat.S_IMODE(directory_stat.st_mode) != 0o700
+            not stat.S_ISREG(value.st_mode)
+            or value.st_dev != expected_dev
+            or value.st_ino != expected_ino
         ):
-            raise OSError("owner-private snapshot directory identity changed")
-        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
-        flags |= getattr(os, "O_NOFOLLOW", 0)
-        fd = os.open(runtime.executable, flags)
+            raise OSError("owner-private Git snapshot identity changed")
+        if (
+            value.st_uid != expected_uid
+            or stat.S_IMODE(value.st_mode) != expected_mode
+            or value.st_uid != os.geteuid()
+            or stat.S_IMODE(value.st_mode) != 0o500
+        ):
+            raise OSError("owner-private Git snapshot access policy changed")
+        if value.st_size != expected_size:
+            raise OSError("owner-private Git snapshot content size changed")
+
+
+def _open_bound_git_runtime_snapshot(
+    runtime: _GitRuntime,
+    *,
+    deadline: float | None = None,
+    deadline_error: str = "Git runtime verification exceeded its shared deadline",
+) -> int:
+    _check_deadline(deadline, deadline_error)
+    _revalidate_git_runtime_directory(
+        runtime,
+        deadline=deadline,
+        deadline_error=deadline_error,
+    )
+    _check_deadline(deadline, deadline_error)
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | _required_open_flag("O_NOFOLLOW")
+        | _required_open_flag("O_NONBLOCK")
+    )
+    fd = os.open(runtime.executable, flags)
+    try:
+        _check_deadline(deadline, deadline_error)
+        _revalidate_open_git_runtime_snapshot(
+            runtime,
+            fd,
+            deadline=deadline,
+            deadline_error=deadline_error,
+        )
+        _check_deadline(deadline, deadline_error)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _verify_git_runtime_snapshot(
+    runtime: _GitRuntime,
+    *,
+    deadline: float | None = None,
+    deadline_error: str = "Git runtime verification exceeded its shared deadline",
+) -> None:
+    try:
+        fd = _open_bound_git_runtime_snapshot(
+            runtime,
+            deadline=deadline,
+            deadline_error=deadline_error,
+        )
         try:
-            file_stat = os.fstat(fd)
-            if (
-                not stat.S_ISREG(file_stat.st_mode)
-                or _file_identity(file_stat) != runtime.file_identity
-                or file_stat.st_uid != os.geteuid()
-                or stat.S_IMODE(file_stat.st_mode) != 0o500
-            ):
-                raise OSError("owner-private Git snapshot identity changed")
-            if _hash_open_file(fd) != runtime.digest:
+            digest, size = _hash_open_file(
+                fd,
+                deadline=deadline,
+                deadline_error=deadline_error,
+            )
+            _revalidate_open_git_runtime_snapshot(
+                runtime,
+                fd,
+                deadline=deadline,
+                deadline_error=deadline_error,
+            )
+            _revalidate_git_runtime_directory(
+                runtime,
+                deadline=deadline,
+                deadline_error=deadline_error,
+            )
+            if size != runtime.file_identity[4]:
+                raise OSError("owner-private Git snapshot size changed")
+            if digest != runtime.digest:
                 raise OSError("owner-private Git snapshot content changed")
         finally:
             os.close(fd)
@@ -536,6 +710,211 @@ def _verify_git_runtime_snapshot(runtime: _GitRuntime) -> None:
         raise UnsupportedGitVersion(
             f"verified Git runtime snapshot is no longer trustworthy: {exc}"
         ) from exc
+
+
+def _prepare_git_runtime_launch(
+    runtime: _GitRuntime,
+    *,
+    deadline: float,
+    deadline_error: str,
+) -> _GitLaunchCopy:
+    source_fd: int | None = None
+    directory: pathlib.Path | None = None
+
+    def cleanup_owner(active_error: BaseException) -> None:
+        if directory is None:
+            return
+        _cleanup_git_launch_after_terminal(
+            _GitLaunchCopy(
+                executable=directory / "git",
+                directory=directory,
+            ),
+            "Git launch preparation",
+            active_error,
+        )
+
+    try:
+        source_fd = _open_bound_git_runtime_snapshot(
+            runtime,
+            deadline=deadline,
+            deadline_error=deadline_error,
+        )
+        _check_deadline(deadline, deadline_error)
+        directory = pathlib.Path(tempfile.mkdtemp(prefix="project-journal-git-launch-"))
+        os.chmod(directory, 0o700)
+        _check_deadline(deadline, deadline_error)
+        directory_stat = os.stat(directory, follow_symlinks=False)
+        _check_deadline(deadline, deadline_error)
+        if (
+            not stat.S_ISDIR(directory_stat.st_mode)
+            or directory_stat.st_uid != os.geteuid()
+            or stat.S_IMODE(directory_stat.st_mode) != 0o700
+        ):
+            raise OSError("command-private Git launch directory is not owner-private")
+
+        executable = directory / "git"
+        flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | _required_open_flag("O_NOFOLLOW")
+            | _required_open_flag("O_NONBLOCK")
+        )
+        destination_fd = os.open(executable, flags, 0o600)
+        digest = hashlib.sha256()
+        copied = 0
+        try:
+            os.lseek(source_fd, 0, os.SEEK_SET)
+            while True:
+                _check_deadline(deadline, deadline_error)
+                chunk = os.read(source_fd, PROCESS_READ_CHUNK_BYTES)
+                if not chunk:
+                    break
+                copied += len(chunk)
+                if copied > MAX_GIT_EXECUTABLE_BYTES:
+                    raise OSError(
+                        "owner-private Git snapshot exceeds "
+                        f"{MAX_GIT_EXECUTABLE_BYTES} bytes"
+                    )
+                digest.update(chunk)
+                offset = 0
+                while offset < len(chunk):
+                    _check_deadline(deadline, deadline_error)
+                    written = os.write(destination_fd, chunk[offset:])
+                    if written <= 0:
+                        raise OSError(
+                            "short write while preparing command-private Git launch"
+                        )
+                    offset += written
+            if copied != runtime.file_identity[4]:
+                raise OSError("owner-private Git snapshot size changed before launch")
+            if digest.hexdigest() != runtime.digest:
+                raise OSError(
+                    "owner-private Git snapshot content changed before launch"
+                )
+            os.fchmod(destination_fd, 0o500)
+            _check_deadline(deadline, deadline_error)
+            destination_written_stat = os.fstat(destination_fd)
+        finally:
+            os.close(destination_fd)
+
+        _revalidate_open_git_runtime_snapshot(
+            runtime,
+            source_fd,
+            deadline=deadline,
+            deadline_error=deadline_error,
+        )
+        _revalidate_git_runtime_directory(
+            runtime,
+            deadline=deadline,
+            deadline_error=deadline_error,
+        )
+        _check_deadline(deadline, deadline_error)
+        os.chmod(directory, 0o500)
+        _check_deadline(deadline, deadline_error)
+        locked_directory_stat = os.stat(directory, follow_symlinks=False)
+        _check_deadline(deadline, deadline_error)
+        if (
+            not stat.S_ISDIR(locked_directory_stat.st_mode)
+            or locked_directory_stat.st_dev != directory_stat.st_dev
+            or locked_directory_stat.st_ino != directory_stat.st_ino
+        ):
+            raise OSError("command-private Git launch directory identity changed")
+        if (
+            locked_directory_stat.st_uid != os.geteuid()
+            or stat.S_IMODE(locked_directory_stat.st_mode) != 0o500
+        ):
+            raise OSError("command-private Git launch directory access policy changed")
+
+        read_flags = (
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | _required_open_flag("O_NOFOLLOW")
+            | _required_open_flag("O_NONBLOCK")
+        )
+        _check_deadline(deadline, deadline_error)
+        destination_read_fd = os.open(executable, read_flags)
+        try:
+            expected_dev = destination_written_stat.st_dev
+            expected_ino = destination_written_stat.st_ino
+
+            def validate_destination_stats(
+                values: tuple[os.stat_result, ...],
+            ) -> None:
+                for value in values:
+                    if (
+                        not stat.S_ISREG(value.st_mode)
+                        or value.st_dev != expected_dev
+                        or value.st_ino != expected_ino
+                    ):
+                        raise OSError("command-private Git launch identity changed")
+                    if (
+                        value.st_uid != os.geteuid()
+                        or stat.S_IMODE(value.st_mode) != 0o500
+                        or value.st_nlink != 1
+                    ):
+                        raise OSError(
+                            "command-private Git launch access policy changed"
+                        )
+                    if value.st_size != copied:
+                        raise OSError("command-private Git launch content size changed")
+
+            _check_deadline(deadline, deadline_error)
+            destination_before = os.fstat(destination_read_fd)
+            _check_deadline(deadline, deadline_error)
+            destination_path_before = os.stat(
+                executable,
+                follow_symlinks=False,
+            )
+            validate_destination_stats(
+                (
+                    destination_before,
+                    destination_path_before,
+                )
+            )
+            destination_digest, destination_size = _hash_open_file(
+                destination_read_fd,
+                deadline=deadline,
+                deadline_error=deadline_error,
+            )
+            _check_deadline(deadline, deadline_error)
+            destination_after = os.fstat(destination_read_fd)
+            _check_deadline(deadline, deadline_error)
+            destination_path_after = os.stat(
+                executable,
+                follow_symlinks=False,
+            )
+            _check_deadline(deadline, deadline_error)
+            validate_destination_stats(
+                (
+                    destination_after,
+                    destination_path_after,
+                )
+            )
+            if destination_size != copied or destination_digest != runtime.digest:
+                raise OSError(
+                    "command-private Git launch content changed after directory lock"
+                )
+        finally:
+            os.close(destination_read_fd)
+
+        return _GitLaunchCopy(
+            executable=executable,
+            directory=directory,
+        )
+    except OSError as exc:
+        error = UnsupportedGitVersion(
+            f"failed to bind Git execution to verified bytes: {exc}"
+        )
+        cleanup_owner(error)
+        raise error from exc
+    except BaseException as exc:
+        cleanup_owner(exc)
+        raise
+    finally:
+        if source_fd is not None:
+            os.close(source_fd)
 
 
 def _git_environment() -> dict[str, str]:
@@ -554,24 +933,30 @@ def _global_config_git_environment() -> dict[str, str]:
     return env
 
 
-def _fixed_git_executable() -> pathlib.Path:
-    global _GIT_RUNTIME_ERROR
-
+def _require_git_runtime() -> _GitRuntime:
     if _GIT_RUNTIME_ERROR is not None:
         raise _GIT_RUNTIME_ERROR
     if _GIT_RUNTIME is None:
         raise UnsupportedGitVersion("Git runtime validation did not complete")
+    return _GIT_RUNTIME
+
+
+def _fixed_git_executable() -> pathlib.Path:
+    global _GIT_RUNTIME_ERROR
+
+    runtime = _require_git_runtime()
     try:
-        _verify_git_runtime_snapshot(_GIT_RUNTIME)
+        _verify_git_runtime_snapshot(runtime)
     except UnsupportedGitVersion as exc:
         _GIT_RUNTIME_ERROR = exc
         raise
-    return _GIT_RUNTIME.executable
+    return runtime.executable
 
 
 def _git_command(repo: pathlib.Path, *args: str) -> list[str]:
+    runtime = _require_git_runtime()
     return [
-        str(_fixed_git_executable()),
+        str(runtime.executable),
         "--no-pager",
         "--no-optional-locks",
         *SAFE_GIT_CONFIG_ARGS,
@@ -592,6 +977,7 @@ def _run_git(
     result = _capture_bounded_process(
         command,
         env=_git_environment(),
+        verified_runtime=_require_git_runtime(),
         timeout_seconds=GIT_COMMAND_TIMEOUT_SECONDS,
         stdout_limit=MAX_GENERIC_GIT_STDOUT_BYTES,
         stderr_limit=MAX_GIT_STDERR_BYTES,
@@ -1436,6 +1822,7 @@ def _capture_bounded_process(
     argv: list[str],
     *,
     env: dict[str, str],
+    verified_runtime: _GitRuntime | None = None,
     stdin_data: bytes | None = None,
     timeout_seconds: float,
     stdout_limit: int,
@@ -1459,29 +1846,114 @@ def _capture_bounded_process(
         operation_deadline = min(operation_deadline, deadline)
     if operation_deadline <= started_at:
         raise UserError(timeout_error)
+    launch: _GitLaunchCopy | None = None
+    try:
+        if verified_runtime is not None:
+            launch = _prepare_git_runtime_launch(
+                verified_runtime,
+                deadline=operation_deadline,
+                deadline_error=timeout_error,
+            )
+        return _capture_bounded_process_with_launch(
+            argv,
+            env=env,
+            launch=launch,
+            stdin_data=stdin_data,
+            operation_deadline=operation_deadline,
+            stdout_limit=stdout_limit,
+            stderr_limit=stderr_limit,
+            stdout_feed=stdout_feed,
+            stdout_finish=stdout_finish,
+            stdout_overflow_error=stdout_overflow_error,
+            stderr_overflow_error=stderr_overflow_error,
+            timeout_error=timeout_error,
+            operation=operation,
+        )
+    finally:
+        if launch is not None:
+            active_error = sys.exc_info()[1]
+            if launch.cleanup_safe:
+                _cleanup_git_launch_after_terminal(
+                    launch,
+                    operation,
+                    active_error,
+                )
+            else:
+                _report_git_launch_issue(
+                    active_error,
+                    f"{operation} lifecycle state is unverified; retained "
+                    f"launch locator: {launch.directory}",
+                )
+
+
+def _capture_bounded_process_with_launch(
+    argv: list[str],
+    *,
+    env: dict[str, str],
+    launch: _GitLaunchCopy | None,
+    stdin_data: bytes | None,
+    operation_deadline: float,
+    stdout_limit: int,
+    stderr_limit: int,
+    stdout_feed: Callable[[bytes], None] | None,
+    stdout_finish: Callable[[], None] | None,
+    stdout_overflow_error: str,
+    stderr_overflow_error: str,
+    timeout_error: str,
+    operation: str,
+) -> subprocess.CompletedProcess[bytes]:
     try:
         selector = selectors.DefaultSelector()
     except OSError as exc:
-        raise UserError(f"failed to create {operation} selector: {exc}") from exc
+        error = UserError(f"failed to create {operation} selector: {exc}")
+        if launch is not None:
+            launch.mark_cleanup_safe()
+        raise error from exc
+    except BaseException:
+        if launch is not None:
+            launch.mark_cleanup_safe()
+        raise
     stdout = bytearray()
     stderr = bytearray()
     stdin_offset = 0
-    try:
-        process = subprocess.Popen(
-            argv,
-            env=env,
-            stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=os.name == "posix",
-        )
-    except OSError as exc:
-        _close_selector(selector)
-        raise UserError(f"failed to start {operation}: {exc}") from exc
-
-    ownership = _ProcessOwnership.for_process()
     selector_open = True
+    process: subprocess.Popen[bytes] | None = None
     try:
+        ownership = _ProcessOwnership.for_process()
+    except BaseException:
+        _close_selector(selector)
+        selector_open = False
+        if launch is not None:
+            launch.mark_cleanup_safe()
+        raise
+
+    try:
+        try:
+            _check_deadline(operation_deadline, timeout_error)
+            process = subprocess.Popen(
+                argv,
+                executable=(str(launch.executable) if launch is not None else None),
+                env=env,
+                stdin=(
+                    subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL
+                ),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=os.name == "posix",
+            )
+        except OSError as exc:
+            _close_selector(selector)
+            selector_open = False
+            error = UserError(f"failed to start {operation}: {exc}")
+            if launch is not None:
+                launch.mark_cleanup_safe()
+            raise error from exc
+        except BaseException:
+            _close_selector(selector)
+            selector_open = False
+            raise
+
+        assert process is not None
         assert process.stdout is not None
         assert process.stderr is not None
         for stream, stream_name in (
@@ -1640,7 +2112,7 @@ def _capture_bounded_process(
             _close_selector(selector)
             selector_open = False
     except _ProcessIdentityLost as exc:
-        ownership.release()
+        ownership.abandon_incomplete()
         if selector_open:
             _close_selector(selector)
             selector_open = False
@@ -1649,6 +2121,11 @@ def _capture_bounded_process(
             "was skipped after leader identity loss"
         ) from exc
     except BaseException as exc:
+        if process is None:
+            if selector_open:
+                _close_selector(selector)
+                selector_open = False
+            raise
         cleanup_error: str | None = None
         if ownership.permits_group_cleanup:
             try:
@@ -1712,6 +2189,9 @@ def _capture_bounded_process(
             if add_note is not None:
                 add_note(cleanup_message)
         raise
+    finally:
+        if launch is not None and ownership.state == "released":
+            launch.mark_cleanup_safe()
 
     return subprocess.CompletedProcess(
         argv,
@@ -1947,9 +2427,19 @@ def _initialize_git_runtime() -> None:
     }
     version_env.update(SAFE_GIT_ENV)
     try:
+        provisional_runtime = _GitRuntime(
+            executable=snapshot,
+            source_executable=executable,
+            version=(0, 0, 0),
+            digest=digest,
+            file_identity=snapshot_identity,
+            directory_identity=directory_identity,
+            snapshot_owner=snapshot_owner,
+        )
         result = _capture_bounded_process(
             [str(snapshot), "--version"],
             env=version_env,
+            verified_runtime=provisional_runtime,
             timeout_seconds=GIT_VERSION_TIMEOUT_SECONDS,
             stdout_limit=MAX_GIT_VERSION_OUTPUT_BYTES,
             stderr_limit=MAX_GIT_VERSION_OUTPUT_BYTES,
@@ -1964,6 +2454,7 @@ def _initialize_git_runtime() -> None:
                 f"{GIT_VERSION_TIMEOUT_SECONDS:g} seconds"
             ),
             operation="Git version probe",
+            deadline=snapshot_deadline,
         )
     except UserError as exc:
         snapshot_owner.cleanup()
@@ -2008,11 +2499,17 @@ def _initialize_git_runtime() -> None:
         snapshot_owner=snapshot_owner,
     )
     try:
-        _verify_git_runtime_snapshot(_GIT_RUNTIME)
-    except UnsupportedGitVersion as exc:
+        _verify_git_runtime_snapshot(
+            _GIT_RUNTIME,
+            deadline=snapshot_deadline,
+            deadline_error=(
+                "selected Git executable snapshot exceeded its shared deadline"
+            ),
+        )
+    except UserError as exc:
         snapshot_owner.cleanup()
         _GIT_RUNTIME = None
-        _GIT_RUNTIME_ERROR = exc
+        _GIT_RUNTIME_ERROR = UnsupportedGitVersion(str(exc))
 
 
 def _tracked_index_journal_snapshot(
@@ -2040,6 +2537,7 @@ def _tracked_index_journal_snapshot(
     result = _capture_bounded_process(
         command,
         env=_git_environment(),
+        verified_runtime=_require_git_runtime(),
         timeout_seconds=GIT_INDEX_SNAPSHOT_TIMEOUT_SECONDS,
         stdout_limit=MAX_TRACKED_JOURNAL_INDEX_BYTES,
         stderr_limit=MAX_GIT_STDERR_BYTES,
@@ -2104,6 +2602,7 @@ def _read_index_blobs_batch(
     result = _capture_bounded_process(
         command,
         env=_git_environment(),
+        verified_runtime=_require_git_runtime(),
         stdin_data=request_data,
         timeout_seconds=timeout_seconds,
         stdout_limit=stdout_limit,
@@ -2698,8 +3197,9 @@ def _global_git_config_entries(
     ) as staged:
         staged.write(content)
         staged.flush()
+        runtime = _require_git_runtime()
         command = [
-            str(_fixed_git_executable()),
+            str(runtime.executable),
             "--no-pager",
             "--no-optional-locks",
             "config",
@@ -2712,6 +3212,7 @@ def _global_git_config_entries(
         result = _capture_bounded_process(
             command,
             env=_global_config_git_environment(),
+            verified_runtime=runtime,
             timeout_seconds=GIT_CONFIG_QUERY_TIMEOUT_SECONDS,
             stdout_limit=MAX_GLOBAL_GIT_CONFIG_OUTPUT_BYTES,
             stderr_limit=MAX_GIT_STDERR_BYTES,
@@ -3412,6 +3913,65 @@ def _interrupted_hook_exchange_recovery_note(
     return f"hook exchange may have committed; {verification}: {recovery_path}"
 
 
+def _interrupted_hook_post_commit_note(
+    binding: _HookDirectoryBinding,
+    target: _HookTargetSnapshot,
+    temporary_name: str,
+    staged: _HookTargetSnapshot,
+) -> str:
+    cleanup_path = binding.path / temporary_name
+    durability_error: str | None = None
+    try:
+        os.fsync(binding.fd)
+    except OSError as exc:
+        durability_error = str(exc)
+
+    expected_installed = dataclasses.replace(staged, name=target.name)
+    try:
+        installed, _installed_content = _snapshot_hook_target(
+            binding,
+            target.name,
+        )
+    except BaseException as exc:
+        installed_status = f"installed-target revalidation is unverified: {exc}"
+    else:
+        installed_status = (
+            "installed target remains identity/content verified"
+            if installed == expected_installed
+            else "installed target no longer matches the committed staged hook"
+        )
+
+    expected_displaced = dataclasses.replace(target, name=temporary_name)
+    try:
+        displaced, _displaced_content = _snapshot_hook_target(
+            binding,
+            temporary_name,
+        )
+    except BaseException as exc:
+        cleanup_status = f"displaced-hook cleanup is unverified: {exc}"
+    else:
+        if not displaced.exists:
+            cleanup_status = "displaced-hook cleanup completed"
+        elif displaced == expected_displaced:
+            cleanup_status = (
+                f"displaced-hook cleanup was interrupted; retained cleanup "
+                f"locator: {cleanup_path}"
+            )
+        else:
+            cleanup_status = (
+                f"displaced-hook cleanup object does not match the verified "
+                f"displaced hook: {cleanup_path}"
+            )
+
+    detail = (
+        f"hook exchange reached the verified installed-target state; "
+        f"{installed_status}; {cleanup_status}"
+    )
+    if durability_error is not None:
+        detail += f"; directory durability is unverified: {durability_error}"
+    return detail
+
+
 def _commit_hook_target_atomically(
     binding: _HookDirectoryBinding,
     target: _HookTargetSnapshot,
@@ -3470,6 +4030,25 @@ def _commit_hook_target_atomically(
 
     expected_displaced = dataclasses.replace(target, name=temporary_name)
     if displaced == expected_displaced:
+        try:
+            installed, _installed_content = _snapshot_hook_target(
+                binding,
+                target.name,
+            )
+        except BaseException as exc:
+            raise _recovery_error(
+                binding,
+                temporary_name,
+                f"the installed target could not be verified before cleanup: {exc}",
+            ) from exc
+        expected_installed = dataclasses.replace(staged, name=target.name)
+        if installed != expected_installed:
+            raise _recovery_error(
+                binding,
+                temporary_name,
+                "the installed target does not match the staged hook before cleanup",
+            )
+        commit_state.mark_installed_target_committed()
         os.unlink(temporary_name, dir_fd=binding.fd)
         commit_state.mark_temporary_consumed()
         return
@@ -3611,6 +4190,18 @@ def _install_hook(
                 f"hook exchange may have committed; preserved recovery "
                 f"locator: {recovery}"
             ) from exc
+        if commit_state.installed_target_committed:
+            temporary_created = False
+            detail = _interrupted_hook_post_commit_note(
+                binding,
+                target,
+                temporary_name,
+                staged,
+            )
+            raise UserError(
+                f"hook cleanup failed after the installed target committed: "
+                f"{exc}; {detail}"
+            ) from exc
         raise UserError(
             f"failed to install hook {binding.path / target.name}: {exc}"
         ) from exc
@@ -3621,6 +4212,17 @@ def _install_hook(
                 binding,
                 target,
                 temporary_name,
+            )
+            add_note = getattr(exc, "add_note", None)
+            if add_note is not None:
+                add_note(detail)
+        elif commit_state.installed_target_committed:
+            temporary_created = False
+            detail = _interrupted_hook_post_commit_note(
+                binding,
+                target,
+                temporary_name,
+                staged,
             )
             add_note = getattr(exc, "add_note", None)
             if add_note is not None:
