@@ -1000,6 +1000,48 @@ class ProjectJournalTests(unittest.TestCase):
                 [per_entry] * (project_journal.MAX_JOURNAL_ENTRIES + 1)
             )
 
+    def test_frontmatter_line_cap_does_not_count_long_body(self) -> None:
+        body = "\n".join(
+            f"Body line {index}"
+            for index in range(project_journal.MAX_FRONTMATTER_LINES + 100)
+        )
+        fields = project_journal._parse_frontmatter_text(
+            "---\n"
+            "id: 20260723-longbody\n"
+            "title: Long body\n"
+            "status: active\n"
+            "created: 2026-07-23\n"
+            "updated: 2026-07-23\n"
+            "branch:\n"
+            "pr:\n"
+            "supersedes: []\n"
+            "superseded_by:\n"
+            "---\n\n"
+            f"{body}\n",
+            "long-body.md",
+        )
+
+        self.assertEqual(fields["id"], "20260723-longbody")
+
+    def test_frontmatter_line_cap_still_bounds_opening_block(self) -> None:
+        oversized_frontmatter = "\n".join(
+            ["---", "title: oversized"]
+            + [
+                "  ignored continuation"
+                for _ in range(project_journal.MAX_FRONTMATTER_LINES)
+            ]
+            + ["---"]
+        )
+
+        with self.assertRaisesRegex(
+            project_journal.JournalLimitExceeded,
+            "frontmatter exceeds",
+        ):
+            project_journal._parse_frontmatter_text(
+                oversized_frontmatter,
+                "oversized-frontmatter.md",
+            )
+
     def test_semantic_cap_in_one_repo_isolated_by_discovery(self) -> None:
         healthy = self.init_repo("healthy-semantic")
         healthy_journal = self.write_journal(
@@ -1331,6 +1373,26 @@ class ProjectJournalTests(unittest.TestCase):
 
         popen.assert_not_called()
 
+    def test_non_posix_runtime_is_explicitly_unsupported(self) -> None:
+        original_runtime = project_journal._GIT_RUNTIME
+        original_error = project_journal._GIT_RUNTIME_ERROR
+        try:
+            project_journal._GIT_RUNTIME = None
+            project_journal._GIT_RUNTIME_ERROR = None
+            with mock.patch.object(project_journal.os, "name", "nt"):
+                project_journal._initialize_git_runtime()
+            self.assertIsInstance(
+                project_journal._GIT_RUNTIME_ERROR,
+                project_journal.UnsupportedPlatform,
+            )
+            self.assertIn(
+                "requires a POSIX host",
+                str(project_journal._GIT_RUNTIME_ERROR),
+            )
+        finally:
+            project_journal._GIT_RUNTIME = original_runtime
+            project_journal._GIT_RUNTIME_ERROR = original_error
+
     @unittest.skipUnless(
         os.name == "posix" and hasattr(os, "WNOWAIT"),
         "POSIX WNOWAIT process-status contract",
@@ -1366,13 +1428,13 @@ class ProjectJournalTests(unittest.TestCase):
         self,
     ) -> None:
         kill_signal = getattr(signal, "SIGKILL", signal.SIGTERM)
-        for term_target_existed, group_exists, expected_signals in (
-            (False, False, [signal.SIGTERM]),
+        for initial_group_exists, group_exists, expected_signals in (
+            (False, False, []),
             (True, False, [signal.SIGTERM]),
             (True, True, [signal.SIGTERM, kill_signal]),
         ):
             with self.subTest(
-                term_target_existed=term_target_existed,
+                initial_group_exists=initial_group_exists,
                 group_exists=group_exists,
             ):
                 events: list[tuple[str, int | None]] = []
@@ -1396,11 +1458,14 @@ class ProjectJournalTests(unittest.TestCase):
                 ) -> project_journal._ProcessSignalResult:
                     self.assertIs(process_arg, process)
                     events.append(("signal", sig))
-                    return project_journal._ProcessSignalResult(
-                        target_existed=(
-                            term_target_existed if sig == signal.SIGTERM else True
-                        )
-                    )
+                    return project_journal._ProcessSignalResult(target_existed=True)
+
+                def initial_probe(
+                    process_arg: subprocess.Popen[bytes],
+                ) -> tuple[bool, None]:
+                    self.assertIs(process_arg, process)
+                    events.append(("initial-probe", None))
+                    return initial_group_exists, None
 
                 def probe_group(
                     process_arg: subprocess.Popen[bytes],
@@ -1429,34 +1494,38 @@ class ProjectJournalTests(unittest.TestCase):
                 ):
                     with mock.patch.object(
                         project_journal,
-                        "_discard_selector_output",
+                        "_bound_process_group_exists",
+                        side_effect=initial_probe,
                     ):
                         with mock.patch.object(
                             project_journal,
-                            "_wait_for_bound_process_group_absence",
-                            side_effect=probe_group,
+                            "_discard_selector_output",
                         ):
                             with mock.patch.object(
                                 project_journal,
-                                "_close_selector",
+                                "_wait_for_bound_process_group_absence",
+                                side_effect=probe_group,
                             ):
                                 with mock.patch.object(
                                     project_journal,
-                                    "_wait_for_process_status_without_reaping",
-                                    side_effect=observe_status,
+                                    "_close_selector",
                                 ):
-                                    cleanup_error = project_journal._terminate_process_group_and_reap(
-                                        process,
-                                        selector,
-                                    )
+                                    with mock.patch.object(
+                                        project_journal,
+                                        "_wait_for_process_status_without_reaping",
+                                        side_effect=observe_status,
+                                    ):
+                                        cleanup_error = project_journal._terminate_process_group_and_reap(
+                                            process,
+                                            selector,
+                                        )
 
                 self.assertIsNone(cleanup_error)
                 actual_signals = [event[1] for event in events if event[0] == "signal"]
                 self.assertEqual(actual_signals, expected_signals)
-                expected_events = [
-                    ("signal", signal.SIGTERM),
-                ]
-                if term_target_existed:
+                expected_events = [("initial-probe", None)]
+                if initial_group_exists:
+                    expected_events.append(("signal", signal.SIGTERM))
                     expected_events.append(("probe", None))
                 if group_exists:
                     expected_events.append(("signal", kill_signal))
@@ -1524,16 +1593,21 @@ class ProjectJournalTests(unittest.TestCase):
         ):
             with mock.patch.object(
                 project_journal,
-                "_terminate_process_group_and_reap",
-            ) as cleanup:
-                with self.assertRaises(KeyboardInterrupt):
-                    self.capture_process(
-                        [sys.executable, "-c", "pass"],
-                        timeout_seconds=5,
-                        stdout_limit=1024,
-                    )
+                "_bound_process_group_exists",
+                return_value=(False, None),
+            ):
+                with mock.patch.object(
+                    project_journal,
+                    "_signal_process_group",
+                ) as signal_group:
+                    with self.assertRaises(KeyboardInterrupt):
+                        self.capture_process(
+                            [sys.executable, "-c", "pass"],
+                            timeout_seconds=5,
+                            stdout_limit=1024,
+                        )
 
-        cleanup.assert_not_called()
+        signal_group.assert_not_called()
 
     @unittest.skipUnless(os.name == "posix", "POSIX process-group contract")
     def test_final_reap_interrupt_reports_cleanup_incomplete(self) -> None:
@@ -1554,8 +1628,9 @@ class ProjectJournalTests(unittest.TestCase):
         ):
             with mock.patch.object(
                 project_journal,
-                "_terminate_process_group_and_reap",
-            ) as cleanup:
+                "_bound_process_group_exists",
+                return_value=(False, None),
+            ):
                 with self.assertRaises(KeyboardInterrupt) as raised:
                     self.capture_process(
                         [sys.executable, "-c", "pass"],
@@ -1563,7 +1638,6 @@ class ProjectJournalTests(unittest.TestCase):
                         stdout_limit=1024,
                     )
 
-        cleanup.assert_not_called()
         detail = "\n".join(
             [
                 *getattr(raised.exception, "__notes__", ()),
@@ -1824,8 +1898,9 @@ class ProjectJournalTests(unittest.TestCase):
         def cleanup_then_report(
             process: subprocess.Popen[bytes],
             selector: object,
+            ownership: project_journal._ProcessOwnership,
         ) -> str:
-            actual_error = original_cleanup(process, selector)
+            actual_error = original_cleanup(process, selector, ownership)
             details = [
                 detail
                 for detail in (
@@ -1843,7 +1918,8 @@ class ProjectJournalTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(
                 project_journal.UserError,
-                "cleanup-incomplete: .*simulated unreaped process group",
+                "cleanup-incomplete(?: after exit 0)?: "
+                ".*simulated unreaped process group",
             ):
                 self.capture_process(
                     [sys.executable, "-c", "import os; os.write(1, b'incomplete')"],
@@ -2290,6 +2366,69 @@ class ProjectJournalTests(unittest.TestCase):
         time.sleep(0.4)
         self.assertFalse(marker.exists())
 
+    @unittest.skipUnless(os.name == "posix", "POSIX process-group contract")
+    def test_bounded_capture_zero_exit_cleans_detached_stream_descendant(
+        self,
+    ) -> None:
+        marker = self.root / "zero-exit-child-survived"
+        ready = self.root / "zero-exit-child-started"
+        release = self.root / "zero-exit-child-release"
+        child = self.root / "zero-exit-delayed-marker.py"
+        child.write_text(
+            textwrap.dedent(
+                """\
+                import pathlib
+                import sys
+                import time
+
+                release = pathlib.Path(sys.argv[2])
+                while not release.exists():
+                    time.sleep(0.005)
+                time.sleep(0.3)
+                pathlib.Path(sys.argv[1]).write_text("survived", encoding="utf-8")
+                """
+            ),
+            encoding="utf-8",
+        )
+        producer = self.root / "zero-exit-producer.py"
+        producer.write_text(
+            textwrap.dedent(
+                """\
+                import pathlib
+                import subprocess
+                import sys
+
+                subprocess.Popen(
+                    [sys.executable, sys.argv[1], sys.argv[2], sys.argv[3]],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                pathlib.Path(sys.argv[4]).write_text("started", encoding="utf-8")
+                """
+            ),
+            encoding="utf-8",
+        )
+
+        result = self.capture_process(
+            [
+                sys.executable,
+                str(producer),
+                str(child),
+                str(marker),
+                str(release),
+                str(ready),
+            ],
+            timeout_seconds=5,
+            stdout_limit=1024,
+        )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertTrue(ready.exists())
+        release.write_text("go", encoding="utf-8")
+        time.sleep(0.4)
+        self.assertFalse(marker.exists())
+
     def test_bounded_capture_enforces_stderr_limit(self) -> None:
         producer = self.root / "stderr-producer.py"
         producer.write_text(
@@ -2430,7 +2569,11 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertIn("final raw index revalidation", skill)
         self.assertIn("stays unreaped as the PID/PGID identity fence", skill)
         self.assertIn("status is observed with `WNOWAIT`", skill)
-        self.assertIn("explicit ownership states", skill)
+        self.assertIn("Explicit ownership states", skill)
+        self.assertIn(
+            "requires a POSIX host and rejects other platforms",
+            skill,
+        )
         self.assertIn(
             "no numeric PGID is signalled after that fence is released",
             skill,
@@ -2444,7 +2587,8 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertIn("without following includes", skill)
         self.assertIn("explicit repo-local `core.hooksPath`", skill)
         self.assertIn("revalidates the snapshot identity and SHA-256", skill)
-        self.assertIn("atomically replaces targets relative to the descriptor", skill)
+        self.assertIn("native no-replace or exchange rename semantics", skill)
+        self.assertIn("mismatched exchanged entry is rolled back", skill)
         self.assertIn("every ancestor identity/access policy", skill)
         self.assertIn("allowing timestamp-only transitions", skill)
         self.assertIn(
@@ -2534,7 +2678,8 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertIn("never signals a numeric PGID after the final reap", readme)
         self.assertIn("reports `cleanup-incomplete`", readme)
         self.assertIn("system and global Git configuration", readme)
-        self.assertIn("descriptor-relative atomic replacement", readme)
+        self.assertIn("native no-replace or exchange rename semantics", readme)
+        self.assertIn("bind the complete absolute path", readme)
         self.assertIn("structured `discovery_error`", readme)
         self.assertIn("duplicate-ID group invalidation", readme)
         self.assertIn("without erasing authoritative index adoption", readme)
@@ -2829,7 +2974,7 @@ class ProjectJournalTests(unittest.TestCase):
                         "#!/bin/sh\necho keep-me\n",
                     )
 
-    def test_install_hooks_atomic_replace_does_not_follow_racing_target_symlink(
+    def test_install_hooks_atomic_commit_rejects_racing_target_symlink(
         self,
     ) -> None:
         repo = self.init_repo()
@@ -2845,15 +2990,15 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertEqual(first.returncode, 0, first.stderr)
         outside = self.root / "outside-hook"
         outside.write_text("keep-me\n", encoding="utf-8")
-        actual_replace = os.replace
+        actual_rename = project_journal._rename_hook_entry_with_flag
         raced = False
 
-        def replace_with_target_race(
+        def rename_with_target_race(
+            directory_fd: int,
             source: str,
             destination: str,
             *,
-            src_dir_fd: int,
-            dst_dir_fd: int,
+            exchange: bool,
         ) -> None:
             nonlocal raced
             if destination == "post-merge" and not raced:
@@ -2861,30 +3006,89 @@ class ProjectJournalTests(unittest.TestCase):
                 target = repo / ".githooks/post-merge"
                 target.unlink()
                 target.symlink_to(outside)
-            actual_replace(
+            actual_rename(
+                directory_fd,
                 source,
                 destination,
-                src_dir_fd=src_dir_fd,
-                dst_dir_fd=dst_dir_fd,
+                exchange=exchange,
             )
 
         args = mock.Mock(repo=str(repo))
         with mock.patch.object(
-            project_journal.os,
-            "replace",
-            side_effect=replace_with_target_race,
+            project_journal,
+            "_rename_hook_entry_with_flag",
+            side_effect=rename_with_target_race,
         ):
-            result = project_journal.command_install_hooks(args)
+            with self.assertRaisesRegex(
+                project_journal.UserError,
+                "hook target changed at atomic commit",
+            ):
+                project_journal.command_install_hooks(args)
 
-        self.assertEqual(result, 0)
         self.assertTrue(raced)
         installed = repo / ".githooks/post-merge"
-        self.assertFalse(installed.is_symlink())
-        self.assertIn(
-            project_journal.HOOK_BEGIN,
-            installed.read_text(encoding="utf-8"),
-        )
+        self.assertTrue(installed.is_symlink())
         self.assertEqual(outside.read_text(encoding="utf-8"), "keep-me\n")
+
+    def test_install_hooks_atomic_commit_rejects_racing_regular_target(
+        self,
+    ) -> None:
+        for initially_exists in (False, True):
+            with self.subTest(initially_exists=initially_exists):
+                repo = self.init_repo(f"repo-regular-race-{initially_exists}")
+                configured = run_git(
+                    repo,
+                    "config",
+                    "--local",
+                    "core.hooksPath",
+                    ".githooks",
+                )
+                self.assertEqual(configured.returncode, 0, configured.stderr)
+                if initially_exists:
+                    first = self.run_cli("install-hooks", "--repo", str(repo))
+                    self.assertEqual(first.returncode, 0, first.stderr)
+
+                actual_rename = project_journal._rename_hook_entry_with_flag
+                raced = False
+
+                def rename_with_regular_target_race(
+                    directory_fd: int,
+                    source: str,
+                    destination: str,
+                    *,
+                    exchange: bool,
+                ) -> None:
+                    nonlocal raced
+                    if destination == "post-merge" and not raced:
+                        raced = True
+                        target = repo / ".githooks/post-merge"
+                        if target.exists():
+                            target.unlink()
+                        target.write_text("racing installer\n", encoding="utf-8")
+                    actual_rename(
+                        directory_fd,
+                        source,
+                        destination,
+                        exchange=exchange,
+                    )
+
+                args = mock.Mock(repo=str(repo))
+                with mock.patch.object(
+                    project_journal,
+                    "_rename_hook_entry_with_flag",
+                    side_effect=rename_with_regular_target_race,
+                ):
+                    with self.assertRaisesRegex(
+                        project_journal.UserError,
+                        "hook target changed at atomic commit",
+                    ):
+                        project_journal.command_install_hooks(args)
+
+                self.assertTrue(raced)
+                self.assertEqual(
+                    (repo / ".githooks/post-merge").read_text(encoding="utf-8"),
+                    "racing installer\n",
+                )
 
     def test_install_hooks_refuses_intermediate_component_symlink(self) -> None:
         repo = self.init_repo()
@@ -2924,33 +3128,33 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertEqual(first.returncode, 0, first.stderr)
         parent = repo / ".hook-parent"
         moved_parent = repo / ".hook-parent-validated-object"
-        actual_replace = os.replace
+        actual_rename = project_journal._rename_hook_entry_with_flag
         raced = False
 
-        def replace_with_intermediate_race(
+        def rename_with_intermediate_race(
+            directory_fd: int,
             source: str,
             destination: str,
             *,
-            src_dir_fd: int,
-            dst_dir_fd: int,
+            exchange: bool,
         ) -> None:
             nonlocal raced
             if destination == "post-merge" and not raced:
                 raced = True
                 parent.rename(moved_parent)
                 (parent / "hooks").mkdir(parents=True)
-            actual_replace(
+            actual_rename(
+                directory_fd,
                 source,
                 destination,
-                src_dir_fd=src_dir_fd,
-                dst_dir_fd=dst_dir_fd,
+                exchange=exchange,
             )
 
         args = mock.Mock(repo=str(repo))
         with mock.patch.object(
-            project_journal.os,
-            "replace",
-            side_effect=replace_with_intermediate_race,
+            project_journal,
+            "_rename_hook_entry_with_flag",
+            side_effect=rename_with_intermediate_race,
         ):
             with self.assertRaisesRegex(
                 project_journal.UserError,
@@ -2979,33 +3183,33 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertEqual(first.returncode, 0, first.stderr)
         hooks_dir = repo / ".githooks"
         moved_hooks = repo / ".githooks-validated-object"
-        actual_replace = os.replace
+        actual_rename = project_journal._rename_hook_entry_with_flag
         raced = False
 
-        def replace_with_parent_race(
+        def rename_with_parent_race(
+            directory_fd: int,
             source: str,
             destination: str,
             *,
-            src_dir_fd: int,
-            dst_dir_fd: int,
+            exchange: bool,
         ) -> None:
             nonlocal raced
             if destination == "post-merge" and not raced:
                 raced = True
                 hooks_dir.rename(moved_hooks)
                 hooks_dir.mkdir()
-            actual_replace(
+            actual_rename(
+                directory_fd,
                 source,
                 destination,
-                src_dir_fd=src_dir_fd,
-                dst_dir_fd=dst_dir_fd,
+                exchange=exchange,
             )
 
         args = mock.Mock(repo=str(repo))
         with mock.patch.object(
-            project_journal.os,
-            "replace",
-            side_effect=replace_with_parent_race,
+            project_journal,
+            "_rename_hook_entry_with_flag",
+            side_effect=rename_with_parent_race,
         ):
             with self.assertRaisesRegex(
                 project_journal.UserError,
@@ -3020,8 +3224,74 @@ class ProjectJournalTests(unittest.TestCase):
             (moved_hooks / "post-merge").read_text(encoding="utf-8"),
         )
 
-    def test_hook_target_timestamp_only_transition_preserves_identity(self) -> None:
+    def test_install_hooks_detects_racing_allowed_root_replacement(self) -> None:
         repo = self.init_repo()
+        configured = run_git(
+            repo,
+            "config",
+            "--local",
+            "core.hooksPath",
+            ".githooks",
+        )
+        self.assertEqual(configured.returncode, 0, configured.stderr)
+        first = self.run_cli("install-hooks", "--repo", str(repo))
+        self.assertEqual(first.returncode, 0, first.stderr)
+        moved_repo = self.root / "repo-validated-object"
+        actual_rename = project_journal._rename_hook_entry_with_flag
+        raced = False
+
+        def rename_with_root_race(
+            directory_fd: int,
+            source: str,
+            destination: str,
+            *,
+            exchange: bool,
+        ) -> None:
+            nonlocal raced
+            if destination == "post-merge" and not raced:
+                raced = True
+                repo.rename(moved_repo)
+                repo.mkdir()
+            actual_rename(
+                directory_fd,
+                source,
+                destination,
+                exchange=exchange,
+            )
+
+        args = mock.Mock(repo=str(repo))
+        with mock.patch.object(
+            project_journal,
+            "_rename_hook_entry_with_flag",
+            side_effect=rename_with_root_race,
+        ):
+            with self.assertRaisesRegex(
+                project_journal.UserError,
+                "ancestor identity or access policy changed",
+            ):
+                project_journal.command_install_hooks(args)
+
+        self.assertTrue(raced)
+        self.assertFalse((repo / ".githooks/post-merge").exists())
+        self.assertIn(
+            project_journal.HOOK_BEGIN,
+            (moved_repo / ".githooks/post-merge").read_text(encoding="utf-8"),
+        )
+
+    def test_install_hooks_explicitly_rejects_non_posix_platform(self) -> None:
+        plan = project_journal._HookPathPlan(
+            root=self.root,
+            components=(".githooks",),
+        )
+        with mock.patch.object(project_journal.os, "name", "nt"):
+            with self.assertRaisesRegex(
+                project_journal.UserError,
+                "requires POSIX descriptor-relative filesystem primitives",
+            ):
+                project_journal._bind_hook_directory(plan)
+
+    def test_hook_target_timestamp_only_transition_preserves_identity(self) -> None:
+        repo = self.init_repo().resolve()
         configured = run_git(
             repo,
             "config",
@@ -3051,7 +3321,7 @@ class ProjectJournalTests(unittest.TestCase):
     ) -> None:
         for mutation in ("object", "content", "access"):
             with self.subTest(mutation=mutation):
-                repo = self.init_repo(f"repo-target-{mutation}")
+                repo = self.init_repo(f"repo-target-{mutation}").resolve()
                 configured = run_git(
                     repo,
                     "config",

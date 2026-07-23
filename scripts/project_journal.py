@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import dataclasses
 import datetime as dt
 import errno
@@ -142,6 +143,12 @@ class UnsupportedGitVersion(UserError):
     code = "unsupported_git_version"
 
 
+class UnsupportedPlatform(UserError):
+    """The host platform cannot satisfy the helper's safety contract."""
+
+    code = "unsupported_platform"
+
+
 class JournalLimitExceeded(UserError):
     """Journal syntax or validation exceeded a declared semantic budget."""
 
@@ -229,6 +236,7 @@ class _BoundHookDirectory:
     identity: tuple[int, int, int, int]
     parent_fd: int | None
     component: str | None
+    access_policy_required: bool
 
 
 @dataclasses.dataclass(frozen=True)
@@ -326,7 +334,7 @@ class _ProcessOwnership:
 
 
 _GIT_RUNTIME: _GitRuntime | None = None
-_GIT_RUNTIME_ERROR: UnsupportedGitVersion | None = None
+_GIT_RUNTIME_ERROR: UserError | None = None
 
 
 def _file_identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
@@ -589,10 +597,6 @@ def _parse_frontmatter_text(
     deadline_error: str = "journal validation exceeded its shared deadline",
 ) -> dict[str, Any]:
     _check_deadline(deadline, deadline_error)
-    if text.count("\n") + 1 > MAX_FRONTMATTER_LINES:
-        raise JournalLimitExceeded(
-            f"{label}: document exceeds {MAX_FRONTMATTER_LINES} lines"
-        )
     lines = text.splitlines()
     if not lines or lines[0].strip() != "---":
         raise UserError(f"{label}: missing frontmatter")
@@ -600,6 +604,10 @@ def _parse_frontmatter_text(
     end = None
     for index, line in enumerate(lines[1:], start=1):
         _check_deadline(deadline, deadline_error)
+        if index + 1 > MAX_FRONTMATTER_LINES:
+            raise JournalLimitExceeded(
+                f"{label}: frontmatter exceeds {MAX_FRONTMATTER_LINES} lines"
+            )
         if line.strip() == "---":
             end = index
             break
@@ -1026,8 +1034,13 @@ def _discard_selector_output(
 
 
 def _close_selector(selector: selectors.BaseSelector) -> None:
-    for key in list(selector.get_map().values()):
-        _close_selector_stream(selector, key.fileobj)
+    try:
+        mapping = selector.get_map()
+    except (OSError, ValueError):
+        mapping = None
+    if mapping is not None:
+        for key in list(mapping.values()):
+            _close_selector_stream(selector, key.fileobj)
     try:
         selector.close()
     except OSError:
@@ -1062,7 +1075,11 @@ def _bound_process_group_exists(
     except ProcessLookupError:
         return False, None
     except PermissionError:
-        return True, None
+        # Darwin can report EPERM for the already-exited, WNOWAIT-fenced
+        # leader after the last live member leaves the group. Every live
+        # process in a group created by this helper retains the caller's
+        # credentials, so a live member remains signal-probeable.
+        return False, None
     except OSError as exc:
         return True, str(exc)
     return True, None
@@ -1180,16 +1197,22 @@ def _terminate_process_group_and_reap(
     if isinstance(process.returncode, int):
         observed_returncode = process.returncode
     elif os.name == "posix":
-        term_result = _signal_process_group(process, signal.SIGTERM)
-        if term_result.error is not None:
-            issues.append(
-                f"failed to signal bound process group with SIGTERM: "
-                f"{term_result.error}"
-            )
+        group_exists, probe_error = _bound_process_group_exists(process)
+        if probe_error is not None:
+            issues.append(f"failed to probe bound process group: {probe_error}")
+        if group_exists:
+            term_result = _signal_process_group(process, signal.SIGTERM)
+            if term_result.error is not None:
+                issues.append(
+                    f"failed to signal bound process group with SIGTERM: "
+                    f"{term_result.error}"
+                )
+        else:
+            term_result = _ProcessSignalResult(target_existed=False)
         terminate_deadline = time.monotonic() + GIT_PROCESS_TERMINATE_GRACE_SECONDS
         _discard_selector_output(selector, terminate_deadline)
         group_exists = term_result.target_existed
-        probe_error: str | None = None
+        probe_error = None
         if group_exists:
             group_exists, probe_error = _wait_for_bound_process_group_absence(
                 process,
@@ -1406,67 +1429,47 @@ def _capture_bounded_process(
                 operation_deadline,
                 timeout_error,
             )
-            if returncode != 0:
-                try:
-                    ownership.claim_group_cleanup()
-                    cleanup_error = _terminate_process_group_and_reap(
-                        process,
-                        selector,
+            try:
+                ownership.claim_group_cleanup()
+                cleanup_error = _terminate_process_group_and_reap(
+                    process,
+                    selector,
+                    ownership,
+                )
+            except BaseException as cleanup_exc:
+                _close_selector(selector)
+                selector_open = False
+                if ownership.needs_reap:
+                    _annotate_cleanup_interruption(
+                        cleanup_exc,
+                        operation,
+                        "final direct-child reap",
                     )
-                except BaseException as cleanup_exc:
+                else:
                     ownership.abandon_incomplete()
-                    _close_selector(selector)
-                    selector_open = False
                     _annotate_cleanup_interruption(
                         cleanup_exc,
                         operation,
                         "process-group cleanup",
                     )
-                    raise
-                selector_open = False
-                if cleanup_error is not None:
-                    ownership.abandon_incomplete()
-                    child_detail = stderr.decode(
-                        "utf-8",
-                        errors="replace",
-                    ).strip()
-                    detail_suffix = (
-                        f"; bounded child stderr: {child_detail}"
-                        if child_detail
-                        else ""
-                    )
-                    raise UserError(
-                        f"{operation} cleanup-incomplete after exit "
-                        f"{returncode}: {cleanup_error}{detail_suffix}"
-                    )
-                ownership.release()
-            else:
-                if stdout_finish is not None:
-                    stdout_finish()
-                # Entering the final reap permanently releases permission to
-                # signal by numeric PGID. The wait may reap successfully and
-                # then be interrupted before it returns to this frame.
-                try:
-                    ownership.transfer_to_reap(returncode)
-                    reap_error = _reap_after_final_group_signal(
-                        process,
-                        returncode,
-                        operation_deadline,
-                    )
-                except BaseException as reap_exc:
-                    _close_selector(selector)
-                    selector_open = False
-                    _annotate_cleanup_interruption(
-                        reap_exc,
-                        operation,
-                        "final direct-child reap",
-                    )
-                    raise
-                if reap_error is not None:
-                    raise UserError(f"{operation} cleanup-incomplete: {reap_error}")
-                ownership.release()
-                _close_selector(selector)
-                selector_open = False
+                raise
+            selector_open = False
+            if cleanup_error is not None:
+                ownership.abandon_incomplete()
+                child_detail = stderr.decode(
+                    "utf-8",
+                    errors="replace",
+                ).strip()
+                detail_suffix = (
+                    f"; bounded child stderr: {child_detail}" if child_detail else ""
+                )
+                raise UserError(
+                    f"{operation} cleanup-incomplete after exit "
+                    f"{returncode}: {cleanup_error}{detail_suffix}"
+                )
+            ownership.release()
+            if returncode == 0 and stdout_finish is not None:
+                stdout_finish()
         else:
             remaining = operation_deadline - time.monotonic()
             if remaining <= 0:
@@ -1643,6 +1646,12 @@ def _initialize_git_runtime() -> None:
     global _GIT_RUNTIME_ERROR
 
     if _GIT_RUNTIME is not None or _GIT_RUNTIME_ERROR is not None:
+        return
+    if os.name != "posix":
+        _GIT_RUNTIME_ERROR = UnsupportedPlatform(
+            "project_journal.py requires a POSIX host for its bounded process "
+            "and filesystem safety contracts"
+        )
         return
     candidate = shutil.which("git", path=os.environ.get("PATH"))
     if candidate is None:
@@ -2640,11 +2649,13 @@ def _hook_path(repo: pathlib.Path, name: str) -> pathlib.Path:
 def _validate_hook_directory_stat(
     path: pathlib.Path,
     value: os.stat_result,
+    *,
+    require_access_policy: bool = True,
 ) -> tuple[int, int, int, int]:
     if not stat.S_ISDIR(value.st_mode):
         raise UserError(f"hook directory is not a directory: {path}")
     mode = stat.S_IMODE(value.st_mode)
-    if value.st_uid != os.geteuid() or mode & 0o022:
+    if require_access_policy and (value.st_uid != os.geteuid() or mode & 0o022):
         raise UserError(
             f"hook directory must be owned by the current user and not "
             f"group/world writable: {path}"
@@ -2659,9 +2670,15 @@ def _revalidate_hook_directory(binding: _HookDirectoryBinding) -> None:
             descriptor_identity = _validate_hook_directory_stat(
                 ancestor.path,
                 descriptor_stat,
+                require_access_policy=ancestor.access_policy_required,
             )
             if ancestor.parent_fd is None:
-                path_identity = descriptor_identity
+                path_stat = os.stat(ancestor.path, follow_symlinks=False)
+                path_identity = _validate_hook_directory_stat(
+                    ancestor.path,
+                    path_stat,
+                    require_access_policy=ancestor.access_policy_required,
+                )
             else:
                 assert ancestor.component is not None
                 path_stat = os.stat(
@@ -2672,6 +2689,7 @@ def _revalidate_hook_directory(binding: _HookDirectoryBinding) -> None:
                 path_identity = _validate_hook_directory_stat(
                     ancestor.path,
                     path_stat,
+                    require_access_policy=ancestor.access_policy_required,
                 )
         except OSError as exc:
             raise UserError(
@@ -2791,39 +2809,65 @@ def _revalidate_hook_target(
 
 
 def _bind_hook_directory(plan: _HookPathPlan) -> _HookDirectoryBinding:
+    if os.name != "posix":
+        raise UserError(
+            "project journal hook installation requires POSIX descriptor-relative "
+            "filesystem primitives"
+        )
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
     flags |= getattr(os, "O_CLOEXEC", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0)
     opened: list[_BoundHookDirectory] = []
     try:
-        root_fd = os.open(plan.root, flags)
+        if not plan.root.is_absolute() or plan.root.anchor != os.sep:
+            raise UserError(
+                f"allowed hook root is not an absolute POSIX path: {plan.root}"
+            )
+        filesystem_root = pathlib.Path(os.sep)
+        root_fd = os.open(filesystem_root, flags)
         root_identity = _validate_hook_directory_stat(
-            plan.root,
+            filesystem_root,
             os.fstat(root_fd),
+            require_access_policy=False,
         )
         root_path_identity = _validate_hook_directory_stat(
-            plan.root,
-            os.stat(plan.root, follow_symlinks=False),
+            filesystem_root,
+            os.stat(filesystem_root, follow_symlinks=False),
+            require_access_policy=False,
         )
         if root_identity != root_path_identity:
             os.close(root_fd)
-            raise UserError(f"allowed hook root changed while being bound: {plan.root}")
+            raise UserError(
+                f"filesystem root changed while hook path was being bound: "
+                f"{filesystem_root}"
+            )
         opened.append(
             _BoundHookDirectory(
-                path=plan.root,
+                path=filesystem_root,
                 fd=root_fd,
                 identity=root_identity,
                 parent_fd=None,
                 component=None,
+                access_policy_required=False,
             )
         )
         current = opened[0]
-        for component in plan.components:
+        root_components = plan.root.parts[1:]
+        traversal = (
+            *(
+                (component, False, index == len(root_components) - 1)
+                for index, component in enumerate(root_components)
+            ),
+            *((component, True, True) for component in plan.components),
+        )
+        for component, may_create, access_policy_required in traversal:
             component_path = current.path / component
             child_fd: int | None = None
             try:
                 child_fd = os.open(component, flags, dir_fd=current.fd)
             except FileNotFoundError:
+                if not may_create:
+                    raise
                 try:
                     os.mkdir(component, 0o755, dir_fd=current.fd)
                 except FileExistsError:
@@ -2833,6 +2877,7 @@ def _bind_hook_directory(plan: _HookPathPlan) -> _HookDirectoryBinding:
                 child_identity = _validate_hook_directory_stat(
                     component_path,
                     os.fstat(child_fd),
+                    require_access_policy=access_policy_required,
                 )
                 linked_identity = _validate_hook_directory_stat(
                     component_path,
@@ -2841,6 +2886,7 @@ def _bind_hook_directory(plan: _HookPathPlan) -> _HookDirectoryBinding:
                         dir_fd=current.fd,
                         follow_symlinks=False,
                     ),
+                    require_access_policy=access_policy_required,
                 )
                 if child_identity != linked_identity:
                     raise UserError(
@@ -2856,6 +2902,7 @@ def _bind_hook_directory(plan: _HookPathPlan) -> _HookDirectoryBinding:
                 identity=child_identity,
                 parent_fd=current.fd,
                 component=component,
+                access_policy_required=access_policy_required,
             )
             opened.append(current)
     except OSError as exc:
@@ -2923,6 +2970,152 @@ def _write_all(fd: int, content: bytes) -> None:
         offset += written
 
 
+def _rename_hook_entry_with_flag(
+    directory_fd: int,
+    source: str,
+    destination: str,
+    *,
+    exchange: bool,
+) -> None:
+    if os.name != "posix":
+        raise UserError(
+            "atomic hook installation requires POSIX conditional rename support"
+        )
+    library = ctypes.CDLL(None, use_errno=True)
+    source_bytes = os.fsencode(source)
+    destination_bytes = os.fsencode(destination)
+    if sys.platform == "darwin":
+        try:
+            rename_function = library.renameatx_np
+        except AttributeError as exc:
+            raise UserError(
+                "atomic hook installation is unavailable: renameatx_np is missing"
+            ) from exc
+        rename_function.argtypes = (
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        )
+        rename_function.restype = ctypes.c_int
+        flag = 0x00000002 if exchange else 0x00000004
+    else:
+        try:
+            rename_function = library.renameat2
+        except AttributeError as exc:
+            raise UserError(
+                "atomic hook installation is unavailable: renameat2 is missing"
+            ) from exc
+        rename_function.argtypes = (
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        )
+        rename_function.restype = ctypes.c_int
+        flag = 0x00000002 if exchange else 0x00000001
+    ctypes.set_errno(0)
+    result = rename_function(
+        directory_fd,
+        source_bytes,
+        directory_fd,
+        destination_bytes,
+        flag,
+    )
+    if result != 0:
+        error_number = ctypes.get_errno() or errno.EIO
+        raise OSError(
+            error_number,
+            os.strerror(error_number),
+            destination,
+        )
+
+
+def _rollback_hook_exchange(
+    binding: _HookDirectoryBinding,
+    temporary_name: str,
+    target_name: str,
+) -> str | None:
+    try:
+        _rename_hook_entry_with_flag(
+            binding.fd,
+            temporary_name,
+            target_name,
+            exchange=True,
+        )
+        os.fsync(binding.fd)
+    except (OSError, UserError) as exc:
+        return str(exc)
+    return None
+
+
+def _commit_hook_target_atomically(
+    binding: _HookDirectoryBinding,
+    target: _HookTargetSnapshot,
+    temporary_name: str,
+) -> None:
+    if not target.exists:
+        try:
+            _rename_hook_entry_with_flag(
+                binding.fd,
+                temporary_name,
+                target.name,
+                exchange=False,
+            )
+        except FileExistsError as exc:
+            raise UserError(
+                f"hook target changed at atomic commit: {binding.path / target.name}"
+            ) from exc
+        except OSError as exc:
+            if exc.errno in {errno.EEXIST, errno.ENOTEMPTY}:
+                raise UserError(
+                    f"hook target changed at atomic commit: "
+                    f"{binding.path / target.name}"
+                ) from exc
+            raise
+        return
+
+    try:
+        _rename_hook_entry_with_flag(
+            binding.fd,
+            temporary_name,
+            target.name,
+            exchange=True,
+        )
+    except OSError as exc:
+        if exc.errno in {errno.ENOENT, errno.EEXIST, errno.ENOTEMPTY}:
+            raise UserError(
+                f"hook target changed at atomic commit: {binding.path / target.name}"
+            ) from exc
+        raise
+
+    try:
+        displaced, _content = _snapshot_hook_target(binding, temporary_name)
+        expected_displaced = dataclasses.replace(target, name=temporary_name)
+        if displaced != expected_displaced:
+            raise UserError(
+                f"hook target changed at atomic commit: {binding.path / target.name}"
+            )
+    except BaseException as exc:
+        rollback_error = _rollback_hook_exchange(
+            binding,
+            temporary_name,
+            target.name,
+        )
+        if rollback_error is not None:
+            raise UserError(
+                f"hook target changed at atomic commit and rollback was "
+                f"cleanup-incomplete: {rollback_error}"
+            ) from exc
+        raise UserError(
+            f"hook target changed at atomic commit: {binding.path / target.name}"
+        ) from exc
+
+    os.unlink(temporary_name, dir_fd=binding.fd)
+
+
 def _install_hook(
     binding: _HookDirectoryBinding,
     target: _HookTargetSnapshot,
@@ -2947,12 +3140,7 @@ def _install_hook(
             os.close(temporary_fd)
         _revalidate_hook_directory(binding)
         _revalidate_hook_target(binding, target)
-        os.replace(
-            temporary_name,
-            target.name,
-            src_dir_fd=binding.fd,
-            dst_dir_fd=binding.fd,
-        )
+        _commit_hook_target_atomically(binding, target, temporary_name)
         temporary_created = False
         os.fsync(binding.fd)
         _revalidate_hook_directory(binding)
