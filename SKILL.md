@@ -1,6 +1,6 @@
 ---
 name: project-journal
-description: Manage repository project journals across local and remote Codex work, including short `PROJECT_STATE` / `PROJECT_TODO` entrypoints, per-workstream `docs/project_journal/**` notes, ignored generated indexes, local Git hook installation, and Codex-session repo discovery.
+description: Maintain repository project journals and their optional local tooling. Use only when the repo already uses `docs/project_journal/`, repo policy requires this workflow, or a task spans Codex sessions, a PR, or a durable workstream. Require an explicit product need before introducing the first tracker into an unadopted repo. Update the smallest applicable journal layer, preserve squash-merge target-branch semantics, and generate indexes or install hooks only when their workflows need them.
 ---
 
 # Project Journal
@@ -8,22 +8,29 @@ description: Manage repository project journals across local and remote Codex wo
 ## Overview
 
 Keep repo memory lightweight, durable, and low-conflict.
-Use per-workstream journal files under `docs/project_journal/YYYY/MM/` as the default dynamic source of truth for a task, thread, PR, blocker, or handoff.
-Use `PROJECT_STATE` only for stable repo-wide pulse, recovery pointers, and global blockers; use `PROJECT_TODO` only for cross-workstream actionable backlog.
+Treat project journals as an adopted or explicitly justified repo workflow, not as a default bootstrap for every repository.
+Within that workflow, use per-workstream journal files under `docs/project_journal/YYYY/MM/` as the dynamic source of truth for a task, thread, PR, blocker, or handoff.
+Use an existing or explicitly needed `PROJECT_STATE` only for stable repo-wide pulse, recovery pointers, and global blockers; use an existing or explicitly needed `PROJECT_TODO` only for cross-workstream actionable backlog.
 Treat the generated `docs/project_journal/INDEX.md` as a local ignored convenience artifact, not as source of truth.
 
 ## Workflow
 
-1. Treat the docs as the default convention.
+1. Decide whether the workflow applies and whether first adoption is justified.
 - Read the repo `AGENTS.md`, existing docs, and the user request.
-- For repositories, assume `docs/PROJECT_STATE.md` and `docs/PROJECT_TODO.md` should exist as stable entrypoints unless the user explicitly opts out or the repo already has a stronger equivalent tracker.
-- If the repo already uses `docs/project_journal/`, read the relevant entries and optionally regenerate the ignored index before planning.
+- Auto-trigger this skill only when the repo already uses `docs/project_journal/`, repo policy requires project journaling, or the task spans Codex sessions, a PR, or a durable workstream.
+- If a spanning task is the only trigger and the repo has neither an adopted journal nor a policy requirement, treat the trigger as a reason to assess durable state, not as permission to create files.
+- Before introducing the first tracker into an unadopted repo, identify an explicit product need in the user request or established project workflow for repo-owned coordination, recovery, or backlog state. General preference for journaling is not enough.
+- If that need is absent, use the current task, PR, issue, or handoff channel and leave `docs/PROJECT_STATE.md`, `docs/PROJECT_TODO.md`, and `docs/project_journal/` unchanged.
+- If the repo has a stronger equivalent tracker or the user chooses another mechanism, follow it instead.
 
 2. Recover context before planning.
+- If the repo already uses `docs/project_journal/`, read only the relevant workstream entries before planning.
+- Read `PROJECT_STATE` and `PROJECT_TODO` when they exist and are relevant; do not create a missing counterpart merely because one exists.
 - Reuse existing section names, task labels, and terminology.
 - Keep top-level trackers short and stable; do not append ordinary PR/thread changelog noise to `PROJECT_STATE` or `PROJECT_TODO`.
 - Use the bundled helper script when the task is to find repositories recently touched by Codex sessions.
 - Use the bundled helper script to verify journal frontmatter before relying on a migrated journal set.
+- Do not generate the local index merely to read or update one known entry.
 
 ### Helper Script Path
 
@@ -37,14 +44,17 @@ python3 "<loaded-skill-dir>/scripts/project_journal.py" validate --repo <path>
 Use a repo-relative `python3 scripts/project_journal.py ...` command only when the current repo is this skill's source checkout and the script file exists there.
 Do not report the journal validator as unavailable merely because `<target-repo>/scripts/project_journal.py` is missing.
 
-3. Create the right layer when setup is needed.
-- If top-level trackers do not exist yet, create both files in the same task.
-- If the task needs durable per-workstream state, create or update a journal note under `docs/project_journal/YYYY/MM/YYYY-MM-DD-<slug>-<shortid>.md`.
+3. Update the smallest applicable layer automatically.
+- Once the workflow applies and any first-adoption gate is satisfied, update the smallest applicable existing or required layer without waiting for another prompt.
+- For ordinary task, PR, thread, blocker, or handoff state, create or update the relevant journal note under `docs/project_journal/YYYY/MM/YYYY-MM-DD-<slug>-<shortid>.md`.
+- Update or introduce `PROJECT_STATE` only when the repo-wide pulse, recovery path, or a global blocker needs a stable entrypoint.
+- Update or introduce `PROJECT_TODO` only when a cross-workstream actionable backlog needs repo-root visibility.
+- Do not create both top-level files as a pair by default. During first adoption, introduce only the layer justified by the explicit product need.
 - Start from the templates in `references/templates.md`, then adapt to the repo.
 
 4. Update them at the right moments.
 - Early in the task: read them to recover context.
-- Late in the task: sync the new current state, completed work, and next steps into the smallest applicable layer. For ordinary PR/thread/workstream updates, that layer is the relevant per-workstream journal, not the top-level entrypoints.
+- Late in the task: automatically sync the new current state, completed work, and next steps into the smallest applicable layer. For ordinary PR/thread/workstream updates, that layer is the relevant per-workstream journal, not the top-level entrypoints.
 - Update `PROJECT_STATE` only when repo-wide state, recovery pointers, or global blockers change.
 - Update `PROJECT_TODO` only when cross-workstream actionable backlog changes.
 - Before a commit: include relevant doc updates in the same commit when they materially changed.
@@ -64,14 +74,16 @@ Do not report the journal validator as unavailable merely because `<target-repo>
 - Evidence references can be commit hashes, PR links, build URLs, log paths, issue IDs, or links to topic/date subfiles.
 
 7. Split or archive when the top-level docs stop being scannable.
-- Keep `docs/PROJECT_STATE.md` and `docs/PROJECT_TODO.md` as the top-level entrypoints, not as endless dumps.
+- When present, keep `docs/PROJECT_STATE.md` and `docs/PROJECT_TODO.md` as concise top-level entrypoints, not as endless dumps.
 - If either file becomes too long or mixes too many unrelated threads, move durable detail into per-workstream journals under `docs/project_journal/`.
 - If a blocker cluster, closure plan, review bundle, or artifact summary needs more room than the top-level trackers should carry, create a focused note under `docs/notes/` or a comparable nearby location and link it from the trackers.
 - Leave short pointers in the top-level file so a future Codex instance can still recover the active context quickly.
 - Archive stale, completed, or superseded TODO clusters in journals instead of keeping them in the live backlog forever.
 
 8. When migrating an existing repo, update the discovery pointers too.
+- Treat migration as an explicit adoption or maintenance workflow, not as incidental cleanup during an unrelated task.
 - For discovery-driven migrations, first check whether `docs/PROJECT_STATE.md` or `docs/PROJECT_TODO.md` ever existed in git history. Skip repos that never committed either tracker unless the user explicitly asks to start journaling there.
+- Existing tracker history makes a repo a migration candidate; it does not by itself require migration.
 - Treat one Git common dir as one migration target by default. Prefer the canonical checkout or target branch; list feature worktrees separately only when that branch still needs its own tracked journal state before merge.
 - Keep personal, cloud-storage, downloaded-sample, and temporary replay repos out of default migration batches unless the user manually confirms them.
 - Do not stop after splitting `PROJECT_STATE` and `PROJECT_TODO`; search repo-local guidance and documentation indexes for references to project records, `PROJECT_STATE`, `PROJECT_TODO`, and `project_journal`.
@@ -81,9 +93,11 @@ Do not report the journal validator as unavailable merely because `<target-repo>
 - For remote repos, make these guidance updates in the same migration PR/branch after confirming the canonical repo root and worktree layout.
 - For multi-repo migrations or legacy tracker splits, load `references/migration-playbook.md` before editing.
 
-9. Generate local indexes only as convenience artifacts.
-- Use the bundled helper's `generate --repo <path> --output docs/project_journal/INDEX.md --ensure-exclude` command to refresh the local index.
-- Use the bundled helper's `install-hooks --repo <path>` command only when the user wants opt-in local hook refresh for that repo.
+9. Generate local tooling only for the workflow that needs it.
+- Use the bundled helper's `generate --repo <path> --output docs/project_journal/INDEX.md --ensure-exclude` command only when the active workflow needs multi-entry navigation, an explicit index refresh, or an already opted-in hook refresh.
+- Do not regenerate an index on every skill invocation or single-entry update.
+- Use the bundled helper's `install-hooks --repo <path>` command only when the user explicitly wants opt-in local hook refresh for that repo.
+- Treat `discover-repos` output as a candidate report; discovery does not establish adoption or authorize tracker, index, or hook creation.
 - Do not commit `docs/project_journal/INDEX.md`; the helper writes it to `.git/info/exclude`.
 
 10. Keep the signal high.
@@ -94,7 +108,10 @@ Do not report the journal validator as unavailable merely because `<target-repo>
 
 ## Guardrails
 
-- Keep both top-level docs concise and stable, not exhaustive.
+- Do not assume every Joey repository should adopt project journals.
+- Do not bootstrap `PROJECT_STATE`, `PROJECT_TODO`, or `docs/project_journal/` without the first-adoption product-need gate.
+- Do not create a missing top-level companion file solely for symmetry.
+- Keep any top-level tracker concise and stable, not exhaustive.
 - Do not duplicate README, design docs, or PR summaries.
 - Do not invent future work just to fill the files.
 - If the repo has a stronger local convention, follow the repo over this skill.

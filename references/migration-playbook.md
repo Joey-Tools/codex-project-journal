@@ -4,11 +4,16 @@ Use this reference when converting existing repositories from large tracked
 `docs/PROJECT_STATE.md` / `docs/PROJECT_TODO.md` files to short entrypoints plus
 per-workstream journal files. Prefer changing future write behavior over
 performing a second broad file migration.
+Treat this as an explicit adoption or maintenance workflow. Do not start a
+migration merely because a repository belongs to Joey or lacks the current
+journal layout.
 
 ## Candidate Filtering
 
 - Start with the bundled `project_journal.py discover-repos` helper; do not crawl the full
   filesystem.
+- Treat discovery output and historical tracker presence as candidate evidence,
+  not as authorization to introduce or migrate trackers.
 - For each discovered repo, check git history for committed trackers:
   `git log --all -- docs/PROJECT_STATE.md docs/PROJECT_TODO.md`.
 - Skip repos with no tracker history unless the user explicitly asks to start

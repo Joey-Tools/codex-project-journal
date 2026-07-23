@@ -14,6 +14,15 @@ import unittest
 
 SCRIPT = pathlib.Path(__file__).resolve().parents[1] / "scripts" / "project_journal.py"
 SKILL_MD = pathlib.Path(__file__).resolve().parents[1] / "SKILL.md"
+OPENAI_YAML = pathlib.Path(__file__).resolve().parents[1] / "agents" / "openai.yaml"
+TEMPLATES_MD = (
+    pathlib.Path(__file__).resolve().parents[1] / "references" / "templates.md"
+)
+MIGRATION_PLAYBOOK_MD = (
+    pathlib.Path(__file__).resolve().parents[1]
+    / "references"
+    / "migration-playbook.md"
+)
 SPEC = importlib.util.spec_from_file_location("project_journal", SCRIPT)
 assert SPEC is not None
 project_journal = importlib.util.module_from_spec(SPEC)
@@ -260,6 +269,99 @@ class ProjectJournalTests(unittest.TestCase):
         )
         self.assertIn("<target-repo>/scripts/project_journal.py", skill)
         self.assertNotIn("Use `scripts/project_journal.py validate", skill)
+
+    def test_skill_limits_auto_trigger_and_requires_first_adoption_need(self) -> None:
+        skill = SKILL_MD.read_text(encoding="utf-8")
+        frontmatter = skill.split("---", 2)[1]
+
+        self.assertIn("Use only when the repo already uses", frontmatter)
+        self.assertIn("repo policy requires this workflow", frontmatter)
+        self.assertIn(
+            "a task spans Codex sessions, a PR, or a durable workstream",
+            frontmatter,
+        )
+        self.assertIn(
+            "Require an explicit product need before introducing the first tracker",
+            frontmatter,
+        )
+        self.assertIn(
+            "treat the trigger as a reason to assess durable state, not as permission to create files",
+            skill,
+        )
+        self.assertIn(
+            "leave `docs/PROJECT_STATE.md`, `docs/PROJECT_TODO.md`, and `docs/project_journal/` unchanged",
+            skill,
+        )
+        self.assertNotIn("Treat the docs as the default convention", skill)
+        self.assertNotIn(
+            "assume `docs/PROJECT_STATE.md` and `docs/PROJECT_TODO.md` should exist",
+            skill,
+        )
+        self.assertNotIn(
+            "If top-level trackers do not exist yet, create both files",
+            skill,
+        )
+        self.assertNotIn("Keep both top-level docs", skill)
+        self.assertIn(
+            "When present, keep `docs/PROJECT_STATE.md` and `docs/PROJECT_TODO.md`",
+            skill,
+        )
+
+    def test_skill_updates_smallest_layer_and_keeps_local_tools_conditional(
+        self,
+    ) -> None:
+        skill = SKILL_MD.read_text(encoding="utf-8")
+
+        self.assertIn(
+            "update the smallest applicable existing or required layer without waiting for another prompt",
+            skill,
+        )
+        self.assertIn(
+            "Do not create both top-level files as a pair by default",
+            skill,
+        )
+        self.assertIn(
+            "only when the active workflow needs multi-entry navigation",
+            skill,
+        )
+        self.assertIn(
+            "only when the user explicitly wants opt-in local hook refresh",
+            skill,
+        )
+        self.assertIn(
+            "In squash-merge repos, tracked journal docs should describe the target branch after the PR lands",
+            skill,
+        )
+
+    def test_skill_metadata_and_references_preserve_adoption_gate(self) -> None:
+        openai_yaml = OPENAI_YAML.read_text(encoding="utf-8")
+        templates = TEMPLATES_MD.read_text(encoding="utf-8")
+        migration = MIGRATION_PLAYBOOK_MD.read_text(encoding="utf-8")
+
+        self.assertIn("$project-journal", openai_yaml)
+        self.assertIn("smallest applicable journal layer", openai_yaml)
+        self.assertIn(
+            "repo has adopted or requires the workflow",
+            openai_yaml,
+        )
+        self.assertIn("task has an explicit durable-state need", openai_yaml)
+        self.assertNotIn("ignored local journal index", openai_yaml)
+        self.assertIn(
+            "explicit product need justifies first adoption",
+            templates,
+        )
+        self.assertIn(
+            "Do not create both top-level trackers",
+            templates,
+        )
+        self.assertIn(
+            "Treat discovery output and historical tracker presence as candidate evidence",
+            migration,
+        )
+        self.assertIn(
+            "migration merely because a repository belongs to Joey",
+            migration,
+        )
 
     def test_validate_rejects_broken_supersedes_link(self) -> None:
         repo = self.init_repo()
