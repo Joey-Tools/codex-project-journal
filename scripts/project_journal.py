@@ -49,8 +49,16 @@ MAX_TRACKED_JOURNAL_INDEX_BYTES = 4 * 1024 * 1024
 MAX_TRACKED_JOURNAL_RECORDS = 4096
 MAX_TRACKED_JOURNAL_BLOB_BYTES = 1024 * 1024
 MAX_TRACKED_JOURNAL_TOTAL_BYTES = 16 * 1024 * 1024
+MAX_CAT_FILE_BATCH_HEADER_BYTES = 128
+MAX_TRACKED_JOURNAL_BATCH_INPUT_BYTES = MAX_TRACKED_JOURNAL_RECORDS * (64 + 1)
+MAX_TRACKED_JOURNAL_BATCH_STDOUT_BYTES = (
+    MAX_TRACKED_JOURNAL_TOTAL_BYTES
+    + MAX_TRACKED_JOURNAL_RECORDS * (MAX_CAT_FILE_BATCH_HEADER_BYTES + 2)
+)
 MAX_GIT_STDERR_BYTES = 64 * 1024
 GIT_INDEX_SNAPSHOT_TIMEOUT_SECONDS = 10.0
+GIT_CAT_FILE_BATCH_TIMEOUT_SECONDS = 10.0
+GIT_ADOPTION_VALIDATION_TIMEOUT_SECONDS = 10.0
 GIT_PROCESS_TERMINATE_GRACE_SECONDS = 0.25
 GIT_PROCESS_KILL_DRAIN_SECONDS = 1.0
 PROCESS_READ_CHUNK_BYTES = 64 * 1024
@@ -100,6 +108,10 @@ class UserError(Exception):
     """A clean user-facing error."""
 
 
+class _ProcessIdentityLost(UserError):
+    """The direct child was reaped before group cleanup could finish."""
+
+
 @dataclasses.dataclass(frozen=True)
 class JournalEntry:
     path: pathlib.Path
@@ -135,6 +147,12 @@ class IndexJournalBlob:
     rel_path: str
 
 
+@dataclasses.dataclass(frozen=True)
+class _ProcessSignalResult:
+    target_existed: bool
+    error: str | None = None
+
+
 def _git_environment() -> dict[str, str]:
     env = {key: os.environ[key] for key in GIT_ENV_PASSTHROUGH if key in os.environ}
     env.update(SAFE_GIT_ENV)
@@ -162,19 +180,6 @@ def _run_git(repo: pathlib.Path, *args: str) -> subprocess.CompletedProcess[str]
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-    )
-
-
-def _run_git_bytes(
-    repo: pathlib.Path, *args: str
-) -> subprocess.CompletedProcess[bytes]:
-    return subprocess.run(
-        _git_command(repo, *args),
-        check=False,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env=_git_environment(),
     )
 
 
@@ -409,6 +414,149 @@ def _parse_index_journal_blobs(output: bytes) -> list[IndexJournalBlob]:
     return parser.blobs()
 
 
+class _CatFileBatchStreamParser:
+    def __init__(
+        self,
+        blobs: list[IndexJournalBlob],
+        *,
+        max_records: int = MAX_TRACKED_JOURNAL_RECORDS,
+        max_blob_bytes: int = MAX_TRACKED_JOURNAL_BLOB_BYTES,
+        max_total_bytes: int = MAX_TRACKED_JOURNAL_TOTAL_BYTES,
+        max_header_bytes: int = MAX_CAT_FILE_BATCH_HEADER_BYTES,
+    ) -> None:
+        if min(max_records, max_blob_bytes, max_total_bytes, max_header_bytes) < 0:
+            raise ValueError("cat-file batch limits must not be negative")
+        if len(blobs) > max_records:
+            raise UserError(f"tracked journal blob batch exceeds {max_records} records")
+
+        requested_oids: list[bytes] = []
+        for blob in blobs:
+            try:
+                raw_oid = blob.oid.encode("ascii")
+            except UnicodeEncodeError as exc:
+                raise UserError(
+                    f"{blob.rel_path}: invalid requested index blob object id"
+                ) from exc
+            if not INDEX_OID_RE.fullmatch(raw_oid):
+                raise UserError(
+                    f"{blob.rel_path}: invalid requested index blob object id"
+                )
+            requested_oids.append(raw_oid)
+
+        self._blobs = tuple(blobs)
+        self._requested_oids = tuple(requested_oids)
+        self._max_blob_bytes = max_blob_bytes
+        self._max_total_bytes = max_total_bytes
+        self._max_header_bytes = max_header_bytes
+        self._pending = bytearray()
+        self._contents: list[bytes] = []
+        self._expected_size: int | None = None
+        self._total_bytes = 0
+        self._finished = False
+
+    def _parse_header(self, header: bytes) -> None:
+        blob = self._blobs[len(self._contents)]
+        expected_oid = self._requested_oids[len(self._contents)]
+        fields = header.split(b" ")
+        if len(fields) not in {2, 3} or any(not field for field in fields):
+            raise UserError(f"{blob.rel_path}: malformed git cat-file batch header")
+        if fields[0] != expected_oid:
+            raise UserError(
+                f"{blob.rel_path}: git cat-file batch returned a mismatched object id"
+            )
+        if len(fields) == 2:
+            if fields[1] == b"missing":
+                raise UserError(f"{blob.rel_path}: index blob is missing")
+            raise UserError(f"{blob.rel_path}: malformed git cat-file batch header")
+
+        _raw_oid, object_type, raw_size = fields
+        if object_type != b"blob":
+            raise UserError(
+                f"{blob.rel_path}: git cat-file batch returned "
+                f"object type {object_type.decode('ascii', errors='replace')!r}, "
+                "expected 'blob'"
+            )
+        if not raw_size.isdigit():
+            raise UserError(f"{blob.rel_path}: invalid git cat-file batch object size")
+        size = int(raw_size)
+        if size > self._max_blob_bytes:
+            raise UserError(
+                f"{blob.rel_path}: index blob exceeds {self._max_blob_bytes} bytes"
+            )
+        if self._total_bytes + size > self._max_total_bytes:
+            raise UserError(
+                f"tracked journal blobs exceed {self._max_total_bytes} total bytes"
+            )
+        self._total_bytes += size
+        self._expected_size = size
+
+    def feed(self, chunk: bytes) -> None:
+        if self._finished:
+            raise RuntimeError("cannot feed a finished Git cat-file batch parser")
+        self._pending.extend(chunk)
+        while True:
+            if len(self._contents) == len(self._blobs):
+                if self._pending:
+                    raise UserError(
+                        "git cat-file batch returned unexpected extra response data"
+                    )
+                return
+
+            if self._expected_size is None:
+                terminator = self._pending.find(b"\n")
+                if terminator < 0:
+                    if len(self._pending) > self._max_header_bytes:
+                        blob = self._blobs[len(self._contents)]
+                        raise UserError(
+                            f"{blob.rel_path}: git cat-file batch header exceeds "
+                            f"{self._max_header_bytes} bytes"
+                        )
+                    return
+                if terminator > self._max_header_bytes:
+                    blob = self._blobs[len(self._contents)]
+                    raise UserError(
+                        f"{blob.rel_path}: git cat-file batch header exceeds "
+                        f"{self._max_header_bytes} bytes"
+                    )
+                header = bytes(self._pending[:terminator])
+                del self._pending[: terminator + 1]
+                self._parse_header(header)
+
+            assert self._expected_size is not None
+            framed_size = self._expected_size + 1
+            if len(self._pending) < framed_size:
+                return
+            if self._pending[self._expected_size : framed_size] != b"\n":
+                blob = self._blobs[len(self._contents)]
+                raise UserError(
+                    f"{blob.rel_path}: malformed git cat-file batch content framing"
+                )
+            self._contents.append(bytes(self._pending[: self._expected_size]))
+            del self._pending[:framed_size]
+            self._expected_size = None
+
+    def finish(self) -> None:
+        if self._finished:
+            return
+        if self._expected_size is not None:
+            blob = self._blobs[len(self._contents)]
+            raise UserError(f"{blob.rel_path}: truncated git cat-file batch content")
+        if self._pending:
+            blob = self._blobs[len(self._contents)]
+            raise UserError(f"{blob.rel_path}: truncated git cat-file batch header")
+        if len(self._contents) != len(self._blobs):
+            raise UserError("git cat-file batch returned fewer records than requested")
+        self._finished = True
+
+    def contents(self) -> list[bytes]:
+        if not self._finished:
+            raise RuntimeError("Git cat-file batch parser has not reached EOF")
+        return list(self._contents)
+
+    def request_data(self) -> bytes:
+        return b"".join(oid + b"\n" for oid in self._requested_oids)
+
+
 def _close_selector_stream(
     selector: selectors.BaseSelector,
     stream: Any,
@@ -438,6 +586,9 @@ def _discard_selector_output(
         if not events:
             continue
         for key, _mask in events:
+            if key.data == "stdin":
+                _close_selector_stream(selector, key.fileobj)
+                continue
             try:
                 chunk = os.read(key.fd, PROCESS_READ_CHUNK_BYTES)
             except BlockingIOError:
@@ -460,7 +611,7 @@ def _close_selector(selector: selectors.BaseSelector) -> None:
 def _signal_process_group(
     process: subprocess.Popen[bytes],
     sig: int,
-) -> None:
+) -> _ProcessSignalResult:
     try:
         if os.name == "posix":
             os.killpg(process.pid, sig)
@@ -468,38 +619,205 @@ def _signal_process_group(
             process.terminate()
         else:
             process.kill()
-    except OSError:
-        pass
+    except ProcessLookupError:
+        return _ProcessSignalResult(target_existed=False)
+    except OSError as exc:
+        return _ProcessSignalResult(target_existed=True, error=str(exc))
+    return _ProcessSignalResult(target_existed=True)
+
+
+def _bound_process_group_exists(
+    process: subprocess.Popen[bytes],
+) -> tuple[bool, str | None]:
+    if os.name != "posix":
+        raise RuntimeError("process-group probes require POSIX")
+    try:
+        os.killpg(process.pid, 0)
+    except ProcessLookupError:
+        return False, None
+    except PermissionError:
+        return True, None
+    except OSError as exc:
+        return True, str(exc)
+    return True, None
+
+
+def _wait_for_bound_process_group_absence(
+    process: subprocess.Popen[bytes],
+    deadline: float,
+) -> tuple[bool, str | None]:
+    while True:
+        exists, error = _bound_process_group_exists(process)
+        if error is not None or not exists:
+            return exists, error
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return True, None
+        time.sleep(min(0.01, remaining))
+
+
+def _waitid_returncode(result: Any) -> int:
+    if result.si_code == os.CLD_EXITED:
+        return int(result.si_status)
+    if result.si_code in {os.CLD_KILLED, os.CLD_DUMPED}:
+        return -int(result.si_status)
+    raise UserError(f"unexpected POSIX child status code {result.si_code!r}")
+
+
+def _wait_for_process_status_without_reaping(
+    process: subprocess.Popen[bytes],
+    deadline: float,
+    timeout_error: str,
+) -> int:
+    if not all(
+        hasattr(os, name)
+        for name in ("waitid", "WNOWAIT", "WEXITED", "WNOHANG", "P_PID")
+    ):
+        raise UserError("POSIX WNOWAIT status observation is unavailable")
+    options = os.WEXITED | os.WNOHANG | os.WNOWAIT
+    while True:
+        try:
+            result = os.waitid(os.P_PID, process.pid, options)
+        except ChildProcessError as exc:
+            raise _ProcessIdentityLost(
+                "direct child identity was lost before final process-group cleanup"
+            ) from exc
+        except InterruptedError:
+            result = None
+        except OSError as exc:
+            raise UserError(
+                f"failed to observe direct child without reaping: {exc}"
+            ) from exc
+        if result is not None:
+            if int(result.si_pid) != process.pid:
+                raise _ProcessIdentityLost(
+                    "POSIX status observation returned a mismatched child"
+                )
+            return _waitid_returncode(result)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise UserError(timeout_error)
+        time.sleep(min(0.01, remaining))
+
+
+def _reap_after_final_group_signal(
+    process: subprocess.Popen[bytes],
+    expected_returncode: int | None,
+    deadline: float,
+) -> str | None:
+    try:
+        returncode = process.wait(timeout=max(0.0, deadline - time.monotonic()))
+    except subprocess.TimeoutExpired:
+        return "direct child did not exit before the cleanup deadline"
+    except OSError as exc:
+        return f"failed to reap direct child: {exc}"
+    if expected_returncode is not None and returncode != expected_returncode:
+        return (
+            "reaped direct-child status changed from "
+            f"{expected_returncode} to {returncode}"
+        )
+    return None
+
+
+def _annotate_cleanup_interruption(
+    exc: BaseException,
+    operation: str,
+    phase: str,
+) -> None:
+    detail = f"{operation} cleanup-incomplete: {phase} was interrupted"
+    add_note = getattr(exc, "add_note", None)
+    if callable(add_note):
+        add_note(detail)
+        return
+    existing = str(exc).strip()
+    exc.args = (f"{existing}; {detail}" if existing else detail,)
 
 
 def _terminate_process_group_and_reap(
     process: subprocess.Popen[bytes],
     selector: selectors.BaseSelector,
-) -> None:
-    _signal_process_group(process, signal.SIGTERM)
-    terminate_deadline = time.monotonic() + GIT_PROCESS_TERMINATE_GRACE_SECONDS
-    _discard_selector_output(selector, terminate_deadline)
+) -> str | None:
+    """Clean up while the unreaped direct child still fences its PID/PGID."""
+    issues: list[str] = []
+    observed_returncode: int | None = None
 
-    kill_signal = getattr(signal, "SIGKILL", signal.SIGTERM)
-    _signal_process_group(process, kill_signal)
-    kill_deadline = time.monotonic() + GIT_PROCESS_KILL_DRAIN_SECONDS
-    _discard_selector_output(selector, kill_deadline)
-    _close_selector(selector)
-
-    try:
-        process.wait(timeout=max(0.0, kill_deadline - time.monotonic()))
-    except subprocess.TimeoutExpired:
+    if os.name == "posix":
+        term_result = _signal_process_group(process, signal.SIGTERM)
+        if term_result.error is not None:
+            issues.append(
+                f"failed to signal bound process group with SIGTERM: "
+                f"{term_result.error}"
+            )
+        terminate_deadline = time.monotonic() + GIT_PROCESS_TERMINATE_GRACE_SECONDS
+        _discard_selector_output(selector, terminate_deadline)
+        group_exists = term_result.target_existed
+        probe_error: str | None = None
+        if group_exists:
+            group_exists, probe_error = _wait_for_bound_process_group_absence(
+                process,
+                terminate_deadline,
+            )
+        if probe_error is not None:
+            issues.append(f"failed to probe bound process group: {probe_error}")
+        if group_exists:
+            kill_signal = getattr(signal, "SIGKILL", signal.SIGTERM)
+            kill_result = _signal_process_group(process, kill_signal)
+            if kill_result.error is not None:
+                issues.append(
+                    f"failed to signal bound process group with SIGKILL: "
+                    f"{kill_result.error}"
+                )
+        kill_deadline = time.monotonic() + GIT_PROCESS_KILL_DRAIN_SECONDS
+        _discard_selector_output(selector, kill_deadline)
         try:
-            process.kill()
-            process.wait(timeout=GIT_PROCESS_KILL_DRAIN_SECONDS)
-        except (OSError, subprocess.TimeoutExpired):
-            pass
+            observed_returncode = _wait_for_process_status_without_reaping(
+                process,
+                kill_deadline,
+                "direct child did not exit after final process-group signal",
+            )
+        except _ProcessIdentityLost as exc:
+            issues.append(str(exc))
+        except UserError as exc:
+            issues.append(str(exc))
+    else:
+        term_result = _signal_process_group(process, signal.SIGTERM)
+        if term_result.error is not None:
+            issues.append(f"failed to terminate direct child: {term_result.error}")
+        terminate_deadline = time.monotonic() + GIT_PROCESS_TERMINATE_GRACE_SECONDS
+        _discard_selector_output(selector, terminate_deadline)
+        try:
+            observed_returncode = process.wait(
+                timeout=max(0.0, terminate_deadline - time.monotonic())
+            )
+        except subprocess.TimeoutExpired:
+            kill_signal = getattr(signal, "SIGKILL", signal.SIGTERM)
+            kill_result = _signal_process_group(process, kill_signal)
+            if kill_result.error is not None:
+                issues.append(f"failed to kill direct child: {kill_result.error}")
+            kill_deadline = time.monotonic() + GIT_PROCESS_KILL_DRAIN_SECONDS
+            _discard_selector_output(selector, kill_deadline)
+        except OSError as exc:
+            issues.append(f"failed to reap direct child: {exc}")
+            kill_deadline = terminate_deadline
+        else:
+            kill_deadline = terminate_deadline
+
+    _close_selector(selector)
+    reap_error = _reap_after_final_group_signal(
+        process,
+        observed_returncode,
+        kill_deadline,
+    )
+    if reap_error is not None:
+        issues.append(reap_error)
+    return "; ".join(issues) or None
 
 
 def _capture_bounded_process(
     argv: list[str],
     *,
     env: dict[str, str],
+    stdin_data: bytes | None = None,
     timeout_seconds: float,
     stdout_limit: int,
     stderr_limit: int,
@@ -508,33 +826,43 @@ def _capture_bounded_process(
     stdout_overflow_error: str,
     stderr_overflow_error: str,
     timeout_error: str,
+    operation: str = "Git index snapshot",
+    deadline: float | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
     if timeout_seconds <= 0:
         raise ValueError("timeout_seconds must be positive")
     if stdout_limit < 0 or stderr_limit < 0:
         raise ValueError("stream limits must not be negative")
 
-    deadline = time.monotonic() + timeout_seconds
+    started_at = time.monotonic()
+    operation_deadline = started_at + timeout_seconds
+    if deadline is not None:
+        operation_deadline = min(operation_deadline, deadline)
+    if operation_deadline <= started_at:
+        raise UserError(timeout_error)
     try:
         selector = selectors.DefaultSelector()
     except OSError as exc:
-        raise UserError(f"failed to create Git index snapshot selector: {exc}") from exc
+        raise UserError(f"failed to create {operation} selector: {exc}") from exc
     stdout = bytearray()
     stderr = bytearray()
-    stdout_finished = False
+    stdin_offset = 0
     try:
         process = subprocess.Popen(
             argv,
             env=env,
-            stdin=subprocess.DEVNULL,
+            stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             start_new_session=os.name == "posix",
         )
     except OSError as exc:
         _close_selector(selector)
-        raise UserError(f"failed to start Git index snapshot: {exc}") from exc
+        raise UserError(f"failed to start {operation}: {exc}") from exc
 
+    leader_identity_held = os.name == "posix"
+    direct_child_needs_cleanup = True
+    selector_open = True
     try:
         assert process.stdout is not None
         assert process.stderr is not None
@@ -551,24 +879,64 @@ def _capture_bounded_process(
                 )
             except OSError as exc:
                 raise UserError(
-                    f"failed to configure Git index snapshot {stream_name}: {exc}"
+                    f"failed to configure {operation} {stream_name}: {exc}"
+                ) from exc
+
+        if stdin_data is not None:
+            assert process.stdin is not None
+            try:
+                if stdin_data:
+                    os.set_blocking(process.stdin.fileno(), False)
+                    selector.register(
+                        process.stdin,
+                        selectors.EVENT_WRITE,
+                        data="stdin",
+                    )
+                else:
+                    process.stdin.close()
+            except OSError as exc:
+                raise UserError(
+                    f"failed to configure {operation} stdin: {exc}"
                 ) from exc
 
         while selector.get_map():
-            remaining = deadline - time.monotonic()
+            remaining = operation_deadline - time.monotonic()
             if remaining <= 0:
                 raise UserError(timeout_error)
             try:
                 events = selector.select(remaining)
             except OSError as exc:
                 raise UserError(
-                    f"failed to monitor Git index snapshot streams: {exc}"
+                    f"failed to monitor {operation} streams: {exc}"
                 ) from exc
             if not events:
                 continue
             for key, _mask in events:
-                if time.monotonic() >= deadline:
+                if time.monotonic() >= operation_deadline:
                     raise UserError(timeout_error)
+                if key.data == "stdin":
+                    assert stdin_data is not None
+                    try:
+                        written = os.write(
+                            key.fd,
+                            stdin_data[
+                                stdin_offset : stdin_offset + PROCESS_READ_CHUNK_BYTES
+                            ],
+                        )
+                    except BlockingIOError:
+                        continue
+                    except OSError as exc:
+                        raise UserError(
+                            f"failed to write {operation} stdin: {exc}"
+                        ) from exc
+                    if written <= 0:
+                        raise UserError(
+                            f"failed to write {operation} stdin: short write"
+                        )
+                    stdin_offset += written
+                    if stdin_offset == len(stdin_data):
+                        _close_selector_stream(selector, key.fileobj)
+                    continue
                 target = stdout if key.data == "stdout" else stderr
                 limit = stdout_limit if key.data == "stdout" else stderr_limit
                 available = limit - len(target)
@@ -579,14 +947,10 @@ def _capture_bounded_process(
                     continue
                 except OSError as exc:
                     raise UserError(
-                        f"failed to read Git index snapshot {key.data}: {exc}"
+                        f"failed to read {operation} {key.data}: {exc}"
                     ) from exc
                 if not chunk:
                     _close_selector_stream(selector, key.fileobj)
-                    if key.data == "stdout" and not stdout_finished:
-                        if stdout_finish is not None:
-                            stdout_finish()
-                        stdout_finished = True
                     continue
                 if len(chunk) > available:
                     if key.data == "stdout":
@@ -596,20 +960,115 @@ def _capture_bounded_process(
                     stdout_feed(chunk)
                 target.extend(chunk)
 
-        if not stdout_finished and stdout_finish is not None:
-            stdout_finish()
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise UserError(timeout_error)
-        try:
-            returncode = process.wait(timeout=remaining)
-        except subprocess.TimeoutExpired as exc:
-            raise UserError(timeout_error) from exc
-    except BaseException:
-        _terminate_process_group_and_reap(process, selector)
+        if os.name == "posix":
+            returncode = _wait_for_process_status_without_reaping(
+                process,
+                operation_deadline,
+                timeout_error,
+            )
+            if returncode != 0:
+                leader_identity_held = False
+                direct_child_needs_cleanup = False
+                try:
+                    cleanup_error = _terminate_process_group_and_reap(
+                        process,
+                        selector,
+                    )
+                except BaseException as cleanup_exc:
+                    _close_selector(selector)
+                    selector_open = False
+                    _annotate_cleanup_interruption(
+                        cleanup_exc,
+                        operation,
+                        "process-group cleanup",
+                    )
+                    raise
+                selector_open = False
+                if cleanup_error is not None:
+                    raise UserError(
+                        f"{operation} cleanup-incomplete after exit "
+                        f"{returncode}: {cleanup_error}"
+                    )
+            else:
+                if stdout_finish is not None:
+                    stdout_finish()
+                # Entering the final reap permanently releases permission to
+                # signal by numeric PGID. The wait may reap successfully and
+                # then be interrupted before it returns to this frame.
+                leader_identity_held = False
+                direct_child_needs_cleanup = False
+                try:
+                    reap_error = _reap_after_final_group_signal(
+                        process,
+                        returncode,
+                        operation_deadline,
+                    )
+                except BaseException as reap_exc:
+                    _close_selector(selector)
+                    selector_open = False
+                    _annotate_cleanup_interruption(
+                        reap_exc,
+                        operation,
+                        "final direct-child reap",
+                    )
+                    raise
+                if reap_error is not None:
+                    raise UserError(f"{operation} cleanup-incomplete: {reap_error}")
+                _close_selector(selector)
+                selector_open = False
+        else:
+            remaining = operation_deadline - time.monotonic()
+            if remaining <= 0:
+                raise UserError(timeout_error)
+            try:
+                returncode = process.wait(timeout=remaining)
+            except subprocess.TimeoutExpired as exc:
+                raise UserError(timeout_error) from exc
+            direct_child_needs_cleanup = False
+            if returncode == 0 and stdout_finish is not None:
+                stdout_finish()
+            _close_selector(selector)
+            selector_open = False
+    except _ProcessIdentityLost as exc:
+        leader_identity_held = False
+        direct_child_needs_cleanup = False
+        if selector_open:
+            _close_selector(selector)
+            selector_open = False
+        raise UserError(
+            f"{exc}; {operation} cleanup-incomplete: process-group cleanup "
+            "was skipped after leader identity loss"
+        ) from exc
+    except BaseException as exc:
+        cleanup_error: str | None = None
+        if leader_identity_held or (os.name != "posix" and direct_child_needs_cleanup):
+            leader_identity_held = False
+            direct_child_needs_cleanup = False
+            try:
+                cleanup_error = _terminate_process_group_and_reap(process, selector)
+            except BaseException as cleanup_exc:
+                _close_selector(selector)
+                selector_open = False
+                _annotate_cleanup_interruption(
+                    cleanup_exc,
+                    operation,
+                    "process-group cleanup",
+                )
+                raise
+            selector_open = False
+        elif selector_open:
+            _close_selector(selector)
+            selector_open = False
+        if cleanup_error is not None:
+            cleanup_message = f"{operation} cleanup-incomplete: {cleanup_error}"
+            if isinstance(exc, UserError):
+                raise UserError(f"{exc}; {cleanup_message}") from exc
+            if isinstance(exc, Exception):
+                raise UserError(f"{exc}; {cleanup_message}") from exc
+            add_note = getattr(exc, "add_note", None)
+            if add_note is not None:
+                add_note(cleanup_message)
         raise
-    else:
-        _close_selector(selector)
 
     return subprocess.CompletedProcess(
         argv,
@@ -621,6 +1080,8 @@ def _capture_bounded_process(
 
 def _tracked_index_journal_snapshot(
     repo: pathlib.Path,
+    *,
+    deadline: float | None = None,
 ) -> tuple[bytes, list[IndexJournalBlob]]:
     parser = _IndexStageStreamParser()
     command = _git_command(
@@ -630,6 +1091,14 @@ def _tracked_index_journal_snapshot(
         "-z",
         "--",
         JOURNAL_ROOT.as_posix(),
+    )
+    timeout_error = (
+        "tracked journal adoption validation exceeded its shared deadline"
+        if deadline is not None
+        else (
+            "tracked journal index snapshot timed out after "
+            f"{GIT_INDEX_SNAPSHOT_TIMEOUT_SECONDS:g} seconds"
+        )
     )
     result = _capture_bounded_process(
         command,
@@ -646,10 +1115,8 @@ def _tracked_index_journal_snapshot(
         stderr_overflow_error=(
             f"git ls-files stderr exceeds {MAX_GIT_STDERR_BYTES} bytes"
         ),
-        timeout_error=(
-            "tracked journal index snapshot timed out after "
-            f"{GIT_INDEX_SNAPSHOT_TIMEOUT_SECONDS:g} seconds"
-        ),
+        timeout_error=timeout_error,
+        deadline=deadline,
     )
     if result.returncode != 0:
         detail = (
@@ -666,34 +1133,63 @@ def _tracked_index_journal_blobs(repo: pathlib.Path) -> list[IndexJournalBlob]:
     return blobs
 
 
-def _read_index_blob(repo: pathlib.Path, blob: IndexJournalBlob) -> bytes:
-    size_result = _run_git_bytes(repo, "cat-file", "-s", blob.oid)
-    if size_result.returncode != 0:
-        detail = (
-            size_result.stderr.decode("utf-8", errors="replace").strip()
-            or "object size lookup failed"
-        )
-        raise UserError(f"{blob.rel_path}: failed to inspect index blob: {detail}")
-    raw_size = size_result.stdout.strip()
-    if not raw_size.isdigit():
-        raise UserError(f"{blob.rel_path}: invalid index blob size")
-    size = int(raw_size)
-    if size > MAX_TRACKED_JOURNAL_BLOB_BYTES:
-        raise UserError(
-            f"{blob.rel_path}: index blob exceeds "
-            f"{MAX_TRACKED_JOURNAL_BLOB_BYTES} bytes"
-        )
+def _read_index_blobs_batch(
+    repo: pathlib.Path,
+    blobs: list[IndexJournalBlob],
+    *,
+    timeout_seconds: float = GIT_CAT_FILE_BATCH_TIMEOUT_SECONDS,
+    deadline: float | None = None,
+) -> list[bytes]:
+    if not blobs:
+        return []
 
-    content_result = _run_git_bytes(repo, "cat-file", "blob", blob.oid)
-    if content_result.returncode != 0:
-        detail = (
-            content_result.stderr.decode("utf-8", errors="replace").strip()
-            or "blob read failed"
+    parser = _CatFileBatchStreamParser(blobs)
+    request_data = parser.request_data()
+    if len(request_data) > MAX_TRACKED_JOURNAL_BATCH_INPUT_BYTES:
+        raise UserError(
+            "tracked journal blob batch request exceeds "
+            f"{MAX_TRACKED_JOURNAL_BATCH_INPUT_BYTES} bytes"
         )
-        raise UserError(f"{blob.rel_path}: failed to read index blob: {detail}")
-    if len(content_result.stdout) != size:
-        raise UserError(f"{blob.rel_path}: index blob size changed while reading")
-    return content_result.stdout
+    stdout_limit = min(
+        MAX_TRACKED_JOURNAL_TOTAL_BYTES,
+        len(blobs) * MAX_TRACKED_JOURNAL_BLOB_BYTES,
+    ) + len(blobs) * (MAX_CAT_FILE_BATCH_HEADER_BYTES + 2)
+    stdout_limit = min(
+        stdout_limit,
+        MAX_TRACKED_JOURNAL_BATCH_STDOUT_BYTES,
+    )
+    command = _git_command(repo, "cat-file", "--batch")
+    timeout_error = (
+        "tracked journal adoption validation exceeded its shared deadline"
+        if deadline is not None
+        else f"git cat-file batch timed out after {timeout_seconds:g} seconds"
+    )
+    result = _capture_bounded_process(
+        command,
+        env=_git_environment(),
+        stdin_data=request_data,
+        timeout_seconds=timeout_seconds,
+        stdout_limit=stdout_limit,
+        stderr_limit=MAX_GIT_STDERR_BYTES,
+        stdout_feed=parser.feed,
+        stdout_finish=parser.finish,
+        stdout_overflow_error=(
+            f"git cat-file batch stdout exceeds {stdout_limit} bytes"
+        ),
+        stderr_overflow_error=(
+            f"git cat-file batch stderr exceeds {MAX_GIT_STDERR_BYTES} bytes"
+        ),
+        timeout_error=timeout_error,
+        operation="Git cat-file batch",
+        deadline=deadline,
+    )
+    if result.returncode != 0:
+        detail = (
+            result.stderr.decode("utf-8", errors="replace").strip()
+            or "git cat-file batch failed"
+        )
+        raise UserError(f"failed to read tracked journal index blobs: {detail}")
+    return parser.contents()
 
 
 def _is_generated_index_blob(content: bytes) -> bool:
@@ -736,21 +1232,26 @@ def _load_entries(repo: pathlib.Path) -> tuple[list[JournalEntry], list[str]]:
 
 def _load_entries_from_index(
     repo: pathlib.Path,
+    *,
+    timeout_seconds: float = GIT_ADOPTION_VALIDATION_TIMEOUT_SECONDS,
 ) -> tuple[list[JournalEntry], list[str], int]:
+    if timeout_seconds <= 0:
+        raise ValueError("timeout_seconds must be positive")
     entries: list[JournalEntry] = []
     issues: list[str] = []
     non_generated_count = 0
-    total_bytes = 0
-    initial_index, blobs = _tracked_index_journal_snapshot(repo)
+    validation_deadline = time.monotonic() + timeout_seconds
+    initial_index, blobs = _tracked_index_journal_snapshot(
+        repo,
+        deadline=validation_deadline,
+    )
+    contents = _read_index_blobs_batch(
+        repo,
+        blobs,
+        deadline=validation_deadline,
+    )
 
-    for blob in blobs:
-        content = _read_index_blob(repo, blob)
-        total_bytes += len(content)
-        if total_bytes > MAX_TRACKED_JOURNAL_TOTAL_BYTES:
-            raise UserError(
-                "tracked journal blobs exceed "
-                f"{MAX_TRACKED_JOURNAL_TOTAL_BYTES} total bytes"
-            )
+    for blob, content in zip(blobs, contents):
         if _is_generated_index_blob(content):
             continue
 
@@ -774,7 +1275,10 @@ def _load_entries_from_index(
             )
         )
 
-    final_index, _ = _tracked_index_journal_snapshot(repo)
+    final_index, _ = _tracked_index_journal_snapshot(
+        repo,
+        deadline=validation_deadline,
+    )
     if final_index != initial_index:
         raise UserError("tracked journal Git index changed during validation")
 
@@ -1316,6 +1820,29 @@ def _is_excluded(repo: pathlib.Path, rel: str) -> bool:
     return rel in exclude.read_text(encoding="utf-8", errors="replace").splitlines()
 
 
+def _discover_adoption_status(repo: pathlib.Path) -> dict[str, Any]:
+    try:
+        adoption = _tracked_journal_adoption(repo)
+    except UserError as exc:
+        return {
+            "adoption_status": "inconclusive",
+            "adoption_error": {
+                "code": "adoption_check_failed",
+                "message": str(exc),
+            },
+            "tracked_journal_adopted": None,
+            "tracked_non_generated_journal_count": None,
+            "valid_tracked_journal_count": None,
+        }
+    return {
+        "adoption_status": (
+            "adopted" if adoption["tracked_journal_adopted"] else "unadopted"
+        ),
+        "adoption_error": None,
+        **adoption,
+    }
+
+
 def _discover_repos(codex_home: pathlib.Path, since_days: int) -> list[dict[str, Any]]:
     sessions = codex_home / "sessions"
     if not sessions.exists():
@@ -1353,7 +1880,7 @@ def _discover_repos(codex_home: pathlib.Path, since_days: int) -> list[dict[str,
     for root, row in sorted(seen.items(), key=lambda item: item[0].as_posix()):
         journal_root = root / JOURNAL_ROOT
         index_rel = DEFAULT_INDEX.as_posix()
-        adoption = _tracked_journal_adoption(root)
+        adoption = _discover_adoption_status(root)
         row.update(
             {
                 "has_journal_dir": journal_root.is_dir(),
@@ -1379,7 +1906,8 @@ def command_discover_repos(args: argparse.Namespace) -> int:
     for row in rows:
         print(
             f"{row['repo']}\tlast_seen={row['last_seen']}\t"
-            f"journals={row['journal_count']}\thooks={row['hooks_installed']}"
+            f"journals={row['journal_count']}\thooks={row['hooks_installed']}\t"
+            f"adoption={row['adoption_status']}"
         )
     return 0
 
