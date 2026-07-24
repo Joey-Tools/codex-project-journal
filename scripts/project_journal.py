@@ -414,16 +414,119 @@ class _DeferredTerminationState:
         runtime = self.signal_runtime
         if runtime is None:
             raise RuntimeError("deferred termination signal runtime is missing")
-        self.phase = "terminal-masking"
-        terminal_mask = runtime.pthread_sigmask(
-            runtime.sig_block,
-            set(self.managed_signals),
-        )
+        self.phase = "terminal-mask-query"
+        try:
+            terminal_mask = runtime.pthread_sigmask(runtime.sig_block, set())
+        except BaseException:
+            self.phase = "terminal-mask-failed"
+            raise
         self.terminal_mask = terminal_mask
         self.terminal_signals = tuple(
             signum for signum in self.managed_signals if signum not in terminal_mask
         )
+        self.phase = "terminal-masking"
+        try:
+            runtime.pthread_sigmask(
+                runtime.sig_block,
+                set(self.managed_signals),
+            )
+        except BaseException:
+            self.phase = "terminal-mask-failed"
+            raise
         self.phase = "terminal-masked"
+
+    def retry_terminal_mask_after_cleanup(self) -> None:
+        if self.phase != "terminal-mask-failed":
+            raise RuntimeError(
+                f"cannot retry deferred terminal mask from phase {self.phase!r}"
+            )
+        runtime = self.signal_runtime
+        if runtime is None:
+            raise RuntimeError("deferred termination signal runtime is missing")
+        self.phase = "terminal-mask-retry"
+        try:
+            if self.terminal_mask is None:
+                terminal_mask = runtime.pthread_sigmask(runtime.sig_block, set())
+                self.terminal_mask = terminal_mask
+                self.terminal_signals = tuple(
+                    signum
+                    for signum in self.managed_signals
+                    if signum not in terminal_mask
+                )
+            runtime.pthread_sigmask(
+                runtime.sig_block,
+                set(self.managed_signals),
+            )
+        except BaseException:
+            self.phase = "terminal-mask-failed"
+            raise
+        self.phase = "terminal-masked"
+
+    def restore_handlers_after_terminal_mask_failure(self) -> None:
+        global _ACTIVE_DEFERRED_TERMINATION
+
+        if self.phase != "terminal-mask-failed":
+            raise RuntimeError(
+                "terminal-mask failure handler restoration requires "
+                f"phase 'terminal-mask-failed', got {self.phase!r}"
+            )
+        self.phase = "restoring-handlers-mask-unknown"
+        restoration_error: BaseException | None = None
+        for signum, previous in reversed(tuple(self.previous_handlers.items())):
+            try:
+                signal.signal(signum, previous)
+            except BaseException as exc:
+                if restoration_error is None:
+                    restoration_error = exc
+                else:
+                    add_note = getattr(restoration_error, "add_note", None)
+                    if add_note is not None:
+                        add_note(
+                            f"handler restoration for {_signal_name(signum)} "
+                            f"also failed: {exc}"
+                        )
+            else:
+                del self.previous_handlers[signum]
+        _ACTIVE_DEFERRED_TERMINATION = None
+        self.phase = "handlers-restored-mask-unknown"
+        if restoration_error is not None:
+            raise restoration_error.with_traceback(restoration_error.__traceback__)
+
+    def restore_mask_after_terminal_mask_failure(self) -> int | None:
+        global _ACTIVE_DEFERRED_TERMINATION
+
+        if self.phase != "handlers-restored-mask-unknown":
+            raise RuntimeError(
+                "terminal-mask failure mask restoration requires "
+                f"phase 'handlers-restored-mask-unknown', got {self.phase!r}"
+            )
+        runtime = self.signal_runtime
+        if runtime is None:
+            raise RuntimeError("deferred termination signal runtime is missing")
+        restore_mask = set(
+            self.terminal_mask if self.terminal_mask is not None else self.entry_mask
+        )
+        # A handler that could not be restored must remain blocked rather than
+        # silently consuming another signal through this state after it is no
+        # longer active.
+        restore_mask.update(self.previous_handlers)
+        _ACTIVE_DEFERRED_TERMINATION = None
+        self.phase = "unmasking-after-terminal-mask-failure"
+        try:
+            runtime.pthread_sigmask(runtime.sig_setmask, restore_mask)
+        except UnsupportedPlatform:
+            self.phase = "mask-restore-failed"
+            raise
+        except BaseException:
+            self.phase = "complete"
+            raise
+        self.phase = "complete"
+        signum = self.pending_signal
+        if signum is None or self.previous_handlers:
+            return None
+        signal.raise_signal(signum)
+        # A restored custom handler can return. Do not then report success.
+        return 128 + signum
 
     def restore_handlers_masked(self, *, capture_pending: bool = True) -> None:
         global _ACTIVE_DEFERRED_TERMINATION
@@ -529,32 +632,73 @@ def _report_deferred_termination(
         )
 
 
+def _merge_terminal_error(
+    primary: BaseException | None,
+    secondary: BaseException,
+    label: str,
+) -> BaseException:
+    if primary is None:
+        return secondary
+    _add_exception_detail(primary, f"{label}: {secondary}")
+    return primary
+
+
+def _add_exception_detail(error: BaseException, detail: object) -> None:
+    text = str(detail)
+    add_note = getattr(error, "add_note", None)
+    if callable(add_note):
+        add_note(text)
+        return
+    existing = getattr(error, "__notes__", ())
+    notes = (
+        [note for note in existing if isinstance(note, str)]
+        if isinstance(existing, (list, tuple))
+        else []
+    )
+    notes = notes[: MAX_DEFERRED_SIGNAL_REPORT_DETAILS - 1]
+    notes.append(text)
+    try:
+        error.__notes__ = notes
+    except (AttributeError, TypeError):
+        pass
+
+
 def _run_with_deferred_termination(action: Callable[[], Any]) -> Any:
+    global _ACTIVE_DEFERRED_TERMINATION
+
     state = _DeferredTerminationState()
     result: Any = None
     interruption: BaseException | None = None
     runtime_cleanup_issue: str | None = None
-    with state:
-        try:
-            result = action()
-        except BaseException as exc:
-            interruption = exc
-        if interruption is None:
+    terminal_error: BaseException | None = None
+    propagation_status: int | None = None
+    reported_signal: int | None = None
+    try:
+        with state:
             try:
-                state.raise_if_pending()
+                result = action()
             except BaseException as exc:
                 interruption = exc
-        elif state.pending_signal is not None and state.phase == "armed":
-            state.phase = "draining"
+            if interruption is None:
+                try:
+                    state.raise_if_pending()
+                except BaseException as exc:
+                    interruption = exc
+            elif state.pending_signal is not None and state.phase == "armed":
+                state.phase = "draining"
+    except BaseException as exc:
+        if state.phase != "terminal-mask-failed":
+            raise
+        terminal_error = exc
 
     # One protected action owns one complete Git-runtime lifetime. Terminal
     # cleanup is unconditional, so a signal generated after the last synchronous
     # pending check but before the atomic mask restore still reaches an already
     # safe runtime state.
-    terminal_error: BaseException | None = None
-    propagation_status: int | None = None
     try:
         runtime_cleanup_issue = _cleanup_git_runtime_at_terminal()
+        if state.phase == "terminal-mask-failed":
+            state.retry_terminal_mask_after_cleanup()
         state._capture_pending_masked()
         state.restore_handlers_masked()
         reported_signal = state.pending_signal
@@ -572,38 +716,83 @@ def _run_with_deferred_termination(action: Callable[[], Any]) -> Any:
                 runtime_cleanup_issue,
             )
     except BaseException as exc:
-        terminal_error = exc
+        terminal_error = _merge_terminal_error(
+            terminal_error,
+            exc,
+            "terminal convergence also failed",
+        )
     finally:
+        if state.phase == "terminal-mask-failed":
+            try:
+                state.restore_handlers_after_terminal_mask_failure()
+            except BaseException as exc:
+                terminal_error = _merge_terminal_error(
+                    terminal_error,
+                    exc,
+                    "best-safe handler restoration also failed",
+                )
+            if (
+                reported_signal is None
+                and state.pending_signal is not None
+                and state.phase == "handlers-restored-mask-unknown"
+            ):
+                try:
+                    _report_deferred_termination(
+                        state,
+                        interruption,
+                        runtime_cleanup_issue,
+                    )
+                except BaseException as exc:
+                    terminal_error = _merge_terminal_error(
+                        terminal_error,
+                        exc,
+                        "deferred-signal reporting also failed",
+                    )
+                reported_signal = state.pending_signal
+            if state.phase == "handlers-restored-mask-unknown":
+                try:
+                    propagation_status = (
+                        state.restore_mask_after_terminal_mask_failure()
+                    )
+                except BaseException as exc:
+                    terminal_error = _merge_terminal_error(
+                        terminal_error,
+                        exc,
+                        "best-safe mask restoration or propagation also failed",
+                    )
         if state.phase == "terminal-masked":
             try:
                 state.restore_handlers_masked(capture_pending=False)
             except BaseException as exc:
-                if terminal_error is None:
-                    terminal_error = exc
-                else:
-                    add_note = getattr(terminal_error, "add_note", None)
-                    if add_note is not None:
-                        add_note(f"handler restoration also failed: {exc}")
+                terminal_error = _merge_terminal_error(
+                    terminal_error,
+                    exc,
+                    "handler restoration also failed",
+                )
         if state.phase == "handlers-restored-masked":
             try:
                 propagation_status = state.restore_mask_and_propagate(
                     capture_pending=terminal_error is None,
                 )
             except BaseException as exc:
-                if terminal_error is None:
-                    terminal_error = exc
-                else:
-                    add_note = getattr(terminal_error, "add_note", None)
-                    if add_note is not None:
-                        add_note(f"signal propagation also failed: {exc}")
+                terminal_error = _merge_terminal_error(
+                    terminal_error,
+                    exc,
+                    "signal propagation also failed",
+                )
+        _ACTIVE_DEFERRED_TERMINATION = None
 
     if runtime_cleanup_issue is not None and state.pending_signal is None:
-        if interruption is None:
+        if terminal_error is not None:
+            terminal_error = _merge_terminal_error(
+                terminal_error,
+                UserError(runtime_cleanup_issue),
+                "runtime cleanup also failed",
+            )
+        elif interruption is None:
             interruption = UserError(runtime_cleanup_issue)
         else:
-            add_note = getattr(interruption, "add_note", None)
-            if add_note is not None:
-                add_note(runtime_cleanup_issue)
+            _add_exception_detail(interruption, runtime_cleanup_issue)
 
     if propagation_status is not None:
         return propagation_status
@@ -6129,6 +6318,13 @@ def main(argv: list[str] | None = None) -> int:
         return int(_run_with_deferred_termination(dispatch))
     except UserError as exc:
         print(f"error: {exc}", file=sys.stderr)
+        for detail in getattr(exc, "__notes__", ())[
+            :MAX_DEFERRED_SIGNAL_REPORT_DETAILS
+        ]:
+            print(
+                f"note: {_bounded_signal_report_detail(detail)}",
+                file=sys.stderr,
+            )
         return 1
 
 

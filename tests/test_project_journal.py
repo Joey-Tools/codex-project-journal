@@ -3323,6 +3323,229 @@ class ProjectJournalTests(unittest.TestCase):
                 action.assert_not_called()
                 cleanup.assert_not_called()
 
+    @unittest.skipUnless(
+        os.name == "posix"
+        and hasattr(signal, "pthread_sigmask")
+        and hasattr(signal, "sigpending"),
+        "POSIX deferred termination mask contract",
+    )
+    def test_terminal_mask_failure_still_cleans_runtime_and_restores_state(
+        self,
+    ) -> None:
+        handled = signal.SIGTERM
+        actual_runtime = project_journal._load_posix_signal_runtime()
+        original_handler = signal.getsignal(handled)
+        original_mask = {
+            int(value) for value in signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        }
+        old_runtime = project_journal._GIT_RUNTIME
+        old_error = project_journal._GIT_RUNTIME_ERROR
+        runtime = self.make_fake_git_runtime("terminal-mask-failure")
+        runtime_locator = pathlib.Path(runtime.snapshot_owner.name)
+        events: list[str] = []
+        managed_block_attempts = 0
+
+        def custom_handler(_signum: int, _frame: object) -> None:
+            events.append("custom-handler")
+
+        def fail_first_terminal_block(
+            how: int,
+            signals: set[int],
+        ) -> set[int]:
+            nonlocal managed_block_attempts
+            if how == actual_runtime.sig_block and signals == {handled}:
+                managed_block_attempts += 1
+                if managed_block_attempts == 2:
+                    events.append("terminal-mask-failed")
+                    raise project_journal.UnsupportedPlatform("terminal block failed")
+                if managed_block_attempts == 3:
+                    events.append("terminal-mask-retry")
+            return actual_runtime.pthread_sigmask(how, signals)
+
+        wrapped_runtime = project_journal._PosixSignalRuntime(
+            pthread_sigmask=fail_first_terminal_block,
+            sigpending=actual_runtime.sigpending,
+            sigwait=actual_runtime.sigwait,
+            sig_block=actual_runtime.sig_block,
+            sig_setmask=actual_runtime.sig_setmask,
+        )
+        actual_cleanup = project_journal._cleanup_git_runtime_at_terminal
+
+        def cleanup_runtime() -> str | None:
+            events.append("runtime-cleanup")
+            return actual_cleanup()
+
+        action = mock.Mock(return_value=17)
+        signal.signal(handled, custom_handler)
+        project_journal._GIT_RUNTIME = runtime
+        project_journal._GIT_RUNTIME_ERROR = None
+        try:
+            with mock.patch.object(
+                project_journal,
+                "_load_posix_signal_runtime",
+                return_value=wrapped_runtime,
+            ):
+                with mock.patch.object(
+                    project_journal,
+                    "_termination_signals",
+                    return_value=(handled,),
+                ):
+                    with mock.patch.object(
+                        project_journal,
+                        "_cleanup_git_runtime_at_terminal",
+                        side_effect=cleanup_runtime,
+                    ) as cleanup:
+                        with self.assertRaisesRegex(
+                            project_journal.UnsupportedPlatform,
+                            "terminal block failed",
+                        ):
+                            project_journal._run_with_deferred_termination(action)
+
+            action.assert_called_once_with()
+            cleanup.assert_called_once_with()
+            self.assertEqual(
+                events,
+                [
+                    "terminal-mask-failed",
+                    "runtime-cleanup",
+                    "terminal-mask-retry",
+                ],
+            )
+            self.assertFalse(runtime_locator.exists())
+            self.assertIsNone(project_journal._GIT_RUNTIME)
+            self.assertIsNone(project_journal._ACTIVE_DEFERRED_TERMINATION)
+            self.assertIs(signal.getsignal(handled), custom_handler)
+            current_mask = {
+                int(value) for value in signal.pthread_sigmask(signal.SIG_BLOCK, set())
+            }
+            self.assertEqual(current_mask, original_mask)
+        finally:
+            if runtime_locator.exists():
+                runtime.snapshot_owner.cleanup()
+            project_journal._GIT_RUNTIME = old_runtime
+            project_journal._GIT_RUNTIME_ERROR = old_error
+            signal.signal(handled, original_handler)
+            signal.pthread_sigmask(signal.SIG_SETMASK, original_mask)
+
+    @unittest.skipUnless(
+        os.name == "posix"
+        and hasattr(signal, "pthread_sigmask")
+        and hasattr(signal, "sigpending"),
+        "POSIX deferred termination mask contract",
+    )
+    def test_persistent_terminal_mask_failure_uses_best_safe_restoration(
+        self,
+    ) -> None:
+        handled = signal.SIGTERM
+        actual_runtime = project_journal._load_posix_signal_runtime()
+        original_handler = signal.getsignal(handled)
+        original_mask = {
+            int(value) for value in signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        }
+        managed_block_attempts = 0
+
+        def custom_handler(_signum: int, _frame: object) -> None:
+            raise AssertionError("unexpected signal delivery")
+
+        def fail_terminal_blocks(
+            how: int,
+            signals: set[int],
+        ) -> set[int]:
+            nonlocal managed_block_attempts
+            if how == actual_runtime.sig_block and signals == {handled}:
+                managed_block_attempts += 1
+                if managed_block_attempts >= 2:
+                    raise project_journal.UnsupportedPlatform(
+                        "persistent terminal block failure"
+                    )
+            return actual_runtime.pthread_sigmask(how, signals)
+
+        wrapped_runtime = project_journal._PosixSignalRuntime(
+            pthread_sigmask=fail_terminal_blocks,
+            sigpending=actual_runtime.sigpending,
+            sigwait=actual_runtime.sigwait,
+            sig_block=actual_runtime.sig_block,
+            sig_setmask=actual_runtime.sig_setmask,
+        )
+
+        signal.signal(handled, custom_handler)
+        try:
+            with mock.patch.object(
+                project_journal,
+                "_load_posix_signal_runtime",
+                return_value=wrapped_runtime,
+            ):
+                with mock.patch.object(
+                    project_journal,
+                    "_termination_signals",
+                    return_value=(handled,),
+                ):
+                    with mock.patch.object(
+                        project_journal,
+                        "_cleanup_git_runtime_at_terminal",
+                        return_value=None,
+                    ) as cleanup:
+                        with self.assertRaisesRegex(
+                            project_journal.UnsupportedPlatform,
+                            "persistent terminal block failure",
+                        ):
+                            project_journal._run_with_deferred_termination(lambda: 19)
+
+            cleanup.assert_called_once_with()
+            self.assertEqual(managed_block_attempts, 3)
+            self.assertIsNone(project_journal._ACTIVE_DEFERRED_TERMINATION)
+            self.assertIs(signal.getsignal(handled), custom_handler)
+            current_mask = {
+                int(value) for value in signal.pthread_sigmask(signal.SIG_BLOCK, set())
+            }
+            self.assertEqual(current_mask, original_mask)
+        finally:
+            signal.signal(handled, original_handler)
+            signal.pthread_sigmask(signal.SIG_SETMASK, original_mask)
+
+    def test_main_reports_cleanup_locator_without_exception_add_note(
+        self,
+    ) -> None:
+        cleanup_issue = (
+            "Git runtime snapshot cleanup-incomplete; retained locator "
+            "/tmp/project-journal-command-error"
+        )
+        parser = mock.Mock()
+
+        def fail_command(_args: object) -> int:
+            raise project_journal.UserError("command rejected")
+
+        parser.parse_args.return_value = mock.Mock(func=fail_command)
+        stderr = io.StringIO()
+        with mock.patch.object(project_journal.UserError, "add_note", None):
+            with mock.patch.object(
+                project_journal,
+                "_initialize_git_runtime",
+                return_value=None,
+            ):
+                with mock.patch.object(
+                    project_journal,
+                    "build_parser",
+                    return_value=parser,
+                ):
+                    with mock.patch.object(
+                        project_journal,
+                        "_cleanup_git_runtime_at_terminal",
+                        return_value=cleanup_issue,
+                    ) as cleanup:
+                        with mock.patch.object(
+                            project_journal.sys,
+                            "stderr",
+                            stderr,
+                        ):
+                            status = project_journal.main([])
+
+        self.assertEqual(status, 1)
+        cleanup.assert_called_once_with()
+        parser.parse_args.assert_called_once_with([])
+        self.assertIn("error: command rejected", stderr.getvalue())
+        self.assertIn(f"note: {cleanup_issue}", stderr.getvalue())
+
     def test_normal_main_invocations_reinitialize_after_terminal_cleanup(
         self,
     ) -> None:
