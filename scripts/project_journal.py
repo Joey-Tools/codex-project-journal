@@ -312,6 +312,7 @@ def _run_with_deferred_termination(action: Callable[[], Any]) -> Any:
     result: Any = None
     interruption: BaseException | None = None
     runtime_cleanup_issue: str | None = None
+    runtime_cleanup_attempted = False
     with state:
         try:
             result = action()
@@ -325,7 +326,15 @@ def _run_with_deferred_termination(action: Callable[[], Any]) -> Any:
         elif state.pending_signal is not None and state.phase == "armed":
             state.phase = "draining"
         if state.pending_signal is not None:
+            runtime_cleanup_attempted = True
             runtime_cleanup_issue = _cleanup_git_runtime_for_termination()
+
+    # A managed signal can arrive while __exit__ restores the prior handlers.
+    # Its handler still records the request, but the in-context cleanup decision
+    # has already passed. Commit that late request to the same cleanup contract
+    # before reporting and restoring its original propagation semantics.
+    if state.pending_signal is not None and not runtime_cleanup_attempted:
+        runtime_cleanup_issue = _cleanup_git_runtime_for_termination()
 
     if state.pending_signal is not None:
         _report_deferred_termination(
@@ -384,6 +393,7 @@ class _ProcessSignalResult:
 class _GitRuntime:
     executable: pathlib.Path
     source_executable: pathlib.Path
+    launcher_kind: str
     version: tuple[int, int, int]
     digest: str
     file_identity: tuple[int, int, int, int, int, int]
@@ -395,6 +405,7 @@ class _GitRuntime:
 class _GitLaunchCopy:
     executable: pathlib.Path
     directory: pathlib.Path
+    source_argv0: pathlib.Path
     cleanup_safe: bool = dataclasses.field(default=False, init=False, repr=False)
 
     def mark_cleanup_safe(self) -> None:
@@ -1080,6 +1091,7 @@ def _prepare_git_runtime_launch(
             _GitLaunchCopy(
                 executable=directory / "git",
                 directory=directory,
+                source_argv0=runtime.source_executable,
             ),
             "Git launch preparation",
             active_error,
@@ -1314,6 +1326,7 @@ def _prepare_git_runtime_launch(
         return _GitLaunchCopy(
             executable=executable,
             directory=directory,
+            source_argv0=runtime.source_executable,
         )
     except OSError as exc:
         error = UnsupportedGitVersion(
@@ -1368,7 +1381,7 @@ def _fixed_git_executable() -> pathlib.Path:
 def _git_command(repo: pathlib.Path, *args: str) -> list[str]:
     runtime = _require_git_runtime()
     return [
-        str(runtime.executable),
+        str(runtime.source_executable),
         "--no-pager",
         "--no-optional-locks",
         *SAFE_GIT_CONFIG_ARGS,
@@ -2486,8 +2499,11 @@ def _capture_bounded_process_with_launch(
     try:
         try:
             _check_deadline(operation_deadline, timeout_error)
+            child_argv = (
+                [str(launch.source_argv0), *argv[1:]] if launch is not None else argv
+            )
             process = subprocess.Popen(
-                argv,
+                child_argv,
                 executable=(str(launch.executable) if launch is not None else None),
                 env=env,
                 stdin=(
@@ -2756,11 +2772,30 @@ def _capture_bounded_process_with_launch(
             launch.mark_cleanup_safe()
 
     return subprocess.CompletedProcess(
-        argv,
+        child_argv,
         returncode,
         bytes(stdout),
         bytes(stderr),
     )
+
+
+def _git_launcher_kind(header: bytes) -> str:
+    if header.startswith(b"#!"):
+        return "script-wrapper"
+    if header.startswith(b"\x7fELF"):
+        return "native"
+    if header[:4] in {
+        b"\xfe\xed\xfa\xce",
+        b"\xce\xfa\xed\xfe",
+        b"\xfe\xed\xfa\xcf",
+        b"\xcf\xfa\xed\xfe",
+        b"\xca\xfe\xba\xbe",
+        b"\xbe\xba\xfe\xca",
+        b"\xca\xfe\xba\xbf",
+        b"\xbf\xba\xfe\xca",
+    }:
+        return "native"
+    return "unsupported-format"
 
 
 def _snapshot_git_executable(
@@ -2773,6 +2808,7 @@ def _snapshot_git_executable(
     str,
     tuple[int, int, int, int, int, int],
     tuple[int, int, int, int, int],
+    str,
     tempfile.TemporaryDirectory[str],
 ]:
     no_follow = _required_open_flag("O_NOFOLLOW")
@@ -2818,12 +2854,15 @@ def _snapshot_git_executable(
             destination_fd = os.open(snapshot, destination_flags, 0o600)
             digest = hashlib.sha256()
             copied = 0
+            header = bytearray()
             try:
                 while True:
                     _check_deadline(deadline, deadline_error)
                     chunk = os.read(source_fd, PROCESS_READ_CHUNK_BYTES)
                     if not chunk:
                         break
+                    if len(header) < 8:
+                        header.extend(chunk[: 8 - len(header)])
                     copied += len(chunk)
                     if copied > MAX_GIT_EXECUTABLE_BYTES:
                         raise OSError(
@@ -2932,6 +2971,7 @@ def _snapshot_git_executable(
             digest.hexdigest(),
             _file_identity(destination_stat),
             _directory_identity(directory_stat),
+            _git_launcher_kind(bytes(header)),
             owner,
         )
     except BaseException:
@@ -2993,6 +3033,7 @@ def _initialize_git_runtime() -> None:
             digest,
             snapshot_identity,
             directory_identity,
+            launcher_kind,
             snapshot_owner,
         ) = _snapshot_git_executable(
             executable,
@@ -3005,6 +3046,24 @@ def _initialize_git_runtime() -> None:
     except (OSError, UserError) as exc:
         _GIT_RUNTIME_ERROR = UnsupportedGitVersion(
             f"failed to create an owner-private Git runtime snapshot: {exc}"
+        )
+        return
+    if launcher_kind != "native":
+        snapshot_owner.cleanup()
+        if launcher_kind == "script-wrapper":
+            detail = (
+                "selected Git executable bytes identify a script wrapper; "
+                "executing a verified private copy cannot preserve relative "
+                "wrapper or interpreter runtime-location semantics"
+            )
+        else:
+            detail = (
+                "selected Git executable format is not a supported ELF or "
+                "Mach-O native binary, so private-copy runtime-location "
+                "semantics cannot be proved"
+            )
+        _GIT_RUNTIME_ERROR = UnsupportedGitVersion(
+            f"{detail}; select a native Git executable on PATH"
         )
         return
 
@@ -3027,6 +3086,7 @@ def _initialize_git_runtime() -> None:
         provisional_runtime = _GitRuntime(
             executable=snapshot,
             source_executable=executable,
+            launcher_kind=launcher_kind,
             version=(0, 0, 0),
             digest=digest,
             file_identity=snapshot_identity,
@@ -3092,6 +3152,7 @@ def _initialize_git_runtime() -> None:
     _GIT_RUNTIME = _GitRuntime(
         executable=snapshot,
         source_executable=executable,
+        launcher_kind=launcher_kind,
         version=version,
         digest=digest,
         file_identity=snapshot_identity,

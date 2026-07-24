@@ -145,6 +145,7 @@ class ProjectJournalTests(unittest.TestCase):
             digest,
             snapshot_identity,
             directory_identity,
+            _launcher_kind,
             snapshot_owner,
         ) = project_journal._snapshot_git_executable(
             source,
@@ -156,6 +157,7 @@ class ProjectJournalTests(unittest.TestCase):
         return project_journal._GitRuntime(
             executable=snapshot,
             source_executable=source,
+            launcher_kind="test-script",
             version=(2, 45, 1),
             digest=digest,
             file_identity=snapshot_identity,
@@ -404,6 +406,7 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertTrue(runtime.executable.is_absolute())
         self.assertEqual(runtime.executable, runtime.executable.resolve())
         self.assertNotEqual(runtime.executable, runtime.source_executable)
+        self.assertEqual(runtime.launcher_kind, "native")
         self.assertEqual(runtime.executable.stat().st_mode & 0o777, 0o500)
         self.assertEqual(runtime.executable.parent.stat().st_mode & 0o777, 0o700)
         self.assertGreaterEqual(runtime.version, project_journal.MINIMUM_GIT_VERSION)
@@ -412,24 +415,122 @@ class ProjectJournalTests(unittest.TestCase):
             "rev-parse",
             "--show-toplevel",
         )
-        self.assertEqual(command[0], str(runtime.executable))
+        self.assertEqual(command[0], str(runtime.source_executable))
+
+    def test_git_gate_rejects_relative_script_wrapper_with_runtime_evidence(
+        self,
+    ) -> None:
+        fake_bin = self.root / "relative-wrapper-bin"
+        fake_bin.mkdir()
+        marker = self.root / "relative-wrapper-executed"
+        companion = fake_bin / "git-real"
+        companion.write_text(
+            "#!/bin/sh\n"
+            f"printf executed > {shlex.quote(str(marker))}\n"
+            "printf 'git version 2.45.1\\n'\n",
+            encoding="utf-8",
+        )
+        companion.chmod(0o755)
+        wrapper = fake_bin / "git"
+        wrapper.write_text(
+            '#!/bin/sh\nexec "$0-real" "$@"\n',
+            encoding="utf-8",
+        )
+        wrapper.chmod(0o755)
+        repo = self.root / "relative-wrapper-repo"
+        repo.mkdir()
+
+        result = self.run_cli(
+            "adoption-status",
+            "--repo",
+            str(repo),
+            env={
+                "PATH": f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}",
+            },
+        )
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(
+            "selected Git executable bytes identify a script wrapper",
+            result.stderr,
+        )
+        self.assertIn(
+            "cannot preserve relative wrapper or interpreter "
+            "runtime-location semantics",
+            result.stderr,
+        )
+        self.assertFalse(marker.exists())
+
+    def test_native_git_launch_preserves_source_argv0_for_runtime_prefix(
+        self,
+    ) -> None:
+        source = pathlib.Path(sys.executable).resolve()
+        (
+            snapshot,
+            digest,
+            snapshot_identity,
+            directory_identity,
+            launcher_kind,
+            snapshot_owner,
+        ) = project_journal._snapshot_git_executable(
+            source,
+            expected_source_identity=project_journal._git_source_identity(
+                source.stat()
+            ),
+            deadline=time.monotonic() + 5,
+        )
+        self.assertEqual(launcher_kind, "native")
+        runtime = project_journal._GitRuntime(
+            executable=snapshot,
+            source_executable=source,
+            launcher_kind=launcher_kind,
+            version=(2, 45, 1),
+            digest=digest,
+            file_identity=snapshot_identity,
+            directory_identity=directory_identity,
+            snapshot_owner=snapshot_owner,
+        )
+
+        try:
+            result = project_journal._capture_bounded_process(
+                [
+                    str(runtime.executable),
+                    "-I",
+                    "-S",
+                    "-c",
+                    "import sys; print(sys.executable)",
+                ],
+                env={
+                    "PATH": os.environ.get("PATH", ""),
+                    "PYTHONDONTWRITEBYTECODE": "1",
+                },
+                verified_runtime=runtime,
+                timeout_seconds=2,
+                stdout_limit=4096,
+                stderr_limit=4096,
+                stdout_overflow_error="runtime-prefix stdout overflow",
+                stderr_overflow_error="runtime-prefix stderr overflow",
+                timeout_error="runtime-prefix launch timed out",
+                operation="runtime-prefix argv0 probe",
+            )
+        finally:
+            runtime.snapshot_owner.cleanup()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.args[0], str(source))
+        self.assertEqual(
+            result.stdout.decode("utf-8").strip(),
+            str(source),
+        )
 
     def test_git_gate_executes_bound_snapshot_after_source_replacement_and_rewrite(
         self,
     ) -> None:
         old_runtime = project_journal._GIT_RUNTIME
         old_error = project_journal._GIT_RUNTIME_ERROR
+        self.assertIsNotNone(old_runtime)
+        assert old_runtime is not None
         fake_git = self.root / "git"
-        safe_script = textwrap.dedent(
-            """\
-            #!/bin/sh
-            if [ "$1" = "--version" ]; then
-              printf 'git version 2.45.1\\n'
-            else
-              printf 'safe-snapshot\\n'
-            fi
-            """
-        )
         malicious_script = textwrap.dedent(
             """\
             #!/bin/sh
@@ -440,7 +541,7 @@ class ProjectJournalTests(unittest.TestCase):
         try:
             for mutation in ("replacement", "same-inode-rewrite"):
                 with self.subTest(mutation=mutation):
-                    fake_git.write_text(safe_script, encoding="utf-8")
+                    shutil.copyfile(old_runtime.source_executable, fake_git)
                     fake_git.chmod(0o755)
                     project_journal._GIT_RUNTIME = None
                     project_journal._GIT_RUNTIME_ERROR = None
@@ -466,14 +567,14 @@ class ProjectJournalTests(unittest.TestCase):
                         self.assertEqual(fake_git.stat().st_ino, original_inode)
 
                     result = subprocess.run(
-                        [str(project_journal._fixed_git_executable()), "probe"],
+                        [str(project_journal._fixed_git_executable()), "--version"],
                         check=False,
                         text=True,
                         stdout=subprocess.PIPE,
                         stderr=subprocess.PIPE,
                     )
                     self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertEqual(result.stdout, "safe-snapshot\n")
+                    self.assertRegex(result.stdout, r"\Agit version ")
                     runtime.snapshot_owner.cleanup()
         finally:
             project_journal._GIT_RUNTIME = old_runtime
@@ -582,7 +683,7 @@ class ProjectJournalTests(unittest.TestCase):
             **kwargs: object,
         ) -> subprocess.Popen[bytes]:
             nonlocal observed_launch
-            self.assertEqual(pathlib.Path(argv[0]), runtime.executable)
+            self.assertEqual(pathlib.Path(argv[0]), runtime.source_executable)
             observed_launch = pathlib.Path(str(kwargs["executable"]))
             self.assertNotEqual(observed_launch, runtime.executable)
             self.assertEqual(observed_launch.stat().st_mode & 0o777, 0o500)
@@ -635,7 +736,7 @@ class ProjectJournalTests(unittest.TestCase):
             **kwargs: object,
         ) -> subprocess.Popen[bytes]:
             nonlocal observed_launch
-            self.assertEqual(pathlib.Path(argv[0]), runtime.executable)
+            self.assertEqual(pathlib.Path(argv[0]), runtime.source_executable)
             observed_launch = pathlib.Path(str(kwargs["executable"]))
             self.assertNotEqual(observed_launch, runtime.executable)
             runtime.executable.unlink()
@@ -690,7 +791,7 @@ class ProjectJournalTests(unittest.TestCase):
             **kwargs: object,
         ) -> subprocess.Popen[bytes]:
             launch_path = pathlib.Path(str(kwargs["executable"]))
-            self.assertEqual(pathlib.Path(argv[0]), runtime.executable)
+            self.assertEqual(pathlib.Path(argv[0]), runtime.source_executable)
             self.assertEqual(launch_path.parent.stat().st_mode & 0o777, 0o500)
             with self.assertRaises(PermissionError):
                 os.replace(attacker, launch_path)
@@ -1265,11 +1366,10 @@ class ProjectJournalTests(unittest.TestCase):
     ) -> None:
         old_runtime = project_journal._GIT_RUNTIME
         old_error = project_journal._GIT_RUNTIME_ERROR
+        self.assertIsNotNone(old_runtime)
+        assert old_runtime is not None
         fake_git = self.root / "version-gate-git"
-        fake_git.write_text(
-            "#!/bin/sh\nprintf 'git version 2.45.1\\n'\n",
-            encoding="utf-8",
-        )
+        shutil.copyfile(old_runtime.source_executable, fake_git)
         fake_git.chmod(0o755)
         attacker = self.root / "version-gate-attacker"
         attacker.write_text(
@@ -1278,7 +1378,18 @@ class ProjectJournalTests(unittest.TestCase):
         )
         attacker.chmod(0o755)
         actual_popen = subprocess.Popen
+        actual_snapshot = project_journal._snapshot_git_executable
+        observed_snapshot: pathlib.Path | None = None
         replaced = False
+
+        def capture_snapshot(
+            *args: object,
+            **kwargs: object,
+        ) -> tuple[object, ...]:
+            nonlocal observed_snapshot
+            snapshot_result = actual_snapshot(*args, **kwargs)
+            observed_snapshot = snapshot_result[0]
+            return snapshot_result
 
         def replace_snapshot_during_version_gate(
             argv: list[str],
@@ -1286,7 +1397,10 @@ class ProjectJournalTests(unittest.TestCase):
             **kwargs: object,
         ) -> subprocess.Popen[bytes]:
             nonlocal replaced
-            snapshot = pathlib.Path(argv[0])
+            self.assertEqual(pathlib.Path(argv[0]), fake_git.resolve())
+            self.assertIsNotNone(observed_snapshot)
+            assert observed_snapshot is not None
+            snapshot = observed_snapshot
             launch = pathlib.Path(str(kwargs["executable"]))
             backup = snapshot.with_name("verified-snapshot-backup")
             self.assertNotEqual(launch, snapshot)
@@ -1308,16 +1422,21 @@ class ProjectJournalTests(unittest.TestCase):
                 return_value=str(fake_git),
             ):
                 with mock.patch.object(
-                    project_journal.subprocess,
-                    "Popen",
-                    side_effect=replace_snapshot_during_version_gate,
+                    project_journal,
+                    "_snapshot_git_executable",
+                    side_effect=capture_snapshot,
                 ):
                     with mock.patch.object(
-                        project_journal,
-                        "_verify_git_runtime_snapshot",
-                        wraps=project_journal._verify_git_runtime_snapshot,
-                    ) as verify:
-                        project_journal._initialize_git_runtime()
+                        project_journal.subprocess,
+                        "Popen",
+                        side_effect=replace_snapshot_during_version_gate,
+                    ):
+                        with mock.patch.object(
+                            project_journal,
+                            "_verify_git_runtime_snapshot",
+                            wraps=project_journal._verify_git_runtime_snapshot,
+                        ) as verify:
+                            project_journal._initialize_git_runtime()
 
             self.assertTrue(replaced)
             self.assertIsNotNone(verify.call_args.kwargs["deadline"])
@@ -1329,7 +1448,7 @@ class ProjectJournalTests(unittest.TestCase):
             runtime = project_journal._GIT_RUNTIME
             self.assertIsNotNone(runtime)
             assert runtime is not None
-            self.assertEqual(runtime.version, (2, 45, 1))
+            self.assertEqual(runtime.version, old_runtime.version)
         finally:
             runtime = project_journal._GIT_RUNTIME
             if runtime is not None and runtime is not old_runtime:
@@ -1508,7 +1627,7 @@ class ProjectJournalTests(unittest.TestCase):
                 deadline=time.monotonic() - 1,
             )
 
-    def test_old_git_fails_closed_and_discovery_reports_inconclusive(
+    def test_script_git_fails_closed_and_discovery_reports_inconclusive(
         self,
     ) -> None:
         repo = self.init_repo()
@@ -1567,11 +1686,62 @@ class ProjectJournalTests(unittest.TestCase):
             rows[0]["adoption_error"]["code"],
             "unsupported_git_version",
         )
-        self.assertIn("Git >= 2.45 is required", rows[0]["adoption_error"]["message"])
+        self.assertIn(
+            "selected Git executable bytes identify a script wrapper",
+            rows[0]["adoption_error"]["message"],
+        )
         self.assertIsNone(rows[0]["index_ignored"])
-        invocations = shim_log.read_text(encoding="utf-8").splitlines()
-        self.assertEqual(invocations, ["--version|lazy=1"])
-        self.assertNotIn("fsmonitor", "\n".join(invocations))
+        self.assertFalse(shim_log.exists())
+
+    def test_native_old_git_version_fails_closed_before_repository_commands(
+        self,
+    ) -> None:
+        old_runtime = project_journal._GIT_RUNTIME
+        old_error = project_journal._GIT_RUNTIME_ERROR
+        self.assertIsNotNone(old_runtime)
+        assert old_runtime is not None
+        fake_git = self.root / "native-old-git"
+        shutil.copyfile(old_runtime.source_executable, fake_git)
+        fake_git.chmod(0o755)
+        old_version = subprocess.CompletedProcess(
+            [str(fake_git), "--version"],
+            0,
+            b"git version 2.44.9\n",
+            b"",
+        )
+
+        project_journal._GIT_RUNTIME = None
+        project_journal._GIT_RUNTIME_ERROR = None
+        try:
+            with mock.patch.object(
+                project_journal.shutil,
+                "which",
+                return_value=str(fake_git),
+            ):
+                with mock.patch.object(
+                    project_journal,
+                    "_capture_bounded_process",
+                    return_value=old_version,
+                ) as capture:
+                    project_journal._initialize_git_runtime()
+
+            self.assertIsNone(project_journal._GIT_RUNTIME)
+            self.assertIsInstance(
+                project_journal._GIT_RUNTIME_ERROR,
+                project_journal.UnsupportedGitVersion,
+            )
+            self.assertIn(
+                "Git >= 2.45 is required",
+                str(project_journal._GIT_RUNTIME_ERROR),
+            )
+            capture.assert_called_once()
+            self.assertEqual(capture.call_args.kwargs["env"]["GIT_NO_LAZY_FETCH"], "1")
+        finally:
+            runtime = project_journal._GIT_RUNTIME
+            if runtime is not None and runtime is not old_runtime:
+                runtime.snapshot_owner.cleanup()
+            project_journal._GIT_RUNTIME = old_runtime
+            project_journal._GIT_RUNTIME_ERROR = old_error
 
     def test_adoption_status_ignores_poisoned_git_repo_and_object_env(
         self,
@@ -2820,6 +2990,91 @@ class ProjectJournalTests(unittest.TestCase):
         time.sleep(1.6)
         self.assertFalse(marker.exists())
 
+    def test_late_restore_signal_cleans_runtime_before_custom_propagation(
+        self,
+    ) -> None:
+        handled = signal.SIGTERM
+        ignored = signal.SIGHUP
+        events: list[str] = []
+
+        def custom_handler(signum: int, _frame: object) -> None:
+            self.assertEqual(signum, handled)
+            events.append("custom-handler")
+
+        def fake_getsignal(signum: int) -> object:
+            return custom_handler if signum == handled else signal.SIG_IGN
+
+        def fake_signal(signum: int, handler: object) -> object:
+            self.assertEqual(signum, handled)
+            if handler is custom_handler:
+                events.append("restore-handler")
+                state = project_journal._ACTIVE_DEFERRED_TERMINATION
+                self.assertIsNotNone(state)
+                assert state is not None
+                state._record(handled, None)
+            else:
+                events.append("install-handler")
+            return custom_handler
+
+        def fake_cleanup() -> None:
+            events.append("cleanup-runtime")
+
+        def fake_report(*_args: object) -> None:
+            events.append("report-signal")
+
+        def fake_raise_signal(signum: int) -> None:
+            self.assertEqual(signum, handled)
+            events.append("propagate-signal")
+            custom_handler(signum, None)
+
+        with mock.patch.object(
+            project_journal,
+            "_termination_signals",
+            return_value=(handled, ignored),
+        ):
+            with mock.patch.object(
+                project_journal.signal,
+                "getsignal",
+                side_effect=fake_getsignal,
+            ):
+                with mock.patch.object(
+                    project_journal.signal,
+                    "signal",
+                    side_effect=fake_signal,
+                ):
+                    with mock.patch.object(
+                        project_journal.signal,
+                        "raise_signal",
+                        side_effect=fake_raise_signal,
+                    ):
+                        with mock.patch.object(
+                            project_journal,
+                            "_cleanup_git_runtime_for_termination",
+                            side_effect=fake_cleanup,
+                        ) as cleanup:
+                            with mock.patch.object(
+                                project_journal,
+                                "_report_deferred_termination",
+                                side_effect=fake_report,
+                            ):
+                                result = project_journal._run_with_deferred_termination(
+                                    lambda: 17
+                                )
+
+        self.assertEqual(result, 128 + handled)
+        cleanup.assert_called_once_with()
+        self.assertEqual(
+            events,
+            [
+                "install-handler",
+                "restore-handler",
+                "cleanup-runtime",
+                "report-signal",
+                "propagate-signal",
+                "custom-handler",
+            ],
+        )
+
     @unittest.skipUnless(
         os.name == "posix"
         and all(hasattr(signal, name) for name in ("SIGHUP", "SIGTERM", "SIGQUIT")),
@@ -2882,8 +3137,65 @@ class ProjectJournalTests(unittest.TestCase):
                     encoding="utf-8",
                 )
                 fake_git.chmod(0o755)
+                driver = case / "signal-git-driver.py"
+                driver.write_text(
+                    textwrap.dedent(
+                        """\
+                        import importlib.util
+                        import pathlib
+                        import sys
+                        import time
+
+                        repo, source_text, script_text = sys.argv[1:]
+                        spec = importlib.util.spec_from_file_location(
+                            "project_journal_signal_git_driver",
+                            script_text,
+                        )
+                        assert spec is not None
+                        assert spec.loader is not None
+                        module = importlib.util.module_from_spec(spec)
+                        sys.modules[spec.name] = module
+                        spec.loader.exec_module(module)
+                        old_runtime = module._GIT_RUNTIME
+                        if old_runtime is not None:
+                            old_runtime.snapshot_owner.cleanup()
+                        source = pathlib.Path(source_text)
+                        (
+                            snapshot,
+                            digest,
+                            snapshot_identity,
+                            directory_identity,
+                            _launcher_kind,
+                            snapshot_owner,
+                        ) = module._snapshot_git_executable(
+                            source,
+                            expected_source_identity=module._git_source_identity(
+                                source.stat()
+                            ),
+                            deadline=time.monotonic() + 5,
+                        )
+                        module._GIT_RUNTIME = module._GitRuntime(
+                            executable=snapshot,
+                            source_executable=source,
+                            launcher_kind="test-script",
+                            version=(2, 45, 1),
+                            digest=digest,
+                            file_identity=snapshot_identity,
+                            directory_identity=directory_identity,
+                            snapshot_owner=snapshot_owner,
+                        )
+                        module._GIT_RUNTIME_ERROR = None
+                        raise SystemExit(
+                            module.main(
+                                ["adoption-status", "--repo", repo]
+                            )
+                        )
+                        """
+                    ),
+                    encoding="utf-8",
+                )
                 env = {
-                    "PATH": f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}",
+                    "PATH": os.environ.get("PATH", ""),
                     "HOME": str(self.home),
                     "GIT_CONFIG_NOSYSTEM": "1",
                     "PYTHONDONTWRITEBYTECODE": "1",
@@ -2892,10 +3204,10 @@ class ProjectJournalTests(unittest.TestCase):
                 process = subprocess.Popen(
                     [
                         sys.executable,
-                        str(SCRIPT),
-                        "adoption-status",
-                        "--repo",
+                        str(driver),
                         str(case),
+                        str(fake_git),
+                        str(SCRIPT),
                     ],
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.PIPE,
