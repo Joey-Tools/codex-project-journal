@@ -200,38 +200,180 @@ def _termination_signals() -> tuple[int, ...]:
     return tuple(selected)
 
 
+@dataclasses.dataclass(frozen=True)
+class _PosixSignalRuntime:
+    """Required POSIX mask and synchronous-wait primitives."""
+
+    pthread_sigmask: Callable[[int, set[int]], set[int]]
+    sigpending: Callable[[], set[int]]
+    sigwait: Callable[[set[int]], int]
+    sig_block: int
+    sig_setmask: int
+
+
+class _LibcSigwait:
+    """Use libc sigwait when Python does not expose signal.sigwait."""
+
+    _SIGSET_STORAGE_WORDS = 128
+
+    def __init__(self) -> None:
+        try:
+            library = ctypes.CDLL(None, use_errno=True)
+            sigemptyset = library.sigemptyset
+            sigaddset = library.sigaddset
+            sigwait = library.sigwait
+        except (AttributeError, OSError) as exc:
+            raise UnsupportedPlatform(
+                "POSIX deferred termination requires sigwait"
+            ) from exc
+        sigemptyset.argtypes = [ctypes.c_void_p]
+        sigemptyset.restype = ctypes.c_int
+        sigaddset.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        sigaddset.restype = ctypes.c_int
+        sigwait.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
+        sigwait.restype = ctypes.c_int
+        self._sigemptyset = sigemptyset
+        self._sigaddset = sigaddset
+        self._sigwait = sigwait
+
+    @staticmethod
+    def _raise_errno(operation: str) -> None:
+        error_number = ctypes.get_errno() or errno.EINVAL
+        raise OSError(error_number, f"{operation}: {os.strerror(error_number)}")
+
+    def __call__(self, signals: set[int]) -> int:
+        if not signals:
+            raise ValueError("sigwait requires at least one blocked signal")
+        signal_set = (ctypes.c_ulong * self._SIGSET_STORAGE_WORDS)()
+        if self._sigemptyset(ctypes.byref(signal_set)) != 0:
+            self._raise_errno("sigemptyset failed")
+        for signum in signals:
+            if self._sigaddset(ctypes.byref(signal_set), signum) != 0:
+                self._raise_errno("sigaddset failed")
+        selected = ctypes.c_int()
+        result = self._sigwait(
+            ctypes.byref(signal_set),
+            ctypes.byref(selected),
+        )
+        if result != 0:
+            raise OSError(result, f"sigwait failed: {os.strerror(result)}")
+        return int(selected.value)
+
+
+def _load_posix_signal_runtime() -> _PosixSignalRuntime:
+    if os.name != "posix":
+        raise UnsupportedPlatform(
+            "project_journal.py requires POSIX signal masking before protected actions"
+        )
+    pthread_sigmask = getattr(signal, "pthread_sigmask", None)
+    sigpending = getattr(signal, "sigpending", None)
+    sig_block = getattr(signal, "SIG_BLOCK", None)
+    sig_setmask = getattr(signal, "SIG_SETMASK", None)
+    if (
+        not callable(pthread_sigmask)
+        or not callable(sigpending)
+        or not isinstance(sig_block, int)
+        or not isinstance(sig_setmask, int)
+    ):
+        raise UnsupportedPlatform(
+            "POSIX deferred termination requires pthread_sigmask and sigpending"
+        )
+
+    python_sigwait = getattr(signal, "sigwait", None)
+    if callable(python_sigwait):
+
+        def wait_for_signal(signals: set[int]) -> int:
+            return int(python_sigwait(signals))
+
+    else:
+        wait_for_signal = _LibcSigwait()
+
+    def apply_mask(how: int, signals: set[int]) -> set[int]:
+        try:
+            return {int(value) for value in pthread_sigmask(how, signals)}
+        except (OSError, ValueError) as exc:
+            raise UnsupportedPlatform(
+                f"POSIX deferred termination signal-mask operation failed: {exc}"
+            ) from exc
+
+    def pending_signals() -> set[int]:
+        try:
+            return {int(value) for value in sigpending()}
+        except OSError as exc:
+            raise UnsupportedPlatform(
+                f"POSIX deferred termination pending-signal query failed: {exc}"
+            ) from exc
+
+    runtime = _PosixSignalRuntime(
+        pthread_sigmask=apply_mask,
+        sigpending=pending_signals,
+        sigwait=wait_for_signal,
+        sig_block=sig_block,
+        sig_setmask=sig_setmask,
+    )
+    original_mask = runtime.pthread_sigmask(runtime.sig_block, set())
+    try:
+        runtime.sigpending()
+    finally:
+        runtime.pthread_sigmask(runtime.sig_setmask, original_mask)
+    return runtime
+
+
 @dataclasses.dataclass
 class _DeferredTerminationState:
     """Record one terminal signal and defer propagation until cleanup finishes."""
 
     phase: str = "new"
     pending_signal: int | None = None
+    signal_runtime: _PosixSignalRuntime | None = None
+    managed_signals: tuple[int, ...] = ()
+    terminal_signals: tuple[int, ...] = ()
     previous_handlers: dict[int, Any] = dataclasses.field(default_factory=dict)
+    entry_mask: set[int] = dataclasses.field(default_factory=set)
+    terminal_mask: set[int] | None = None
 
     def _record(self, signum: int, _frame: Any) -> None:
         if self.pending_signal is None:
             self.pending_signal = signum
+
+    def _restore_handlers_masked(self) -> None:
+        for signum, previous in reversed(tuple(self.previous_handlers.items())):
+            signal.signal(signum, previous)
+        self.previous_handlers.clear()
 
     def __enter__(self) -> _DeferredTerminationState:
         global _ACTIVE_DEFERRED_TERMINATION
 
         if _ACTIVE_DEFERRED_TERMINATION is not None:
             raise RuntimeError("deferred termination state is already active")
-        self.phase = "arming"
-        _ACTIVE_DEFERRED_TERMINATION = self
+        runtime = _load_posix_signal_runtime()
+        candidates = _termination_signals()
+        entry_mask = runtime.pthread_sigmask(
+            runtime.sig_block,
+            set(candidates),
+        )
+        self.signal_runtime = runtime
+        self.entry_mask = entry_mask
+        self.phase = "arming-masked"
         try:
-            for signum in _termination_signals():
+            for signum in candidates:
                 previous = signal.getsignal(signum)
-                if previous == signal.SIG_IGN:
+                if previous == signal.SIG_IGN or signum in entry_mask:
                     continue
                 self.previous_handlers[signum] = previous
                 signal.signal(signum, self._record)
+            self.managed_signals = tuple(self.previous_handlers)
+            _ACTIVE_DEFERRED_TERMINATION = self
+            self.phase = "armed"
+            runtime.pthread_sigmask(runtime.sig_setmask, entry_mask)
         except BaseException:
-            self._restore()
-            _ACTIVE_DEFERRED_TERMINATION = None
-            self.phase = "restoration-failed"
+            try:
+                self._restore_handlers_masked()
+            finally:
+                _ACTIVE_DEFERRED_TERMINATION = None
+                self.phase = "arming-failed"
+                runtime.pthread_sigmask(runtime.sig_setmask, entry_mask)
             raise
-        self.phase = "armed"
         return self
 
     def raise_if_pending(self) -> None:
@@ -240,26 +382,106 @@ class _DeferredTerminationState:
         self.phase = "draining"
         raise _DeferredTermination(self.pending_signal)
 
-    def _restore(self) -> None:
-        for signum, previous in reversed(tuple(self.previous_handlers.items())):
-            signal.signal(signum, previous)
-        self.previous_handlers.clear()
+    def _capture_pending_masked(self) -> None:
+        runtime = self.signal_runtime
+        if runtime is None or self.phase not in {
+            "terminal-masked",
+            "handlers-restored-masked",
+        }:
+            raise RuntimeError("pending signals can only be consumed while masked")
+        managed = set(self.terminal_signals)
+        while True:
+            pending = runtime.sigpending() & managed
+            if not pending:
+                return
+            try:
+                signum = runtime.sigwait(pending)
+            except (OSError, ValueError) as exc:
+                raise UnsupportedPlatform(
+                    f"POSIX deferred termination sigwait failed: {exc}"
+                ) from exc
+            if signum not in pending:
+                raise UnsupportedPlatform(
+                    "POSIX deferred termination sigwait returned an unrequested signal"
+                )
+            self._record(signum, None)
 
-    def __exit__(self, _exc_type: Any, _exc: Any, _traceback: Any) -> None:
+    def begin_terminal(self) -> None:
+        if self.phase not in {"armed", "draining"}:
+            raise RuntimeError(
+                f"cannot begin deferred termination from phase {self.phase!r}"
+            )
+        runtime = self.signal_runtime
+        if runtime is None:
+            raise RuntimeError("deferred termination signal runtime is missing")
+        self.phase = "terminal-masking"
+        terminal_mask = runtime.pthread_sigmask(
+            runtime.sig_block,
+            set(self.managed_signals),
+        )
+        self.terminal_mask = terminal_mask
+        self.terminal_signals = tuple(
+            signum for signum in self.managed_signals if signum not in terminal_mask
+        )
+        self.phase = "terminal-masked"
+
+    def restore_handlers_masked(self, *, capture_pending: bool = True) -> None:
         global _ACTIVE_DEFERRED_TERMINATION
 
-        self.phase = "safe-terminal"
+        if self.phase != "terminal-masked":
+            raise RuntimeError(
+                f"cannot restore deferred handlers from phase {self.phase!r}"
+            )
+        self._restore_handlers_masked()
+        self.phase = "handlers-restored-masked"
+        if capture_pending:
+            self._capture_pending_masked()
+        _ACTIVE_DEFERRED_TERMINATION = None
+
+    def __exit__(self, _exc_type: Any, _exc: Any, _traceback: Any) -> None:
+        self.begin_terminal()
+
+    def restore_mask_and_propagate(
+        self,
+        *,
+        capture_pending: bool = True,
+    ) -> int | None:
+        global _ACTIVE_DEFERRED_TERMINATION
+
+        if self.phase != "handlers-restored-masked":
+            raise RuntimeError(
+                f"cannot unmask deferred handlers from phase {self.phase!r}"
+            )
+        runtime = self.signal_runtime
+        terminal_mask = self.terminal_mask
+        if runtime is None or terminal_mask is None:
+            raise RuntimeError("deferred termination terminal mask is missing")
+        if capture_pending:
+            self._capture_pending_masked()
+        signum = self.pending_signal
+        propagation_error: BaseException | None = None
         try:
-            self._restore()
+            if signum is not None:
+                signal.raise_signal(signum)
+        except BaseException as exc:
+            propagation_error = exc
         finally:
             _ACTIVE_DEFERRED_TERMINATION = None
-
-    def propagate(self) -> int:
-        if self.pending_signal is None:
-            raise RuntimeError("cannot propagate without a pending signal")
-        signal.raise_signal(self.pending_signal)
+            self.phase = "unmasking"
+            try:
+                runtime.pthread_sigmask(runtime.sig_setmask, terminal_mask)
+            except UnsupportedPlatform:
+                self.phase = "mask-restore-failed"
+                raise
+            except BaseException:
+                self.phase = "complete"
+                raise
+            else:
+                self.phase = "complete"
+        if propagation_error is not None:
+            raise propagation_error.with_traceback(propagation_error.__traceback__)
         # A restored custom handler can return. Do not then report success.
-        return 128 + self.pending_signal
+        return 128 + signum if signum is not None else None
 
 
 _ACTIVE_DEFERRED_TERMINATION: _DeferredTerminationState | None = None
@@ -312,7 +534,6 @@ def _run_with_deferred_termination(action: Callable[[], Any]) -> Any:
     result: Any = None
     interruption: BaseException | None = None
     runtime_cleanup_issue: str | None = None
-    runtime_cleanup_attempted = False
     with state:
         try:
             result = action()
@@ -325,24 +546,69 @@ def _run_with_deferred_termination(action: Callable[[], Any]) -> Any:
                 interruption = exc
         elif state.pending_signal is not None and state.phase == "armed":
             state.phase = "draining"
-        if state.pending_signal is not None:
-            runtime_cleanup_attempted = True
-            runtime_cleanup_issue = _cleanup_git_runtime_for_termination()
 
-    # A managed signal can arrive while __exit__ restores the prior handlers.
-    # Its handler still records the request, but the in-context cleanup decision
-    # has already passed. Commit that late request to the same cleanup contract
-    # before reporting and restoring its original propagation semantics.
-    if state.pending_signal is not None and not runtime_cleanup_attempted:
-        runtime_cleanup_issue = _cleanup_git_runtime_for_termination()
+    # One protected action owns one complete Git-runtime lifetime. Terminal
+    # cleanup is unconditional, so a signal generated after the last synchronous
+    # pending check but before the atomic mask restore still reaches an already
+    # safe runtime state.
+    terminal_error: BaseException | None = None
+    propagation_status: int | None = None
+    try:
+        runtime_cleanup_issue = _cleanup_git_runtime_at_terminal()
+        state._capture_pending_masked()
+        state.restore_handlers_masked()
+        reported_signal = state.pending_signal
+        if reported_signal is not None:
+            _report_deferred_termination(
+                state,
+                interruption,
+                runtime_cleanup_issue,
+            )
+        state._capture_pending_masked()
+        if reported_signal is None and state.pending_signal is not None:
+            _report_deferred_termination(
+                state,
+                interruption,
+                runtime_cleanup_issue,
+            )
+    except BaseException as exc:
+        terminal_error = exc
+    finally:
+        if state.phase == "terminal-masked":
+            try:
+                state.restore_handlers_masked(capture_pending=False)
+            except BaseException as exc:
+                if terminal_error is None:
+                    terminal_error = exc
+                else:
+                    add_note = getattr(terminal_error, "add_note", None)
+                    if add_note is not None:
+                        add_note(f"handler restoration also failed: {exc}")
+        if state.phase == "handlers-restored-masked":
+            try:
+                propagation_status = state.restore_mask_and_propagate(
+                    capture_pending=terminal_error is None,
+                )
+            except BaseException as exc:
+                if terminal_error is None:
+                    terminal_error = exc
+                else:
+                    add_note = getattr(terminal_error, "add_note", None)
+                    if add_note is not None:
+                        add_note(f"signal propagation also failed: {exc}")
 
-    if state.pending_signal is not None:
-        _report_deferred_termination(
-            state,
-            interruption,
-            runtime_cleanup_issue,
-        )
-        return state.propagate()
+    if runtime_cleanup_issue is not None and state.pending_signal is None:
+        if interruption is None:
+            interruption = UserError(runtime_cleanup_issue)
+        else:
+            add_note = getattr(interruption, "add_note", None)
+            if add_note is not None:
+                add_note(runtime_cleanup_issue)
+
+    if propagation_status is not None:
+        return propagation_status
+    if terminal_error is not None:
+        raise terminal_error.with_traceback(terminal_error.__traceback__)
     if interruption is not None:
         raise interruption.with_traceback(interruption.__traceback__)
     return result
@@ -629,8 +895,9 @@ _GIT_RUNTIME: _GitRuntime | None = None
 _GIT_RUNTIME_ERROR: UserError | None = None
 
 
-def _cleanup_git_runtime_for_termination() -> str | None:
+def _cleanup_git_runtime_at_terminal() -> str | None:
     global _GIT_RUNTIME
+    global _GIT_RUNTIME_ERROR
 
     runtime = _GIT_RUNTIME
     if runtime is None:
@@ -639,10 +906,12 @@ def _cleanup_git_runtime_for_termination() -> str | None:
     try:
         runtime.snapshot_owner.cleanup()
     except BaseException as exc:
-        return (
+        issue = (
             "Git runtime snapshot cleanup-incomplete; retained locator "
             f"{locator}: {exc}"
         )
+        _GIT_RUNTIME_ERROR = UnsupportedGitVersion(issue)
+        return issue
     _GIT_RUNTIME = None
     return None
 
@@ -5851,6 +6120,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     def dispatch() -> int:
+        _initialize_git_runtime()
         parser = build_parser()
         args = parser.parse_args(argv)
         return int(args.func(args))
@@ -5860,9 +6130,6 @@ def main(argv: list[str] | None = None) -> int:
     except UserError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
-
-
-_run_with_deferred_termination(_initialize_git_runtime)
 
 
 if __name__ == "__main__":

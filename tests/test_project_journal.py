@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import errno
 import importlib.util
+import io
 import json
 import os
 import pathlib
@@ -35,6 +36,7 @@ project_journal = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
 sys.modules[SPEC.name] = project_journal
 SPEC.loader.exec_module(project_journal)
+project_journal._initialize_git_runtime()
 
 
 def run_git(repo: pathlib.Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -2990,90 +2992,439 @@ class ProjectJournalTests(unittest.TestCase):
         time.sleep(1.6)
         self.assertFalse(marker.exists())
 
-    def test_late_restore_signal_cleans_runtime_before_custom_propagation(
+    @unittest.skipUnless(
+        os.name == "posix"
+        and hasattr(signal, "pthread_sigmask")
+        and hasattr(signal, "sigpending"),
+        "POSIX deferred termination mask contract",
+    )
+    def test_restore_window_signal_is_waited_before_custom_propagation(
         self,
     ) -> None:
         handled = signal.SIGTERM
         ignored = signal.SIGHUP
+        actual_signal = signal.signal
+        original_handlers = {
+            handled: signal.getsignal(handled),
+            ignored: signal.getsignal(ignored),
+        }
+        original_mask = {
+            int(value) for value in signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        }
         events: list[str] = []
+        signal_calls: list[int] = []
+        injected = False
+        stderr = io.StringIO()
+        cleanup_issue = (
+            "Git runtime snapshot cleanup-incomplete; retained locator "
+            "/tmp/project-journal-signal-test"
+        )
 
         def custom_handler(signum: int, _frame: object) -> None:
             self.assertEqual(signum, handled)
             events.append("custom-handler")
 
-        def fake_getsignal(signum: int) -> object:
-            return custom_handler if signum == handled else signal.SIG_IGN
-
-        def fake_signal(signum: int, handler: object) -> object:
-            self.assertEqual(signum, handled)
-            if handler is custom_handler:
+        def signal_with_restore_fault(
+            signum: int,
+            handler: object,
+        ) -> object:
+            nonlocal injected
+            signal_calls.append(signum)
+            previous = actual_signal(signum, handler)
+            if signum == handled and handler is custom_handler and not injected:
+                injected = True
                 events.append("restore-handler")
-                state = project_journal._ACTIVE_DEFERRED_TERMINATION
-                self.assertIsNotNone(state)
-                assert state is not None
-                state._record(handled, None)
-            else:
-                events.append("install-handler")
-            return custom_handler
+                os.kill(os.getpid(), handled)
+            return previous
 
-        def fake_cleanup() -> None:
+        def cleanup_runtime() -> str:
             events.append("cleanup-runtime")
+            return cleanup_issue
 
-        def fake_report(*_args: object) -> None:
-            events.append("report-signal")
-
-        def fake_raise_signal(signum: int) -> None:
-            self.assertEqual(signum, handled)
-            events.append("propagate-signal")
-            custom_handler(signum, None)
-
-        with mock.patch.object(
-            project_journal,
-            "_termination_signals",
-            return_value=(handled, ignored),
-        ):
+        actual_signal(handled, custom_handler)
+        actual_signal(ignored, signal.SIG_IGN)
+        try:
             with mock.patch.object(
-                project_journal.signal,
-                "getsignal",
-                side_effect=fake_getsignal,
+                project_journal,
+                "_termination_signals",
+                return_value=(handled, ignored),
             ):
                 with mock.patch.object(
                     project_journal.signal,
                     "signal",
-                    side_effect=fake_signal,
+                    side_effect=signal_with_restore_fault,
                 ):
                     with mock.patch.object(
-                        project_journal.signal,
-                        "raise_signal",
-                        side_effect=fake_raise_signal,
-                    ):
-                        with mock.patch.object(
-                            project_journal,
-                            "_cleanup_git_runtime_for_termination",
-                            side_effect=fake_cleanup,
-                        ) as cleanup:
-                            with mock.patch.object(
-                                project_journal,
-                                "_report_deferred_termination",
-                                side_effect=fake_report,
-                            ):
-                                result = project_journal._run_with_deferred_termination(
-                                    lambda: 17
-                                )
+                        project_journal,
+                        "_cleanup_git_runtime_at_terminal",
+                        side_effect=cleanup_runtime,
+                    ) as cleanup:
+                        with mock.patch.object(project_journal.sys, "stderr", stderr):
+                            result = project_journal._run_with_deferred_termination(
+                                lambda: 17
+                            )
+        finally:
+            actual_signal(handled, original_handlers[handled])
+            actual_signal(ignored, original_handlers[ignored])
+            signal.pthread_sigmask(signal.SIG_SETMASK, original_mask)
 
+        self.assertTrue(injected)
         self.assertEqual(result, 128 + handled)
+        cleanup.assert_called_once_with()
+        self.assertNotIn(ignored, signal_calls)
+        self.assertEqual(
+            events,
+            [
+                "cleanup-runtime",
+                "restore-handler",
+                "custom-handler",
+            ],
+        )
+        self.assertIn(cleanup_issue, stderr.getvalue())
+        self.assertEqual(signal.getsignal(ignored), original_handlers[ignored])
+        current_mask = {
+            int(value) for value in signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        }
+        self.assertEqual(current_mask, original_mask)
+
+    @unittest.skipUnless(
+        os.name == "posix"
+        and hasattr(signal, "pthread_sigmask")
+        and hasattr(signal, "sigpending"),
+        "POSIX deferred termination mask contract",
+    )
+    def test_final_check_to_unmask_signal_sees_terminal_cleanup(self) -> None:
+        handled = signal.SIGTERM
+        actual_pthread_sigmask = signal.pthread_sigmask
+        original_handler = signal.getsignal(handled)
+        original_mask = {
+            int(value) for value in actual_pthread_sigmask(signal.SIG_BLOCK, set())
+        }
+        events: list[str] = []
+        setmask_calls = 0
+
+        def custom_handler(signum: int, _frame: object) -> None:
+            self.assertEqual(signum, handled)
+            events.append("custom-handler")
+
+        def pthread_sigmask_with_final_window_signal(
+            how: int,
+            signals: set[int],
+        ) -> set[signal.Signals]:
+            nonlocal setmask_calls
+            if how == signal.SIG_SETMASK:
+                setmask_calls += 1
+                if setmask_calls == 3:
+                    events.append("final-window-signal")
+                    os.kill(os.getpid(), handled)
+            return actual_pthread_sigmask(how, signals)
+
+        def cleanup_runtime() -> None:
+            events.append("cleanup-runtime")
+
+        signal.signal(handled, custom_handler)
+        try:
+            with mock.patch.object(
+                project_journal,
+                "_termination_signals",
+                return_value=(handled,),
+            ):
+                with mock.patch.object(
+                    project_journal.signal,
+                    "pthread_sigmask",
+                    side_effect=pthread_sigmask_with_final_window_signal,
+                ):
+                    with mock.patch.object(
+                        project_journal,
+                        "_cleanup_git_runtime_at_terminal",
+                        side_effect=cleanup_runtime,
+                    ) as cleanup:
+                        result = project_journal._run_with_deferred_termination(
+                            lambda: 29
+                        )
+        finally:
+            signal.signal(handled, original_handler)
+            actual_pthread_sigmask(signal.SIG_SETMASK, original_mask)
+
+        self.assertEqual(result, 29)
         cleanup.assert_called_once_with()
         self.assertEqual(
             events,
             [
-                "install-handler",
-                "restore-handler",
                 "cleanup-runtime",
-                "report-signal",
-                "propagate-signal",
+                "final-window-signal",
                 "custom-handler",
             ],
         )
+        current_mask = {
+            int(value) for value in actual_pthread_sigmask(signal.SIG_BLOCK, set())
+        }
+        self.assertEqual(current_mask, original_mask)
+
+    @unittest.skipUnless(
+        os.name == "posix"
+        and hasattr(signal, "pthread_sigmask")
+        and hasattr(signal, "sigpending"),
+        "POSIX deferred termination mask contract",
+    )
+    def test_caller_blocked_signal_remains_blocked_and_pending(self) -> None:
+        blocked = signal.SIGQUIT
+        original_handler = signal.getsignal(blocked)
+        original_mask = {
+            int(value) for value in signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        }
+        delivered: list[int] = []
+        runtime = project_journal._load_posix_signal_runtime()
+
+        def custom_handler(signum: int, _frame: object) -> None:
+            delivered.append(signum)
+
+        current_mask: set[int] = set()
+        pending: set[int] = set()
+        signal.signal(blocked, custom_handler)
+        signal.pthread_sigmask(signal.SIG_BLOCK, {blocked})
+        try:
+            with mock.patch.object(
+                project_journal,
+                "_termination_signals",
+                return_value=(blocked,),
+            ):
+                with mock.patch.object(
+                    project_journal,
+                    "_cleanup_git_runtime_at_terminal",
+                    return_value=None,
+                ):
+                    result = project_journal._run_with_deferred_termination(
+                        lambda: os.kill(os.getpid(), blocked) or 31
+                    )
+
+            current_mask = {
+                int(value) for value in signal.pthread_sigmask(signal.SIG_BLOCK, set())
+            }
+            pending = {int(value) for value in signal.sigpending()}
+        finally:
+            if blocked in {int(value) for value in signal.sigpending()}:
+                runtime.sigwait({blocked})
+            signal.signal(blocked, original_handler)
+            signal.pthread_sigmask(signal.SIG_SETMASK, original_mask)
+
+        self.assertEqual(result, 31)
+        self.assertEqual(delivered, [])
+        self.assertIn(blocked, current_mask)
+        self.assertIn(blocked, pending)
+
+    @unittest.skipUnless(
+        os.name == "posix"
+        and hasattr(signal, "pthread_sigmask")
+        and hasattr(signal, "sigpending"),
+        "POSIX deferred termination mask contract",
+    )
+    def test_multiple_real_signals_propagate_only_the_first_managed_signal(
+        self,
+    ) -> None:
+        first = signal.SIGTERM
+        second = signal.SIGQUIT
+        ignored = signal.SIGHUP
+        original_handlers = {
+            signum: signal.getsignal(signum) for signum in (first, second, ignored)
+        }
+        original_mask = {
+            int(value) for value in signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        }
+        delivered: list[int] = []
+
+        def custom_handler(signum: int, _frame: object) -> None:
+            delivered.append(signum)
+
+        def send_signals() -> int:
+            os.kill(os.getpid(), first)
+            os.kill(os.getpid(), second)
+            os.kill(os.getpid(), ignored)
+            return 23
+
+        for signum in (first, second):
+            signal.signal(signum, custom_handler)
+        signal.signal(ignored, signal.SIG_IGN)
+        try:
+            with mock.patch.object(
+                project_journal,
+                "_cleanup_git_runtime_at_terminal",
+                return_value=None,
+            ):
+                with mock.patch.object(project_journal.sys, "stderr", io.StringIO()):
+                    result = project_journal._run_with_deferred_termination(
+                        send_signals
+                    )
+        finally:
+            for signum, handler in original_handlers.items():
+                signal.signal(signum, handler)
+            signal.pthread_sigmask(signal.SIG_SETMASK, original_mask)
+
+        self.assertEqual(result, 128 + first)
+        self.assertEqual(delivered, [first])
+        current_mask = {
+            int(value) for value in signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        }
+        self.assertEqual(current_mask, original_mask)
+
+    def test_missing_signal_mask_or_wait_capability_fails_before_action(
+        self,
+    ) -> None:
+        cases = ("pthread_sigmask", "sigpending", "sigwait")
+        for missing in cases:
+            with self.subTest(missing=missing):
+                action = mock.Mock(return_value=17)
+                cleanup = mock.Mock(return_value=None)
+                if missing == "pthread_sigmask":
+                    capability_patch = mock.patch.object(
+                        project_journal.signal,
+                        "pthread_sigmask",
+                        None,
+                    )
+                    fallback_patch = mock.patch.object(
+                        project_journal,
+                        "_LibcSigwait",
+                        wraps=project_journal._LibcSigwait,
+                    )
+                elif missing == "sigpending":
+                    capability_patch = mock.patch.object(
+                        project_journal.signal,
+                        "sigpending",
+                        None,
+                    )
+                    fallback_patch = mock.patch.object(
+                        project_journal,
+                        "_LibcSigwait",
+                        wraps=project_journal._LibcSigwait,
+                    )
+                else:
+                    capability_patch = mock.patch.object(
+                        project_journal.signal,
+                        "sigwait",
+                        None,
+                        create=True,
+                    )
+                    fallback_patch = mock.patch.object(
+                        project_journal,
+                        "_LibcSigwait",
+                        side_effect=project_journal.UnsupportedPlatform(
+                            "sigwait unavailable"
+                        ),
+                    )
+                with capability_patch:
+                    with fallback_patch:
+                        with mock.patch.object(
+                            project_journal,
+                            "_cleanup_git_runtime_at_terminal",
+                            cleanup,
+                        ):
+                            with self.assertRaises(project_journal.UnsupportedPlatform):
+                                project_journal._run_with_deferred_termination(action)
+                action.assert_not_called()
+                cleanup.assert_not_called()
+
+    def test_normal_main_invocations_reinitialize_after_terminal_cleanup(
+        self,
+    ) -> None:
+        repo = self.init_repo()
+        old_runtime = project_journal._GIT_RUNTIME
+        old_error = project_journal._GIT_RUNTIME_ERROR
+        project_journal._GIT_RUNTIME = None
+        project_journal._GIT_RUNTIME_ERROR = None
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        try:
+            with mock.patch.object(project_journal.sys, "stdout", stdout):
+                with mock.patch.object(project_journal.sys, "stderr", stderr):
+                    first = project_journal.main(
+                        ["adoption-status", "--repo", str(repo)]
+                    )
+                    self.assertIsNone(project_journal._GIT_RUNTIME)
+                    second = project_journal.main(
+                        ["adoption-status", "--repo", str(repo)]
+                    )
+                    self.assertIsNone(project_journal._GIT_RUNTIME)
+        finally:
+            runtime = project_journal._GIT_RUNTIME
+            if runtime is not None and runtime is not old_runtime:
+                runtime.snapshot_owner.cleanup()
+            project_journal._GIT_RUNTIME = old_runtime
+            project_journal._GIT_RUNTIME_ERROR = old_error
+
+        self.assertEqual((first, second), (0, 0), stderr.getvalue())
+        self.assertEqual(stdout.getvalue().count('"tracked_journal_adopted": false'), 2)
+
+    @unittest.skipUnless(
+        os.name == "posix"
+        and hasattr(signal, "pthread_sigmask")
+        and hasattr(signal, "sigpending"),
+        "POSIX deferred termination mask contract",
+    )
+    def test_default_signal_propagates_only_after_terminal_cleanup(self) -> None:
+        marker = self.root / "default-signal-cleanup"
+        driver = self.root / "default-signal-driver.py"
+        driver.write_text(
+            textwrap.dedent(
+                """\
+                import importlib.util
+                import os
+                import pathlib
+                import signal
+                import sys
+
+                script_text, marker_text = sys.argv[1:]
+                spec = importlib.util.spec_from_file_location(
+                    "project_journal_default_signal_driver",
+                    script_text,
+                )
+                assert spec is not None
+                assert spec.loader is not None
+                module = importlib.util.module_from_spec(spec)
+                sys.modules[spec.name] = module
+                spec.loader.exec_module(module)
+
+                def cleanup():
+                    pathlib.Path(marker_text).write_text(
+                        "terminal",
+                        encoding="utf-8",
+                    )
+                    return None
+
+                def request_signal():
+                    os.kill(os.getpid(), signal.SIGTERM)
+                    return 19
+
+                signal.signal(signal.SIGTERM, signal.SIG_DFL)
+                module._termination_signals = lambda: (signal.SIGTERM,)
+                module._cleanup_git_runtime_at_terminal = cleanup
+                module._run_with_deferred_termination(request_signal)
+                raise SystemExit("default signal did not terminate")
+                """
+            ),
+            encoding="utf-8",
+        )
+
+        process = subprocess.run(
+            [
+                sys.executable,
+                str(driver),
+                str(SCRIPT),
+                str(marker),
+            ],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=8,
+            env={
+                "PATH": os.environ.get("PATH", ""),
+                "PYTHONDONTWRITEBYTECODE": "1",
+            },
+        )
+
+        self.assertEqual(process.returncode, -signal.SIGTERM, process.stderr)
+        self.assertEqual(marker.read_text(encoding="utf-8"), "terminal")
+        self.assertIn("received SIGTERM", process.stderr)
 
     @unittest.skipUnless(
         os.name == "posix"
