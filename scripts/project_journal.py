@@ -480,12 +480,11 @@ class _DeferredTerminationState:
                 if restoration_error is None:
                     restoration_error = exc
                 else:
-                    add_note = getattr(restoration_error, "add_note", None)
-                    if add_note is not None:
-                        add_note(
-                            f"handler restoration for {_signal_name(signum)} "
-                            f"also failed: {exc}"
-                        )
+                    _add_exception_detail(
+                        restoration_error,
+                        f"handler restoration for {_signal_name(signum)} "
+                        f"also failed: {exc}",
+                    )
             else:
                 del self.previous_handlers[signum]
         _ACTIVE_DEFERRED_TERMINATION = None
@@ -624,8 +623,13 @@ def _report_deferred_termination(
             details.append(interruption)
         details.extend(getattr(interruption, "__notes__", ()))
     if runtime_cleanup_issue is not None:
-        details.append(runtime_cleanup_issue)
-    for detail in details[:MAX_DEFERRED_SIGNAL_REPORT_DETAILS]:
+        details = [
+            *details[: MAX_DEFERRED_SIGNAL_REPORT_DETAILS - 1],
+            runtime_cleanup_issue,
+        ]
+    else:
+        details = details[:MAX_DEFERRED_SIGNAL_REPORT_DETAILS]
+    for detail in details:
         print(
             f"note: {_bounded_signal_report_detail(detail)}",
             file=sys.stderr,
@@ -925,16 +929,10 @@ def _report_git_launch_issue(
 ) -> None:
     if active_error is None:
         if cause is not None and not isinstance(cause, Exception):
-            add_note = getattr(cause, "add_note", None)
-            if add_note is not None:
-                add_note(message)
+            _add_exception_detail(cause, message)
             raise cause
         raise UserError(message) from cause
-    if isinstance(active_error, Exception):
-        raise UserError(f"{active_error}; {message}") from active_error
-    add_note = getattr(active_error, "add_note", None)
-    if add_note is not None:
-        add_note(message)
+    _add_exception_detail(active_error, message)
 
 
 def _cleanup_git_launch_after_terminal(
@@ -1133,6 +1131,7 @@ def _cleanup_git_runtime_at_terminal() -> str | None:
 
     runtime = _GIT_RUNTIME
     if runtime is None:
+        _GIT_RUNTIME_ERROR = None
         return None
     locator = pathlib.Path(runtime.snapshot_owner.name)
     try:
@@ -1145,6 +1144,7 @@ def _cleanup_git_runtime_at_terminal() -> str | None:
         _GIT_RUNTIME_ERROR = UnsupportedGitVersion(issue)
         return issue
     _GIT_RUNTIME = None
+    _GIT_RUNTIME_ERROR = None
     return None
 
 
@@ -2749,12 +2749,7 @@ def _annotate_cleanup_interruption(
     phase: str,
 ) -> None:
     detail = f"{operation} cleanup-incomplete: {phase} was interrupted"
-    add_note = getattr(exc, "add_note", None)
-    if callable(add_note):
-        add_note(detail)
-        return
-    existing = str(exc).strip()
-    exc.args = (f"{existing}; {detail}" if existing else detail,)
+    _add_exception_detail(exc, detail)
 
 
 def _terminate_process_group_and_reap(
@@ -3259,14 +3254,10 @@ def _capture_bounded_process_with_launch(
             _close_selector(selector)
             selector_open = False
         if cleanup_error is not None:
-            cleanup_message = f"{operation} cleanup-incomplete: {cleanup_error}"
-            if isinstance(exc, UserError):
-                raise UserError(f"{exc}; {cleanup_message}") from exc
-            if isinstance(exc, Exception):
-                raise UserError(f"{exc}; {cleanup_message}") from exc
-            add_note = getattr(exc, "add_note", None)
-            if add_note is not None:
-                add_note(cleanup_message)
+            _add_exception_detail(
+                exc,
+                f"{operation} cleanup-incomplete: {cleanup_error}",
+            )
         raise
     finally:
         if launch is not None and ownership.state == "released":
@@ -6222,9 +6213,7 @@ def _install_hook(
                 temporary_name,
                 staged,
             )
-            add_note = getattr(exc, "add_note", None)
-            if add_note is not None:
-                add_note(detail)
+            _add_exception_detail(exc, detail)
         elif commit_state.must_preserve_temporary:
             temporary_created = False
             detail = _interrupted_hook_exchange_recovery_note(
@@ -6232,9 +6221,7 @@ def _install_hook(
                 target,
                 temporary_name,
             )
-            add_note = getattr(exc, "add_note", None)
-            if add_note is not None:
-                add_note(detail)
+            _add_exception_detail(exc, detail)
         elif commit_state.installed_target_committed:
             temporary_created = False
             detail = _interrupted_hook_post_commit_note(
@@ -6243,13 +6230,12 @@ def _install_hook(
                 temporary_name,
                 staged,
             )
-            add_note = getattr(exc, "add_note", None)
-            if add_note is not None:
-                pending_step = commit_state.pending_step or "post-commit verification"
-                add_note(
-                    f"hook target installation committed, but {pending_step} "
-                    f"is incomplete after interruption; {detail}"
-                )
+            pending_step = commit_state.pending_step or "post-commit verification"
+            _add_exception_detail(
+                exc,
+                f"hook target installation committed, but {pending_step} "
+                f"is incomplete after interruption; {detail}",
+            )
         raise
     finally:
         if temporary_created:

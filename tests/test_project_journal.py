@@ -55,6 +55,14 @@ def stat_with_gid(value: os.stat_result, gid: int) -> os.stat_result:
     return os.stat_result(fields)
 
 
+class LegacyUnsupportedPlatform(project_journal.UnsupportedPlatform):
+    add_note = None
+
+
+class LegacyInterrupt(BaseException):
+    add_note = None
+
+
 class ProjectJournalTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -1140,11 +1148,17 @@ class ProjectJournalTests(unittest.TestCase):
                             operation="retained Git launch",
                         )
 
-            self.assertIn("simulated unverified terminal state", str(raised.exception))
-            self.assertIn("retained launch locator", str(raised.exception))
+            details = "\n".join(
+                [
+                    str(raised.exception),
+                    *getattr(raised.exception, "__notes__", ()),
+                ]
+            )
+            self.assertIn("simulated unverified terminal state", details)
+            self.assertIn("retained launch locator", details)
             self.assertIsNotNone(observed_launch)
             assert observed_launch is not None
-            self.assertIn(str(observed_launch.parent), str(raised.exception))
+            self.assertIn(str(observed_launch.parent), details)
             self.assertTrue(observed_launch.exists())
             self.assertEqual(observed_launch.parent.stat().st_mode & 0o777, 0o500)
         finally:
@@ -1198,14 +1212,17 @@ class ProjectJournalTests(unittest.TestCase):
                             operation="identity-lost Git launch",
                         )
 
-            self.assertIn(
-                "simulated bound child identity loss",
-                str(raised.exception),
+            details = "\n".join(
+                [
+                    str(raised.exception),
+                    *getattr(raised.exception, "__notes__", ()),
+                ]
             )
-            self.assertIn("retained launch locator", str(raised.exception))
+            self.assertIn("simulated bound child identity loss", details)
+            self.assertIn("retained launch locator", details)
             self.assertIsNotNone(observed_launch)
             assert observed_launch is not None
-            self.assertIn(str(observed_launch.parent), str(raised.exception))
+            self.assertIn(str(observed_launch.parent), details)
             self.assertTrue(observed_launch.exists())
         finally:
             for process in spawned:
@@ -1218,6 +1235,13 @@ class ProjectJournalTests(unittest.TestCase):
     def test_git_launch_cleanup_failure_preserves_original_error(self) -> None:
         runtime = self.make_fake_git_runtime("launch-cleanup-error")
         actual_cleanup = project_journal._GitLaunchCopy.cleanup
+        original_error = LegacyUnsupportedPlatform(
+            "original launch action failure",
+        )
+        original_args = original_error.args
+
+        def reject_output(_chunk: bytes) -> None:
+            raise original_error
 
         def cleanup_then_fail(
             launch: project_journal._GitLaunchCopy,
@@ -1232,26 +1256,42 @@ class ProjectJournalTests(unittest.TestCase):
                 side_effect=cleanup_then_fail,
                 autospec=True,
             ):
-                with self.assertRaises(project_journal.UserError) as raised:
+                try:
                     project_journal._capture_bounded_process(
                         [str(runtime.executable), "probe"],
                         env={"PATH": os.environ.get("PATH", "")},
                         verified_runtime=runtime,
                         timeout_seconds=2,
-                        stdout_limit=0,
+                        stdout_limit=1024,
                         stderr_limit=1024,
-                        stdout_overflow_error="original stdout overflow",
+                        stdout_feed=reject_output,
+                        stdout_overflow_error="stdout overflow",
                         stderr_overflow_error="stderr overflow",
                         timeout_error="launch timed out",
                         operation="cleanup-failing Git launch",
                     )
+                except LegacyUnsupportedPlatform as exc:
+                    raised_error = exc
+                else:
+                    self.fail("expected original launch action failure")
 
-            self.assertIn("original stdout overflow", str(raised.exception))
-            self.assertIn("launch-copy cleanup-incomplete", str(raised.exception))
-            self.assertIn(
-                "simulated launch cleanup failure",
-                str(raised.exception),
+            self.assertIs(raised_error, original_error)
+            self.assertIs(type(raised_error), LegacyUnsupportedPlatform)
+            self.assertEqual(
+                raised_error.code,
+                project_journal.UnsupportedPlatform.code,
             )
+            self.assertEqual(raised_error.args, original_args)
+            notes = "\n".join(getattr(raised_error, "__notes__", ()))
+            self.assertIn("launch-copy cleanup-incomplete at locator", notes)
+            self.assertIn("simulated launch cleanup failure", notes)
+            traceback_names: list[str] = []
+            traceback = raised_error.__traceback__
+            while traceback is not None:
+                traceback_names.append(traceback.tb_frame.f_code.co_name)
+                traceback = traceback.tb_next
+            self.assertIn("reject_output", traceback_names)
+            self.assertNotIn("_report_git_launch_issue", traceback_names)
         finally:
             runtime.snapshot_owner.cleanup()
 
@@ -1309,6 +1349,8 @@ class ProjectJournalTests(unittest.TestCase):
     ) -> None:
         runtime = self.make_fake_git_runtime("launch-popen-interrupt")
         observed_launch: pathlib.Path | None = None
+        interruption = LegacyInterrupt("injected process-start interruption")
+        original_args = interruption.args
 
         def interrupt_process_start(
             argv: list[str],
@@ -1317,7 +1359,7 @@ class ProjectJournalTests(unittest.TestCase):
         ) -> subprocess.Popen[bytes]:
             nonlocal observed_launch
             observed_launch = pathlib.Path(str(kwargs["executable"]))
-            raise KeyboardInterrupt("injected process-start interruption")
+            raise interruption
 
         try:
             with mock.patch.object(
@@ -1325,7 +1367,7 @@ class ProjectJournalTests(unittest.TestCase):
                 "Popen",
                 side_effect=interrupt_process_start,
             ):
-                with self.assertRaises(KeyboardInterrupt) as raised:
+                with self.assertRaises(LegacyInterrupt) as raised:
                     project_journal._capture_bounded_process(
                         [str(runtime.executable), "probe"],
                         env={"PATH": os.environ.get("PATH", "")},
@@ -1339,6 +1381,8 @@ class ProjectJournalTests(unittest.TestCase):
                         operation="process-start-interrupted Git launch",
                     )
 
+            self.assertIs(raised.exception, interruption)
+            self.assertEqual(raised.exception.args, original_args)
             self.assertIsNotNone(observed_launch)
             assert observed_launch is not None
             self.assertTrue(observed_launch.exists())
@@ -3624,6 +3668,37 @@ class ProjectJournalTests(unittest.TestCase):
         )
         self.assertIn(f"note: {cleanup_issue}", stderr.getvalue())
 
+    def test_pending_signal_report_reserves_cleanup_locator_slot(self) -> None:
+        state = project_journal._DeferredTerminationState(
+            pending_signal=signal.SIGTERM,
+        )
+        interruption = LegacyUnsupportedPlatform("action failed")
+        interruption.__notes__ = [f"action note {index}" for index in range(7)]
+        cleanup_issue = (
+            "Git runtime snapshot cleanup-incomplete; retained locator "
+            "/tmp/project-journal-saturated-report"
+        )
+        stderr = io.StringIO()
+
+        with mock.patch.object(project_journal.sys, "stderr", stderr):
+            project_journal._report_deferred_termination(
+                state,
+                interruption,
+                cleanup_issue,
+            )
+
+        note_lines = [
+            line for line in stderr.getvalue().splitlines() if line.startswith("note: ")
+        ]
+        self.assertEqual(
+            len(note_lines),
+            project_journal.MAX_DEFERRED_SIGNAL_REPORT_DETAILS,
+        )
+        self.assertEqual(note_lines[0], "note: action failed")
+        self.assertIn("note: action note 5", note_lines)
+        self.assertNotIn("note: action note 6", note_lines)
+        self.assertEqual(note_lines[-1], f"note: {cleanup_issue}")
+
     @unittest.skipUnless(
         os.name == "posix"
         and hasattr(signal, "pthread_sigmask")
@@ -3735,6 +3810,59 @@ class ProjectJournalTests(unittest.TestCase):
 
         self.assertEqual((first, second), (0, 0), stderr.getvalue())
         self.assertEqual(stdout.getvalue().count('"tracked_journal_adopted": false'), 2)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX Git runtime contract")
+    def test_failed_runtime_initialization_can_retry_after_repair(self) -> None:
+        repo = self.init_repo()
+        old_runtime = project_journal._GIT_RUNTIME
+        old_error = project_journal._GIT_RUNTIME_ERROR
+        self.assertIsNotNone(old_runtime)
+        assert old_runtime is not None
+        project_journal._GIT_RUNTIME = None
+        project_journal._GIT_RUNTIME_ERROR = None
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        which_calls: list[str] = []
+
+        def fail_then_find_git(
+            command: str,
+            path: str | None = None,
+        ) -> str | None:
+            del path
+            which_calls.append(command)
+            if len(which_calls) == 1:
+                return None
+            return str(old_runtime.source_executable)
+
+        try:
+            with mock.patch.object(
+                project_journal.shutil,
+                "which",
+                side_effect=fail_then_find_git,
+            ):
+                with mock.patch.object(project_journal.sys, "stdout", stdout):
+                    with mock.patch.object(project_journal.sys, "stderr", stderr):
+                        first = project_journal.main(
+                            ["adoption-status", "--repo", str(repo)]
+                        )
+                        self.assertIsNone(project_journal._GIT_RUNTIME)
+                        self.assertIsNone(project_journal._GIT_RUNTIME_ERROR)
+                        second = project_journal.main(
+                            ["adoption-status", "--repo", str(repo)]
+                        )
+                        self.assertIsNone(project_journal._GIT_RUNTIME)
+                        self.assertIsNone(project_journal._GIT_RUNTIME_ERROR)
+        finally:
+            runtime = project_journal._GIT_RUNTIME
+            if runtime is not None and runtime is not old_runtime:
+                runtime.snapshot_owner.cleanup()
+            project_journal._GIT_RUNTIME = old_runtime
+            project_journal._GIT_RUNTIME_ERROR = old_error
+
+        self.assertEqual((first, second), (1, 0), stderr.getvalue())
+        self.assertEqual(which_calls, ["git", "git"])
+        self.assertIn("no Git executable was found on PATH", stderr.getvalue())
+        self.assertIn('"tracked_journal_adopted": false', stdout.getvalue())
 
     @unittest.skipUnless(
         os.name == "posix"
@@ -4718,6 +4846,74 @@ class ProjectJournalTests(unittest.TestCase):
                     stdout_finish=parser.finish,
                 )
 
+    @unittest.skipUnless(os.name == "posix", "POSIX process-group contract")
+    def test_process_group_cleanup_failure_preserves_original_error(self) -> None:
+        original_cleanup = project_journal._terminate_process_group_and_reap
+        original_error = LegacyUnsupportedPlatform(
+            "original bounded-process action failure",
+        )
+        original_args = original_error.args
+
+        def reject_output(_chunk: bytes) -> None:
+            raise original_error
+
+        def cleanup_then_report(
+            process: subprocess.Popen[bytes],
+            selector: object,
+            ownership: project_journal._ProcessOwnership | None = None,
+            known_returncode: int | None = None,
+        ) -> str:
+            actual_error = original_cleanup(
+                process,
+                selector,
+                ownership,
+                known_returncode=known_returncode,
+            )
+            details = [
+                detail
+                for detail in (
+                    actual_error,
+                    "simulated process-group cleanup failure",
+                )
+                if detail
+            ]
+            return "; ".join(details)
+
+        with mock.patch.object(
+            project_journal,
+            "_terminate_process_group_and_reap",
+            side_effect=cleanup_then_report,
+        ):
+            try:
+                self.capture_process(
+                    [sys.executable, "-c", "import os; os.write(1, b'x')"],
+                    timeout_seconds=5,
+                    stdout_limit=1024,
+                    stdout_feed=reject_output,
+                )
+            except LegacyUnsupportedPlatform as exc:
+                raised_error = exc
+            else:
+                self.fail("expected original bounded-process action failure")
+
+        self.assertIs(raised_error, original_error)
+        self.assertIs(type(raised_error), LegacyUnsupportedPlatform)
+        self.assertEqual(
+            raised_error.code,
+            project_journal.UnsupportedPlatform.code,
+        )
+        self.assertEqual(raised_error.args, original_args)
+        notes = "\n".join(getattr(raised_error, "__notes__", ()))
+        self.assertIn("cleanup-incomplete", notes)
+        self.assertIn("simulated process-group cleanup failure", notes)
+        traceback_names: list[str] = []
+        traceback = raised_error.__traceback__
+        while traceback is not None:
+            traceback_names.append(traceback.tb_frame.f_code.co_name)
+            traceback = traceback.tb_next
+        self.assertIn("reject_output", traceback_names)
+        self.assertNotIn("_add_exception_detail", traceback_names)
+
     def test_bounded_capture_kills_process_group_on_stdout_overflow(
         self,
     ) -> None:
@@ -5391,6 +5587,10 @@ class ProjectJournalTests(unittest.TestCase):
             "an unverified terminal retains and reports the locator",
             skill,
         )
+        self.assertIn(
+            "preserve the exact original exception object, type, code, arguments, and traceback",
+            skill,
+        )
         self.assertIn("native no-replace or exchange rename semantics", skill)
         self.assertIn("reported recovery locator", skill)
         self.assertIn("installed-target-committed state", skill)
@@ -5408,6 +5608,8 @@ class ProjectJournalTests(unittest.TestCase):
             "without `BaseException.add_note`",
             skill,
         )
+        self.assertIn("clears a cached initialization failure", skill)
+        self.assertIn("reserves its final bounded detail slot", skill)
         self.assertIn(
             "held root-to-directory descriptor chain",
             skill,
@@ -6113,6 +6315,8 @@ class ProjectJournalTests(unittest.TestCase):
         old_stat = hook.stat()
         actual_rename = project_journal._rename_hook_entry_with_flag
         interrupted = False
+        interruption = LegacyInterrupt("injected after committed exchange")
+        original_args = interruption.args
 
         def rename_then_interrupt(
             directory_fd: int,
@@ -6130,7 +6334,7 @@ class ProjectJournalTests(unittest.TestCase):
             )
             if destination == "post-merge" and exchange and not interrupted:
                 interrupted = True
-                raise KeyboardInterrupt("injected after committed exchange")
+                raise interruption
 
         args = mock.Mock(repo=str(repo))
         with mock.patch.object(
@@ -6138,9 +6342,11 @@ class ProjectJournalTests(unittest.TestCase):
             "_rename_hook_entry_with_flag",
             side_effect=rename_then_interrupt,
         ):
-            with self.assertRaises(KeyboardInterrupt) as raised:
+            with self.assertRaises(LegacyInterrupt) as raised:
                 project_journal.command_install_hooks(args)
 
+        self.assertIs(raised.exception, interruption)
+        self.assertEqual(raised.exception.args, original_args)
         self.assertTrue(interrupted)
         self.assertNotEqual(hook.read_bytes(), old_content)
         self.assertIn(project_journal.HOOK_BEGIN.encode(), hook.read_bytes())
@@ -6311,6 +6517,8 @@ class ProjectJournalTests(unittest.TestCase):
         hook.write_bytes(old_content)
         actual_unlink = project_journal.os.unlink
         interrupted = False
+        interruption = LegacyInterrupt("injected after displaced-hook unlink")
+        original_args = interruption.args
 
         def unlink_then_interrupt(
             path: os.PathLike[str] | str,
@@ -6325,7 +6533,7 @@ class ProjectJournalTests(unittest.TestCase):
                 and not interrupted
             ):
                 interrupted = True
-                raise KeyboardInterrupt("injected after displaced-hook unlink")
+                raise interruption
 
         args = mock.Mock(repo=str(repo))
         with mock.patch.object(
@@ -6333,9 +6541,11 @@ class ProjectJournalTests(unittest.TestCase):
             "unlink",
             side_effect=unlink_then_interrupt,
         ):
-            with self.assertRaises(KeyboardInterrupt) as raised:
+            with self.assertRaises(LegacyInterrupt) as raised:
                 project_journal.command_install_hooks(args)
 
+        self.assertIs(raised.exception, interruption)
+        self.assertEqual(raised.exception.args, original_args)
         self.assertTrue(interrupted)
         self.assertNotEqual(hook.read_bytes(), old_content)
         self.assertIn(project_journal.HOOK_BEGIN.encode(), hook.read_bytes())
@@ -6364,6 +6574,10 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertEqual(configured.returncode, 0, configured.stderr)
         actual_rename = project_journal._rename_hook_entry_with_flag
         interrupted = False
+        interruption = LegacyInterrupt(
+            "injected after committed no-replace rename",
+        )
+        original_args = interruption.args
 
         def rename_then_interrupt(
             directory_fd: int,
@@ -6381,7 +6595,7 @@ class ProjectJournalTests(unittest.TestCase):
             )
             if destination == "post-merge" and not exchange and not interrupted:
                 interrupted = True
-                raise KeyboardInterrupt("injected after committed no-replace rename")
+                raise interruption
 
         args = mock.Mock(repo=str(repo))
         with mock.patch.object(
@@ -6389,9 +6603,11 @@ class ProjectJournalTests(unittest.TestCase):
             "_rename_hook_entry_with_flag",
             side_effect=rename_then_interrupt,
         ):
-            with self.assertRaises(KeyboardInterrupt) as raised:
+            with self.assertRaises(LegacyInterrupt) as raised:
                 project_journal.command_install_hooks(args)
 
+        self.assertIs(raised.exception, interruption)
+        self.assertEqual(raised.exception.args, original_args)
         self.assertTrue(interrupted)
         hook = repo / ".githooks/post-merge"
         self.assertIn(
