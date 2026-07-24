@@ -2820,6 +2820,266 @@ class ProjectJournalTests(unittest.TestCase):
         time.sleep(1.6)
         self.assertFalse(marker.exists())
 
+    @unittest.skipUnless(
+        os.name == "posix"
+        and all(hasattr(signal, name) for name in ("SIGHUP", "SIGTERM", "SIGQUIT")),
+        "POSIX deferred termination contract",
+    )
+    def test_helper_defers_terminal_signals_until_git_group_cleanup(self) -> None:
+        for signum in (signal.SIGHUP, signal.SIGTERM, signal.SIGQUIT):
+            with self.subTest(signal=signal.Signals(signum).name):
+                case = self.root / f"deferred-{signal.Signals(signum).name.lower()}"
+                fake_bin = case / "bin"
+                fake_bin.mkdir(parents=True)
+                temp_root = case / "tmp"
+                temp_root.mkdir()
+                ready = case / "descendant.ready"
+                survived = case / "descendant.survived"
+                fake_git = fake_bin / "git"
+                fake_git.write_text(
+                    f"#!{sys.executable}\n"
+                    f"PJ_SIGNAL_READY = {str(ready)!r}\n"
+                    f"PJ_SIGNAL_SURVIVED = {str(survived)!r}\n"
+                    + textwrap.dedent(
+                        """\
+                        import os
+                        import pathlib
+                        import signal
+                        import subprocess
+                        import sys
+                        import time
+
+                        if sys.argv[1:] == ["--version"]:
+                            print("git version 2.45.1")
+                            raise SystemExit(0)
+
+                        if sys.argv[1:] == ["--project-journal-descendant"]:
+                            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                            pathlib.Path(PJ_SIGNAL_READY).write_text(
+                                str(os.getpid()),
+                                encoding="utf-8",
+                            )
+                            time.sleep(0.75)
+                            pathlib.Path(PJ_SIGNAL_SURVIVED).write_text(
+                                "survived",
+                                encoding="utf-8",
+                            )
+                            raise SystemExit(0)
+
+                        subprocess.Popen(
+                            [sys.executable, __file__, "--project-journal-descendant"],
+                            stdin=subprocess.DEVNULL,
+                        )
+                        deadline = time.monotonic() + 5
+                        ready = pathlib.Path(PJ_SIGNAL_READY)
+                        while not ready.exists():
+                            if time.monotonic() >= deadline:
+                                raise SystemExit("descendant did not become ready")
+                            time.sleep(0.005)
+                        time.sleep(30)
+                        """
+                    ),
+                    encoding="utf-8",
+                )
+                fake_git.chmod(0o755)
+                env = {
+                    "PATH": f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}",
+                    "HOME": str(self.home),
+                    "GIT_CONFIG_NOSYSTEM": "1",
+                    "PYTHONDONTWRITEBYTECODE": "1",
+                    "TMPDIR": str(temp_root),
+                }
+                process = subprocess.Popen(
+                    [
+                        sys.executable,
+                        str(SCRIPT),
+                        "adoption-status",
+                        "--repo",
+                        str(case),
+                    ],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    env=env,
+                )
+                try:
+                    deadline = time.monotonic() + 8
+                    while not ready.exists():
+                        if process.poll() is not None:
+                            stdout, stderr = process.communicate()
+                            self.fail(
+                                "helper exited before its Git descendant was ready: "
+                                f"stdout={stdout!r} stderr={stderr!r}"
+                            )
+                        if time.monotonic() >= deadline:
+                            self.fail("helper Git descendant did not become ready")
+                        time.sleep(0.01)
+
+                    process.send_signal(signum)
+                    stdout, stderr = process.communicate(timeout=8)
+                    self.assertEqual(stdout, "")
+                    self.assertEqual(process.returncode, -signum, stderr)
+                    self.assertIn(
+                        f"received {signal.Signals(signum).name}",
+                        stderr,
+                    )
+                    self.assertIn(
+                        "protected cleanup reached a terminal state",
+                        stderr,
+                    )
+                    time.sleep(0.9)
+                    self.assertFalse(
+                        survived.exists(),
+                        "launch-owned descendant survived deferred cleanup",
+                    )
+                    self.assertEqual(
+                        list(temp_root.glob("project-journal-git-runtime-*")),
+                        [],
+                    )
+                    self.assertEqual(
+                        list(temp_root.glob("project-journal-git-launch-*")),
+                        [],
+                    )
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                        process.communicate()
+                    if ready.exists():
+                        try:
+                            os.kill(
+                                int(ready.read_text(encoding="utf-8")), signal.SIGKILL
+                            )
+                        except (ProcessLookupError, ValueError):
+                            pass
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "SIGHUP"),
+        "POSIX deferred termination contract",
+    )
+    def test_helper_reports_rename_state_before_propagating_signal(self) -> None:
+        repo = self.init_repo()
+        configured = run_git(
+            repo,
+            "config",
+            "--local",
+            "core.hooksPath",
+            ".githooks",
+        )
+        self.assertEqual(configured.returncode, 0, configured.stderr)
+        ready = self.root / "rename.ready"
+        release = self.root / "rename.release"
+        driver = self.root / "signal-rename-driver.py"
+        driver.write_text(
+            textwrap.dedent(
+                """\
+                import importlib.util
+                import pathlib
+                import sys
+                import time
+
+                repo, ready_text, release_text, script_text = sys.argv[1:]
+                spec = importlib.util.spec_from_file_location(
+                    "project_journal_signal_driver",
+                    script_text,
+                )
+                assert spec is not None
+                assert spec.loader is not None
+                module = importlib.util.module_from_spec(spec)
+                sys.modules[spec.name] = module
+                spec.loader.exec_module(module)
+                actual_rename = module._rename_hook_entry_with_flag
+                ready = pathlib.Path(ready_text)
+                release = pathlib.Path(release_text)
+
+                def rename_then_wait(
+                    directory_fd,
+                    source,
+                    destination,
+                    *,
+                    exchange,
+                ):
+                    actual_rename(
+                        directory_fd,
+                        source,
+                        destination,
+                        exchange=exchange,
+                    )
+                    if destination != "post-merge" or exchange:
+                        return
+                    ready.write_text("renamed", encoding="utf-8")
+                    deadline = time.monotonic() + 8
+                    while not release.exists():
+                        if time.monotonic() >= deadline:
+                            raise RuntimeError("signal release was not provided")
+                        time.sleep(0.005)
+
+                module._rename_hook_entry_with_flag = rename_then_wait
+                raise SystemExit(
+                    module.main(["install-hooks", "--repo", repo])
+                )
+                """
+            ),
+            encoding="utf-8",
+        )
+        env = {
+            "PATH": os.environ.get("PATH", ""),
+            "HOME": str(self.home),
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                str(driver),
+                str(repo),
+                str(ready),
+                str(release),
+                str(SCRIPT),
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+        )
+        try:
+            deadline = time.monotonic() + 8
+            while not ready.exists():
+                if process.poll() is not None:
+                    stdout, stderr = process.communicate()
+                    self.fail(
+                        "helper exited before the no-replace rename: "
+                        f"stdout={stdout!r} stderr={stderr!r}"
+                    )
+                if time.monotonic() >= deadline:
+                    self.fail("helper did not reach the no-replace rename")
+                time.sleep(0.01)
+
+            process.send_signal(signal.SIGHUP)
+            release.write_text("continue", encoding="utf-8")
+            stdout, stderr = process.communicate(timeout=8)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.communicate()
+
+        self.assertEqual(stdout, "")
+        self.assertEqual(process.returncode, -signal.SIGHUP, stderr)
+        self.assertIn("received SIGHUP", stderr)
+        self.assertIn("absent-target no-replace rename committed", stderr)
+        self.assertIn(
+            "object-identity/content/access-policy verified",
+            stderr,
+        )
+        self.assertIn("no displaced-hook recovery object exists", stderr)
+        self.assertNotIn("preserved recovery locator", stderr)
+        self.assertTrue((repo / ".githooks/post-merge").exists())
+        self.assertEqual(
+            list((repo / ".githooks").glob(".project-journal-post-merge-*.tmp")),
+            [],
+        )
+
     @unittest.skipUnless(os.name == "posix", "POSIX process-group contract")
     def test_group_cleanup_keeps_leader_fence_and_orders_final_signal(
         self,
@@ -2898,10 +3158,13 @@ class ProjectJournalTests(unittest.TestCase):
                     process_arg: subprocess.Popen[bytes],
                     deadline: float,
                     timeout_error: str,
+                    *,
+                    interruptible: bool,
                 ) -> int:
                     self.assertIs(process_arg, process)
                     self.assertGreater(deadline, 0)
                     self.assertTrue(timeout_error)
+                    self.assertFalse(interruptible)
                     events.append(("status", None))
                     return -signal.SIGTERM
 
@@ -6012,6 +6275,63 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertTrue((repo / ".githooks/post-merge").exists())
         self.assertFalse((repo / ".git/hooks/post-merge").exists())
 
+    def test_install_hooks_preserves_significant_hooks_path_whitespace(self) -> None:
+        repo = self.init_repo()
+        configured_path = " .githooks "
+        result = run_git(
+            repo,
+            "config",
+            "--local",
+            "core.hooksPath",
+            configured_path,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        install = self.run_cli("install-hooks", "--repo", str(repo))
+
+        self.assertEqual(install.returncode, 0, install.stderr)
+        self.assertTrue((repo / configured_path / "post-merge").exists())
+        self.assertFalse((repo / ".githooks/post-merge").exists())
+
+    def test_hooks_path_parser_removes_only_nul_framing(self) -> None:
+        raw_path = b" leading-\xff-trailing \0"
+
+        parsed = project_journal._parse_nul_terminated_git_path(
+            raw_path,
+            "test core.hooksPath query",
+        )
+
+        self.assertEqual(os.fsencode(parsed), raw_path[:-1])
+        with self.assertRaisesRegex(
+            project_journal.UserError,
+            "malformed NUL framing",
+        ):
+            project_journal._parse_nul_terminated_git_path(
+                b"path\0extra\0",
+                "test core.hooksPath query",
+            )
+
+    def test_install_hooks_applies_git_prefix_path_semantics_before_roots(
+        self,
+    ) -> None:
+        repo = self.init_repo()
+        configured_path = "%(prefix)/project-journal-review-hooks"
+        result = run_git(
+            repo,
+            "config",
+            "--local",
+            "core.hooksPath",
+            configured_path,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        install = self.run_cli("install-hooks", "--repo", str(repo))
+
+        self.assertNotEqual(install.returncode, 0)
+        self.assertIn("core.hooksPath is outside", install.stderr)
+        self.assertFalse((repo / "%(prefix)/project-journal-review-hooks").exists())
+        self.assertFalse((repo / ".git/hooks/post-merge").exists())
+
     def test_install_hooks_respects_included_local_hooks_path(self) -> None:
         repo = self.init_repo()
         included = repo / ".git/hooks.inc"
@@ -6096,6 +6416,26 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertNotEqual(refused.returncode, 0)
         self.assertIn("global core.hooksPath is set", refused.stderr)
         self.assertIn("config --local core.hooksPath .githooks", refused.stderr)
+        remediation_text = refused.stderr.split("for example: ", 1)[1].strip()
+        remediation_argv = shlex.split(remediation_text)
+        remediation_git = pathlib.Path(remediation_argv[0])
+        self.assertTrue(
+            remediation_git.is_file(),
+            "remediation Git path disappeared after helper subprocess exit",
+        )
+        self.assertNotIn("project-journal-git-runtime-", str(remediation_git))
+        remediation_probe = subprocess.run(
+            [str(remediation_git), "--version"],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.assertEqual(
+            remediation_probe.returncode,
+            0,
+            remediation_probe.stderr,
+        )
         self.assertFalse((repo / ".git/hooks/post-merge").exists())
         self.assertFalse((global_hooks / "post-merge").exists())
 

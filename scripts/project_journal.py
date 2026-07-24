@@ -86,6 +86,9 @@ GIT_CONFIG_QUERY_TIMEOUT_SECONDS = 5.0
 GIT_PROCESS_TERMINATE_GRACE_SECONDS = 0.25
 GIT_PROCESS_KILL_DRAIN_SECONDS = 1.0
 PROCESS_READ_CHUNK_BYTES = 64 * 1024
+DEFERRED_SIGNAL_POLL_SECONDS = 0.05
+MAX_DEFERRED_SIGNAL_REPORT_DETAILS = 8
+MAX_DEFERRED_SIGNAL_REPORT_CHARS = 4096
 MAX_LINUX_PROC_GROUP_SCAN_PIDS = 131_072
 MAX_LINUX_PROC_STAT_BYTES = 4096
 MINIMUM_GIT_VERSION = (2, 45, 0)
@@ -165,12 +168,175 @@ class _ProcessIdentityLost(UserError):
     """The direct child was reaped before group cleanup could finish."""
 
 
+class _DeferredTermination(BaseException):
+    """Move an externally requested termination onto the normal cleanup path."""
+
+    def __init__(self, signum: int) -> None:
+        self.signum = signum
+        super().__init__(f"deferred {_signal_name(signum)}")
+
+
 class _HookExchangeRecoveryRequired(UserError):
     """A hook exchange could not be safely rolled back."""
 
     def __init__(self, message: str, recovery_name: str) -> None:
         super().__init__(message)
         self.recovery_name = recovery_name
+
+
+def _signal_name(signum: int) -> str:
+    try:
+        return signal.Signals(signum).name
+    except ValueError:
+        return f"signal {signum}"
+
+
+def _termination_signals() -> tuple[int, ...]:
+    selected: list[int] = []
+    for name in ("SIGHUP", "SIGTERM", "SIGQUIT"):
+        signum = getattr(signal, name, None)
+        if isinstance(signum, int) and signum not in selected:
+            selected.append(signum)
+    return tuple(selected)
+
+
+@dataclasses.dataclass
+class _DeferredTerminationState:
+    """Record one terminal signal and defer propagation until cleanup finishes."""
+
+    phase: str = "new"
+    pending_signal: int | None = None
+    previous_handlers: dict[int, Any] = dataclasses.field(default_factory=dict)
+
+    def _record(self, signum: int, _frame: Any) -> None:
+        if self.pending_signal is None:
+            self.pending_signal = signum
+
+    def __enter__(self) -> _DeferredTerminationState:
+        global _ACTIVE_DEFERRED_TERMINATION
+
+        if _ACTIVE_DEFERRED_TERMINATION is not None:
+            raise RuntimeError("deferred termination state is already active")
+        self.phase = "arming"
+        _ACTIVE_DEFERRED_TERMINATION = self
+        try:
+            for signum in _termination_signals():
+                previous = signal.getsignal(signum)
+                if previous == signal.SIG_IGN:
+                    continue
+                self.previous_handlers[signum] = previous
+                signal.signal(signum, self._record)
+        except BaseException:
+            self._restore()
+            _ACTIVE_DEFERRED_TERMINATION = None
+            self.phase = "restoration-failed"
+            raise
+        self.phase = "armed"
+        return self
+
+    def raise_if_pending(self) -> None:
+        if self.pending_signal is None or self.phase != "armed":
+            return
+        self.phase = "draining"
+        raise _DeferredTermination(self.pending_signal)
+
+    def _restore(self) -> None:
+        for signum, previous in reversed(tuple(self.previous_handlers.items())):
+            signal.signal(signum, previous)
+        self.previous_handlers.clear()
+
+    def __exit__(self, _exc_type: Any, _exc: Any, _traceback: Any) -> None:
+        global _ACTIVE_DEFERRED_TERMINATION
+
+        self.phase = "safe-terminal"
+        try:
+            self._restore()
+        finally:
+            _ACTIVE_DEFERRED_TERMINATION = None
+
+    def propagate(self) -> int:
+        if self.pending_signal is None:
+            raise RuntimeError("cannot propagate without a pending signal")
+        signal.raise_signal(self.pending_signal)
+        # A restored custom handler can return. Do not then report success.
+        return 128 + self.pending_signal
+
+
+_ACTIVE_DEFERRED_TERMINATION: _DeferredTerminationState | None = None
+
+
+def _raise_if_termination_pending() -> None:
+    state = _ACTIVE_DEFERRED_TERMINATION
+    if state is not None:
+        state.raise_if_pending()
+
+
+def _bounded_signal_report_detail(value: object) -> str:
+    text = str(value).replace("\0", "\\0")
+    if len(text) <= MAX_DEFERRED_SIGNAL_REPORT_CHARS:
+        return text
+    return text[:MAX_DEFERRED_SIGNAL_REPORT_CHARS] + "…[truncated]"
+
+
+def _report_deferred_termination(
+    state: _DeferredTerminationState,
+    interruption: BaseException | None,
+    runtime_cleanup_issue: str | None,
+) -> None:
+    assert state.pending_signal is not None
+    print(
+        f"error: received {_signal_name(state.pending_signal)}; deferred until "
+        "protected cleanup reached a terminal state",
+        file=sys.stderr,
+        flush=True,
+    )
+    if interruption is None:
+        details: list[object] = []
+    else:
+        details = []
+        if not isinstance(interruption, _DeferredTermination) and str(interruption):
+            details.append(interruption)
+        details.extend(getattr(interruption, "__notes__", ()))
+    if runtime_cleanup_issue is not None:
+        details.append(runtime_cleanup_issue)
+    for detail in details[:MAX_DEFERRED_SIGNAL_REPORT_DETAILS]:
+        print(
+            f"note: {_bounded_signal_report_detail(detail)}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
+def _run_with_deferred_termination(action: Callable[[], Any]) -> Any:
+    state = _DeferredTerminationState()
+    result: Any = None
+    interruption: BaseException | None = None
+    runtime_cleanup_issue: str | None = None
+    with state:
+        try:
+            result = action()
+        except BaseException as exc:
+            interruption = exc
+        if interruption is None:
+            try:
+                state.raise_if_pending()
+            except BaseException as exc:
+                interruption = exc
+        elif state.pending_signal is not None and state.phase == "armed":
+            state.phase = "draining"
+        if state.pending_signal is not None:
+            runtime_cleanup_issue = _cleanup_git_runtime_for_termination()
+
+    if state.pending_signal is not None:
+        _report_deferred_termination(
+            state,
+            interruption,
+            runtime_cleanup_issue,
+        )
+        return state.propagate()
+    if interruption is not None:
+        raise interruption.with_traceback(interruption.__traceback__)
+    return result
 
 
 @dataclasses.dataclass(frozen=True)
@@ -450,6 +616,24 @@ class _ProcessOwnership:
 
 _GIT_RUNTIME: _GitRuntime | None = None
 _GIT_RUNTIME_ERROR: UserError | None = None
+
+
+def _cleanup_git_runtime_for_termination() -> str | None:
+    global _GIT_RUNTIME
+
+    runtime = _GIT_RUNTIME
+    if runtime is None:
+        return None
+    locator = pathlib.Path(runtime.snapshot_owner.name)
+    try:
+        runtime.snapshot_owner.cleanup()
+    except BaseException as exc:
+        return (
+            "Git runtime snapshot cleanup-incomplete; retained locator "
+            f"{locator}: {exc}"
+        )
+    _GIT_RUNTIME = None
+    return None
 
 
 def _file_identity(value: os.stat_result) -> tuple[int, int, int, int, int, int]:
@@ -1295,6 +1479,7 @@ def _strip_quotes(value: str) -> str:
 
 
 def _check_deadline(deadline: float | None, error: str) -> None:
+    _raise_if_termination_pending()
     if deadline is not None and time.monotonic() >= deadline:
         raise UserError(error)
 
@@ -1989,6 +2174,8 @@ def _wait_for_process_status_without_reaping(
     process: subprocess.Popen[bytes],
     deadline: float,
     timeout_error: str,
+    *,
+    interruptible: bool = True,
 ) -> int:
     if not all(
         hasattr(os, name)
@@ -1997,6 +2184,8 @@ def _wait_for_process_status_without_reaping(
         raise UserError("POSIX WNOWAIT status observation is unavailable")
     options = os.WEXITED | os.WNOHANG | os.WNOWAIT
     while True:
+        if interruptible:
+            _raise_if_termination_pending()
         try:
             result = os.waitid(os.P_PID, process.pid, options)
         except ChildProcessError as exc:
@@ -2123,6 +2312,7 @@ def _terminate_process_group_and_reap(
                 process,
                 kill_deadline,
                 "direct child did not exit after final process-group signal",
+                interruptible=False,
             )
             leader_exited = True
         except _ProcessIdentityLost as exc:
@@ -2355,12 +2545,14 @@ def _capture_bounded_process_with_launch(
                     f"failed to configure {operation} stdin: {exc}"
                 ) from exc
 
+        _raise_if_termination_pending()
         while selector.get_map():
+            _raise_if_termination_pending()
             remaining = operation_deadline - time.monotonic()
             if remaining <= 0:
                 raise UserError(timeout_error)
             try:
-                events = selector.select(remaining)
+                events = selector.select(min(remaining, DEFERRED_SIGNAL_POLL_SECONDS))
             except OSError as exc:
                 raise UserError(
                     f"failed to monitor {operation} streams: {exc}"
@@ -2370,6 +2562,7 @@ def _capture_bounded_process_with_launch(
             for key, _mask in events:
                 if time.monotonic() >= operation_deadline:
                     raise UserError(timeout_error)
+                _raise_if_termination_pending()
                 if key.data == "stdin":
                     assert stdin_data is not None
                     try:
@@ -2417,6 +2610,7 @@ def _capture_bounded_process_with_launch(
                 target.extend(chunk)
 
         if os.name == "posix":
+            _raise_if_termination_pending()
             returncode = _wait_for_process_status_without_reaping(
                 process,
                 operation_deadline,
@@ -2462,6 +2656,7 @@ def _capture_bounded_process_with_launch(
                     f"{returncode}: {cleanup_error}{detail_suffix}"
                 )
             ownership.release()
+            _raise_if_termination_pending()
             if returncode == 0 and stdout_finish is not None:
                 stdout_finish()
         else:
@@ -2864,6 +3059,9 @@ def _initialize_git_runtime() -> None:
             f"failed the bounded credential-free Git version gate: {exc}"
         )
         return
+    except BaseException:
+        snapshot_owner.cleanup()
+        raise
     if result.returncode != 0:
         snapshot_owner.cleanup()
         detail = (
@@ -2912,6 +3110,10 @@ def _initialize_git_runtime() -> None:
         snapshot_owner.cleanup()
         _GIT_RUNTIME = None
         _GIT_RUNTIME_ERROR = UnsupportedGitVersion(str(exc))
+    except BaseException:
+        snapshot_owner.cleanup()
+        _GIT_RUNTIME = None
+        raise
 
 
 def _tracked_index_journal_snapshot(
@@ -3492,7 +3694,7 @@ def _allowed_hook_roots(repo: pathlib.Path) -> list[pathlib.Path]:
 
 
 def _hook_path_plan_from_config(repo: pathlib.Path, raw_path: str) -> _HookPathPlan:
-    if not raw_path.strip():
+    if raw_path == "":
         raise UserError(
             "core.hooksPath is empty; unset it or set a non-empty hook directory before installing"
         )
@@ -3500,7 +3702,10 @@ def _hook_path_plan_from_config(repo: pathlib.Path, raw_path: str) -> _HookPathP
         raise UserError(
             "core.hooksPath points at os.devnull; cannot install project journal hooks"
         )
-    hooks_dir = pathlib.Path(raw_path).expanduser()
+    # The scoped Git query has already applied Git's pathname expansion,
+    # including ~ and %(prefix). Preserve every remaining path byte represented
+    # by the decoded value; leading and trailing whitespace can be significant.
+    hooks_dir = pathlib.Path(raw_path)
     hooks_dir = _lexical_absolute_path(hooks_dir, base=repo)
     candidates: list[tuple[pathlib.Path, tuple[str, ...]]] = []
     for root in _allowed_hook_roots(repo):
@@ -3576,6 +3781,12 @@ def _parse_git_config_records(output: bytes, label: str) -> list[tuple[str, str]
             raise UserError(f"{label} returned malformed records")
         entries.append((key.lower(), value))
     return entries
+
+
+def _parse_nul_terminated_git_path(output: bytes, label: str) -> str:
+    if not output.endswith(b"\0") or b"\0" in output[:-1]:
+        raise UserError(f"{label} returned malformed NUL framing")
+    return os.fsdecode(output[:-1])
 
 
 def _global_git_config_entries(
@@ -3685,7 +3896,9 @@ def _preflight_global_hooks_config(repo: pathlib.Path) -> None:
         if key == "include.path"
         or (key.startswith("includeif.") and key.endswith(".path"))
     ]
-    git_executable = shlex.quote(str(_fixed_git_executable()))
+    # The verified runtime snapshot is process-private and disappears at exit.
+    # Remediation text must instead name the durable source path selected for it.
+    git_executable = shlex.quote(str(_require_git_runtime().source_executable))
     repo_arg = shlex.quote(str(repo))
     instruction = (
         f"{git_executable} -C {repo_arg} config --local core.hooksPath .githooks"
@@ -3733,16 +3946,50 @@ def _preflight_global_hooks_config(repo: pathlib.Path) -> None:
 
 def _hook_path_plan(repo: pathlib.Path) -> _HookPathPlan:
     for scope in ("--worktree", "--local"):
-        configured = _run_git(
+        operation = f"{scope} core.hooksPath query"
+        command = _git_command(
             repo,
             "config",
             "--includes",
             scope,
+            "--type=path",
+            "--null",
             "--get",
             "core.hooksPath",
         )
+        configured = _capture_bounded_process(
+            command,
+            env=_git_environment(),
+            verified_runtime=_require_git_runtime(),
+            timeout_seconds=GIT_CONFIG_QUERY_TIMEOUT_SECONDS,
+            stdout_limit=MAX_GLOBAL_GIT_CONFIG_OUTPUT_BYTES,
+            stderr_limit=MAX_GIT_STDERR_BYTES,
+            stdout_overflow_error=(
+                f"{operation} stdout exceeds {MAX_GLOBAL_GIT_CONFIG_OUTPUT_BYTES} bytes"
+            ),
+            stderr_overflow_error=(
+                f"{operation} stderr exceeds {MAX_GIT_STDERR_BYTES} bytes"
+            ),
+            timeout_error=(
+                f"{operation} timed out after "
+                f"{GIT_CONFIG_QUERY_TIMEOUT_SECONDS:g} seconds"
+            ),
+            operation=operation,
+        )
         if configured.returncode == 0:
-            return _hook_path_plan_from_config(repo, configured.stdout.strip())
+            raw_path = _parse_nul_terminated_git_path(
+                configured.stdout,
+                operation,
+            )
+            return _hook_path_plan_from_config(repo, raw_path)
+        if configured.returncode != 1:
+            detail = (
+                configured.stderr.decode("utf-8", errors="replace").strip()
+                or f"exit {configured.returncode}"
+            )
+            raise UserError(
+                f"failed to resolve {scope} core.hooksPath safely: {detail}"
+            )
     _preflight_global_hooks_config(repo)
     return _default_hook_path_plan(repo)
 
@@ -4695,6 +4942,7 @@ def _commit_hook_target_atomically(
     staged: _HookTargetSnapshot,
     commit_state: _HookCommitState,
 ) -> None:
+    _raise_if_termination_pending()
     if not target.exists:
         commit_state.begin_absent_rename()
         try:
@@ -4704,6 +4952,7 @@ def _commit_hook_target_atomically(
                 target.name,
                 exchange=False,
             )
+            _raise_if_termination_pending()
         except OSError as exc:
             if exc.errno in {errno.EEXIST, errno.ENOTEMPTY}:
                 commit_state.mark_cleanup_safe()
@@ -4740,6 +4989,7 @@ def _commit_hook_target_atomically(
             target.name,
             exchange=True,
         )
+        _raise_if_termination_pending()
     except OSError as exc:
         _revalidate_failed_hook_exchange(
             binding,
@@ -4786,6 +5036,7 @@ def _commit_hook_target_atomically(
             )
         commit_state.mark_installed_target_committed("displaced-hook cleanup")
         os.unlink(temporary_name, dir_fd=binding.fd)
+        _raise_if_termination_pending()
         commit_state.mark_temporary_consumed()
         return
 
@@ -4851,6 +5102,7 @@ def _install_hook(
     binding: _HookDirectoryBinding,
     target: _HookTargetSnapshot,
 ) -> pathlib.Path:
+    _raise_if_termination_pending()
     _revalidate_hook_directory(binding)
     _revalidate_hook_target(binding, target)
     content = _hook_body().encode("utf-8")
@@ -4887,6 +5139,7 @@ def _install_hook(
             )
         _revalidate_hook_directory(binding)
         _revalidate_hook_target(binding, target)
+        _raise_if_termination_pending()
         _commit_hook_target_atomically(
             binding,
             target,
@@ -4895,8 +5148,10 @@ def _install_hook(
             commit_state,
         )
         temporary_created = False
+        _raise_if_termination_pending()
         os.fsync(binding.fd)
         commit_state.mark_directory_durable()
+        _raise_if_termination_pending()
         _revalidate_hook_directory(binding)
         installed, installed_content = _snapshot_hook_target(binding, target.name)
         expected_installed = dataclasses.replace(staged, name=target.name)
@@ -4916,6 +5171,7 @@ def _install_hook(
                 f"{binding.path / target.name}: {status}"
             )
         commit_state.mark_verified()
+        _raise_if_termination_pending()
     except _HookExchangeRecoveryRequired:
         temporary_created = False
         raise
@@ -5533,16 +5789,19 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = build_parser()
-    args = parser.parse_args(argv)
-    try:
+    def dispatch() -> int:
+        parser = build_parser()
+        args = parser.parse_args(argv)
         return int(args.func(args))
+
+    try:
+        return int(_run_with_deferred_termination(dispatch))
     except UserError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
 
-_initialize_git_runtime()
+_run_with_deferred_termination(_initialize_git_runtime)
 
 
 if __name__ == "__main__":
