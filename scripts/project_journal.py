@@ -1123,6 +1123,42 @@ class _ProcessOwnership:
 
 _GIT_RUNTIME: _GitRuntime | None = None
 _GIT_RUNTIME_ERROR: UserError | None = None
+_GIT_SNAPSHOT_CLEANUP_NOTE_PREFIX = "Git runtime snapshot cleanup-incomplete"
+
+
+def _has_git_snapshot_cleanup_issue(error: BaseException) -> bool:
+    return any(
+        isinstance(detail, str) and detail.startswith(_GIT_SNAPSHOT_CLEANUP_NOTE_PREFIX)
+        for detail in getattr(error, "__notes__", ())
+    )
+
+
+def _cleanup_git_snapshot_owner(
+    owner: tempfile.TemporaryDirectory[str],
+    operation: str,
+    active_error: BaseException | None,
+) -> bool:
+    locator = pathlib.Path(owner.name)
+    try:
+        owner.cleanup()
+    except BaseException as cleanup_error:
+        details = _exception_details(
+            cleanup_error,
+            f"{_GIT_SNAPSHOT_CLEANUP_NOTE_PREFIX} after {operation}; "
+            f"retained locator {locator}",
+        )
+        if active_error is not None:
+            _add_exception_details(active_error, details)
+            return False
+        if isinstance(cleanup_error, Exception):
+            failure = UnsupportedGitVersion(
+                _bounded_signal_report_detail(details[0]),
+            )
+            _add_exception_details(failure, details[1:])
+            raise failure from cleanup_error
+        _add_exception_detail(cleanup_error, details[0])
+        raise
+    return True
 
 
 def _cleanup_git_runtime_at_terminal() -> str | None:
@@ -3515,8 +3551,12 @@ def _snapshot_git_executable(
             _git_launcher_kind(bytes(header)),
             owner,
         )
-    except BaseException:
-        owner.cleanup()
+    except BaseException as exc:
+        _cleanup_git_snapshot_owner(
+            owner,
+            "snapshot creation",
+            exc,
+        )
         raise
 
 
@@ -3582,15 +3622,23 @@ def _initialize_git_runtime() -> None:
             deadline=snapshot_deadline,
         )
     except UnsupportedPlatform as exc:
+        if _has_git_snapshot_cleanup_issue(exc):
+            raise
         _GIT_RUNTIME_ERROR = exc
         return
     except (OSError, UserError) as exc:
+        if _has_git_snapshot_cleanup_issue(exc):
+            raise
         _GIT_RUNTIME_ERROR = UnsupportedGitVersion(
             f"failed to create an owner-private Git runtime snapshot: {exc}"
         )
         return
     if launcher_kind != "native":
-        snapshot_owner.cleanup()
+        _cleanup_git_snapshot_owner(
+            snapshot_owner,
+            "unsupported launcher rejection",
+            None,
+        )
         if launcher_kind == "script-wrapper":
             detail = (
                 "selected Git executable bytes identify a script wrapper; "
@@ -3655,16 +3703,30 @@ def _initialize_git_runtime() -> None:
             deadline=snapshot_deadline,
         )
     except UserError as exc:
-        snapshot_owner.cleanup()
+        cleanup_completed = _cleanup_git_snapshot_owner(
+            snapshot_owner,
+            "the bounded Git version gate",
+            exc,
+        )
+        if not cleanup_completed:
+            raise
         _GIT_RUNTIME_ERROR = UnsupportedGitVersion(
             f"failed the bounded credential-free Git version gate: {exc}"
         )
         return
-    except BaseException:
-        snapshot_owner.cleanup()
+    except BaseException as exc:
+        _cleanup_git_snapshot_owner(
+            snapshot_owner,
+            "the bounded Git version gate",
+            exc,
+        )
         raise
     if result.returncode != 0:
-        snapshot_owner.cleanup()
+        _cleanup_git_snapshot_owner(
+            snapshot_owner,
+            "a nonzero Git version probe",
+            None,
+        )
         detail = (
             result.stderr.decode("utf-8", errors="replace").strip()
             or result.stdout.decode("utf-8", errors="replace").strip()
@@ -3676,14 +3738,22 @@ def _initialize_git_runtime() -> None:
         return
     match = GIT_VERSION_RE.fullmatch(result.stdout)
     if match is None:
-        snapshot_owner.cleanup()
+        _cleanup_git_snapshot_owner(
+            snapshot_owner,
+            "an unsupported Git version response",
+            None,
+        )
         _GIT_RUNTIME_ERROR = UnsupportedGitVersion(
             "Git version probe returned an unsupported response"
         )
         return
     version = tuple(int(part or 0) for part in match.groups())
     if version < MINIMUM_GIT_VERSION:
-        snapshot_owner.cleanup()
+        _cleanup_git_snapshot_owner(
+            snapshot_owner,
+            "an outdated Git version rejection",
+            None,
+        )
         actual = ".".join(str(part) for part in version)
         minimum = ".".join(str(part) for part in MINIMUM_GIT_VERSION[:2])
         _GIT_RUNTIME_ERROR = UnsupportedGitVersion(
@@ -3709,12 +3779,22 @@ def _initialize_git_runtime() -> None:
             ),
         )
     except UserError as exc:
-        snapshot_owner.cleanup()
         _GIT_RUNTIME = None
+        cleanup_completed = _cleanup_git_snapshot_owner(
+            snapshot_owner,
+            "final Git snapshot validation",
+            exc,
+        )
+        if not cleanup_completed:
+            raise
         _GIT_RUNTIME_ERROR = UnsupportedGitVersion(str(exc))
-    except BaseException:
-        snapshot_owner.cleanup()
+    except BaseException as exc:
         _GIT_RUNTIME = None
+        _cleanup_git_snapshot_owner(
+            snapshot_owner,
+            "final Git snapshot validation",
+            exc,
+        )
         raise
 
 
@@ -5531,6 +5611,95 @@ def _hook_recovery_reference(
     return f"recovery path_unverified; recovery_evidence={encoded}"
 
 
+def _hook_temporary_cleanup_reference(
+    binding: _HookDirectoryBinding,
+    temporary_name: str,
+) -> str:
+    try:
+        expected, _content = _snapshot_hook_target(
+            binding,
+            temporary_name,
+        )
+    except BaseException:
+        expected = _HookTargetSnapshot(
+            name=temporary_name,
+            exists=False,
+        )
+    try:
+        return _hook_recovery_reference(
+            binding,
+            temporary_name,
+            expected,
+        )
+    except BaseException as recovery_error:
+        evidence = {
+            "leaf": temporary_name,
+            "path_status": "path_unverified",
+            "reference_error": _hook_recovery_exception_evidence(recovery_error),
+        }
+        return "recovery path_unverified; recovery_evidence=" + json.dumps(
+            evidence,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+
+def _cleanup_hook_temporary_entry(
+    binding: _HookDirectoryBinding,
+    temporary_name: str,
+    active_error: BaseException | None,
+) -> None:
+    try:
+        os.unlink(temporary_name, dir_fd=binding.fd)
+    except FileNotFoundError:
+        return
+    except BaseException as cleanup_error:
+        recovery = _hook_temporary_cleanup_reference(
+            binding,
+            temporary_name,
+        )
+        locator_status = (
+            "descriptor-bound/path-verified"
+            if recovery.startswith("preserved recovery locator:")
+            else "descriptor-relative/path-unverified"
+        )
+        recovery_issue = (
+            "hook temporary-entry cleanup-incomplete; "
+            f"{locator_status} recovery evidence: {recovery}"
+        )
+        cleanup_issue = (
+            "hook temporary-entry unlink failed with "
+            f"{_hook_recovery_exception_summary(cleanup_error)}: "
+            f"{_bounded_signal_report_detail(cleanup_error)}"
+        )
+        cleanup_notes = tuple(
+            detail
+            for detail in getattr(cleanup_error, "__notes__", ())
+            if isinstance(detail, str)
+        )
+        if active_error is not None:
+            _add_exception_details(
+                active_error,
+                (recovery_issue, cleanup_issue, *cleanup_notes),
+            )
+            return
+        if isinstance(cleanup_error, Exception):
+            failure = UserError(
+                _bounded_signal_report_detail(recovery_issue),
+            )
+            _add_exception_details(
+                failure,
+                (cleanup_issue, *cleanup_notes),
+            )
+            raise failure from cleanup_error
+        _add_exception_details(
+            cleanup_error,
+            (recovery_issue, cleanup_issue),
+        )
+        raise
+
+
 def _recovery_error(
     binding: _HookDirectoryBinding,
     temporary_name: str,
@@ -6288,10 +6457,11 @@ def _install_hook(
         raise
     finally:
         if temporary_created:
-            try:
-                os.unlink(temporary_name, dir_fd=binding.fd)
-            except FileNotFoundError:
-                pass
+            _cleanup_hook_temporary_entry(
+                binding,
+                temporary_name,
+                sys.exc_info()[1],
+            )
     return binding.path / target.name
 
 

@@ -175,6 +175,15 @@ class ProjectJournalTests(unittest.TestCase):
             snapshot_owner=snapshot_owner,
         )
 
+    def make_native_git_copy(self, name: str) -> pathlib.Path:
+        runtime = project_journal._GIT_RUNTIME
+        self.assertIsNotNone(runtime)
+        assert runtime is not None
+        destination = self.root / name
+        shutil.copyfile(runtime.source_executable, destination)
+        destination.chmod(0o755)
+        return destination
+
     def make_terminal_mask_failure_runtime(
         self,
         handled: int,
@@ -216,6 +225,14 @@ class ProjectJournalTests(unittest.TestCase):
         marker = "recovery_evidence="
         self.assertIn(marker, reference)
         return json.loads(reference.split(marker, 1)[1])
+
+    def exception_traceback_names(self, error: BaseException) -> list[str]:
+        names: list[str] = []
+        traceback = error.__traceback__
+        while traceback is not None:
+            names.append(traceback.tb_frame.f_code.co_name)
+            traceback = traceback.tb_next
+        return names
 
     def write_journal(
         self,
@@ -1294,6 +1311,302 @@ class ProjectJournalTests(unittest.TestCase):
             self.assertNotIn("_report_git_launch_issue", traceback_names)
         finally:
             runtime.snapshot_owner.cleanup()
+
+    @unittest.skipUnless(os.name == "posix", "POSIX Git runtime contract")
+    def test_git_snapshot_creation_cleanup_failure_preserves_original_error(
+        self,
+    ) -> None:
+        fake_git = self.make_native_git_copy("snapshot-creation-git")
+        old_runtime = project_journal._GIT_RUNTIME
+        old_error = project_journal._GIT_RUNTIME_ERROR
+        retained_owner = tempfile.TemporaryDirectory(
+            prefix="project-journal-test-snapshot-creation-"
+        )
+        failing_owner = mock.Mock()
+        failing_owner.name = retained_owner.name
+        cleanup_error = OSError(
+            errno.EIO,
+            "simulated snapshot creation cleanup failure",
+        )
+        failing_owner.cleanup.side_effect = cleanup_error
+        original_error = OSError(
+            errno.EACCES,
+            "original snapshot creation failure",
+        )
+        original_args = original_error.args
+
+        def interrupt_snapshot_creation(*_args: object, **_kwargs: object) -> None:
+            raise original_error
+
+        project_journal._GIT_RUNTIME = None
+        project_journal._GIT_RUNTIME_ERROR = None
+        try:
+            with mock.patch.object(
+                project_journal.shutil,
+                "which",
+                return_value=str(fake_git),
+            ):
+                with mock.patch.object(
+                    project_journal.tempfile,
+                    "TemporaryDirectory",
+                    return_value=failing_owner,
+                ):
+                    with mock.patch.object(
+                        project_journal,
+                        "_reject_runtime_extended_acl",
+                        side_effect=interrupt_snapshot_creation,
+                    ):
+                        try:
+                            project_journal._initialize_git_runtime()
+                        except OSError as exc:
+                            raised_error = exc
+                        else:
+                            self.fail("expected original snapshot creation failure")
+
+            self.assertIs(raised_error, original_error)
+            self.assertIs(type(raised_error), type(original_error))
+            self.assertEqual(raised_error.args, original_args)
+            notes = "\n".join(getattr(raised_error, "__notes__", ()))
+            self.assertIn(
+                "Git runtime snapshot cleanup-incomplete after snapshot creation",
+                notes,
+            )
+            self.assertIn(str(retained_owner.name), notes)
+            self.assertIn(str(cleanup_error), notes)
+            traceback_names = self.exception_traceback_names(raised_error)
+            self.assertIn("interrupt_snapshot_creation", traceback_names)
+            self.assertNotIn("_cleanup_git_snapshot_owner", traceback_names)
+            failing_owner.cleanup.assert_called_once_with()
+            self.assertTrue(pathlib.Path(retained_owner.name).exists())
+            self.assertIsNone(project_journal._GIT_RUNTIME)
+            self.assertIsNone(project_journal._GIT_RUNTIME_ERROR)
+        finally:
+            project_journal._GIT_RUNTIME = old_runtime
+            project_journal._GIT_RUNTIME_ERROR = old_error
+            retained_owner.cleanup()
+
+    @unittest.skipUnless(os.name == "posix", "POSIX Git runtime contract")
+    def test_git_version_cleanup_failure_preserves_original_error(self) -> None:
+        fake_git = self.make_native_git_copy("version-cleanup-git")
+        old_runtime = project_journal._GIT_RUNTIME
+        old_error = project_journal._GIT_RUNTIME_ERROR
+        retained_owner = tempfile.TemporaryDirectory(
+            prefix="project-journal-test-version-cleanup-"
+        )
+        failing_owner = mock.Mock()
+        failing_owner.name = retained_owner.name
+        cleanup_error = OSError(
+            errno.EIO,
+            "simulated version snapshot cleanup failure",
+        )
+        failing_owner.cleanup.side_effect = cleanup_error
+        original_error = LegacyUnsupportedPlatform(
+            "original version probe failure",
+        )
+        original_args = original_error.args
+
+        def interrupt_version_probe(
+            *_args: object,
+            **_kwargs: object,
+        ) -> subprocess.CompletedProcess[bytes]:
+            raise original_error
+
+        project_journal._GIT_RUNTIME = None
+        project_journal._GIT_RUNTIME_ERROR = None
+        try:
+            with mock.patch.object(
+                project_journal.shutil,
+                "which",
+                return_value=str(fake_git),
+            ):
+                with mock.patch.object(
+                    project_journal.tempfile,
+                    "TemporaryDirectory",
+                    return_value=failing_owner,
+                ):
+                    with mock.patch.object(
+                        project_journal,
+                        "_capture_bounded_process",
+                        side_effect=interrupt_version_probe,
+                    ):
+                        try:
+                            project_journal._initialize_git_runtime()
+                        except LegacyUnsupportedPlatform as exc:
+                            raised_error = exc
+                        else:
+                            self.fail("expected original version probe failure")
+
+            self.assertIs(raised_error, original_error)
+            self.assertIs(type(raised_error), LegacyUnsupportedPlatform)
+            self.assertEqual(
+                raised_error.code,
+                project_journal.UnsupportedPlatform.code,
+            )
+            self.assertEqual(raised_error.args, original_args)
+            notes = "\n".join(getattr(raised_error, "__notes__", ()))
+            self.assertIn(
+                "Git runtime snapshot cleanup-incomplete after the bounded "
+                "Git version gate",
+                notes,
+            )
+            self.assertIn(str(retained_owner.name), notes)
+            self.assertIn(str(cleanup_error), notes)
+            traceback_names = self.exception_traceback_names(raised_error)
+            self.assertIn("interrupt_version_probe", traceback_names)
+            self.assertNotIn("_cleanup_git_snapshot_owner", traceback_names)
+            failing_owner.cleanup.assert_called_once_with()
+            self.assertTrue(pathlib.Path(retained_owner.name).exists())
+            self.assertIsNone(project_journal._GIT_RUNTIME)
+            self.assertIsNone(project_journal._GIT_RUNTIME_ERROR)
+        finally:
+            project_journal._GIT_RUNTIME = old_runtime
+            project_journal._GIT_RUNTIME_ERROR = old_error
+            retained_owner.cleanup()
+
+    @unittest.skipUnless(os.name == "posix", "POSIX Git runtime contract")
+    def test_git_final_validation_cleanup_failure_preserves_original_error(
+        self,
+    ) -> None:
+        fake_git = self.make_native_git_copy("final-validation-cleanup-git")
+        old_runtime = project_journal._GIT_RUNTIME
+        old_error = project_journal._GIT_RUNTIME_ERROR
+        retained_owner = tempfile.TemporaryDirectory(
+            prefix="project-journal-test-final-validation-cleanup-"
+        )
+        failing_owner = mock.Mock()
+        failing_owner.name = retained_owner.name
+        cleanup_error = OSError(
+            errno.EIO,
+            "simulated final validation cleanup failure",
+        )
+        failing_owner.cleanup.side_effect = cleanup_error
+        original_error = LegacyInterrupt(
+            "original final snapshot validation interruption",
+        )
+        original_args = original_error.args
+        version_result = subprocess.CompletedProcess(
+            [str(fake_git), "--version"],
+            0,
+            b"git version 2.45.1\n",
+            b"",
+        )
+
+        def interrupt_final_validation(
+            *_args: object,
+            **_kwargs: object,
+        ) -> None:
+            raise original_error
+
+        project_journal._GIT_RUNTIME = None
+        project_journal._GIT_RUNTIME_ERROR = None
+        try:
+            with mock.patch.object(
+                project_journal.shutil,
+                "which",
+                return_value=str(fake_git),
+            ):
+                with mock.patch.object(
+                    project_journal.tempfile,
+                    "TemporaryDirectory",
+                    return_value=failing_owner,
+                ):
+                    with mock.patch.object(
+                        project_journal,
+                        "_capture_bounded_process",
+                        return_value=version_result,
+                    ):
+                        with mock.patch.object(
+                            project_journal,
+                            "_verify_git_runtime_snapshot",
+                            side_effect=interrupt_final_validation,
+                        ):
+                            try:
+                                project_journal._initialize_git_runtime()
+                            except LegacyInterrupt as exc:
+                                raised_error = exc
+                            else:
+                                self.fail(
+                                    "expected original final validation interruption"
+                                )
+
+            self.assertIs(raised_error, original_error)
+            self.assertIs(type(raised_error), LegacyInterrupt)
+            self.assertEqual(raised_error.args, original_args)
+            notes = "\n".join(getattr(raised_error, "__notes__", ()))
+            self.assertIn(
+                "Git runtime snapshot cleanup-incomplete after final "
+                "Git snapshot validation",
+                notes,
+            )
+            self.assertIn(str(retained_owner.name), notes)
+            self.assertIn(str(cleanup_error), notes)
+            traceback_names = self.exception_traceback_names(raised_error)
+            self.assertIn("interrupt_final_validation", traceback_names)
+            self.assertNotIn("_cleanup_git_snapshot_owner", traceback_names)
+            failing_owner.cleanup.assert_called_once_with()
+            self.assertTrue(pathlib.Path(retained_owner.name).exists())
+            self.assertIsNone(project_journal._GIT_RUNTIME)
+            self.assertIsNone(project_journal._GIT_RUNTIME_ERROR)
+        finally:
+            project_journal._GIT_RUNTIME = old_runtime
+            project_journal._GIT_RUNTIME_ERROR = old_error
+            retained_owner.cleanup()
+
+    def test_git_snapshot_cleanup_without_primary_reports_cleanup_failure(
+        self,
+    ) -> None:
+        retained_owner = tempfile.TemporaryDirectory(
+            prefix="project-journal-test-standalone-cleanup-"
+        )
+        failing_owner = mock.Mock()
+        failing_owner.name = retained_owner.name
+        cleanup_error = OSError(
+            errno.EACCES,
+            "simulated standalone snapshot cleanup failure",
+        )
+        failing_owner.cleanup.side_effect = cleanup_error
+        try:
+            with self.assertRaises(
+                project_journal.UnsupportedGitVersion,
+            ) as raised:
+                project_journal._cleanup_git_snapshot_owner(
+                    failing_owner,
+                    "standalone rejection",
+                    None,
+                )
+
+            self.assertIs(raised.exception.__cause__, cleanup_error)
+            self.assertIn(
+                "cleanup-incomplete after standalone rejection", str(raised.exception)
+            )
+            self.assertIn(str(retained_owner.name), str(raised.exception))
+            failing_owner.cleanup.assert_called_once_with()
+
+            cleanup_interrupt = LegacyInterrupt(
+                "simulated standalone snapshot cleanup interruption",
+            )
+            failing_owner.cleanup.side_effect = cleanup_interrupt
+            try:
+                project_journal._cleanup_git_snapshot_owner(
+                    failing_owner,
+                    "standalone interruption",
+                    None,
+                )
+            except LegacyInterrupt as exc:
+                raised_interrupt = exc
+            else:
+                self.fail("expected standalone snapshot cleanup interruption")
+
+            self.assertIs(raised_interrupt, cleanup_interrupt)
+            interrupt_notes = "\n".join(getattr(raised_interrupt, "__notes__", ()))
+            self.assertIn(
+                "cleanup-incomplete after standalone interruption",
+                interrupt_notes,
+            )
+            self.assertIn(str(retained_owner.name), interrupt_notes)
+            self.assertEqual(failing_owner.cleanup.call_count, 2)
+        finally:
+            retained_owner.cleanup()
 
     def test_git_launch_is_cleaned_when_selector_creation_is_interrupted(
         self,
@@ -6603,6 +6916,255 @@ class ProjectJournalTests(unittest.TestCase):
         )
         self.assertEqual(len(recoveries), 1)
         self.assertEqual(recoveries[0].read_bytes(), old_content)
+
+    def test_install_hook_cleanup_failure_preserves_each_primary_stage_error(
+        self,
+    ) -> None:
+        cases = (
+            (
+                "write",
+                LegacyInterrupt("original hook write interruption"),
+                PermissionError(
+                    errno.EACCES,
+                    "simulated hook write cleanup denial",
+                ),
+            ),
+            (
+                "validation",
+                LegacyUnsupportedPlatform(
+                    "original staged hook validation failure",
+                ),
+                OSError(
+                    errno.EIO,
+                    "simulated hook validation cleanup failure",
+                ),
+            ),
+            (
+                "commit",
+                LegacyInterrupt("original hook commit interruption"),
+                LegacyInterrupt("simulated hook commit cleanup interruption"),
+            ),
+        )
+        actual_snapshot = project_journal._snapshot_hook_target
+        actual_unlink = project_journal.os.unlink
+
+        for stage, original_error, cleanup_error in cases:
+            with self.subTest(stage=stage):
+                repo = self.init_repo(f"repo-hook-cleanup-{stage}")
+                configured = run_git(
+                    repo,
+                    "config",
+                    "--local",
+                    "core.hooksPath",
+                    ".githooks",
+                )
+                self.assertEqual(configured.returncode, 0, configured.stderr)
+                stage_injected = False
+                cleanup_injected = False
+                original_args = original_error.args
+
+                def fail_write(*_args: object, **_kwargs: object) -> None:
+                    nonlocal stage_injected
+                    stage_injected = True
+                    raise original_error
+
+                def fail_validation(
+                    binding: project_journal._HookDirectoryBinding,
+                    name: str,
+                ) -> tuple[project_journal._HookTargetSnapshot, bytes | None]:
+                    nonlocal stage_injected
+                    if (
+                        name.startswith(".project-journal-")
+                        and name.endswith(".tmp")
+                        and not stage_injected
+                    ):
+                        stage_injected = True
+                        raise original_error
+                    return actual_snapshot(binding, name)
+
+                def fail_commit(*_args: object, **_kwargs: object) -> None:
+                    nonlocal stage_injected
+                    stage_injected = True
+                    raise original_error
+
+                if stage == "write":
+                    stage_patch = mock.patch.object(
+                        project_journal,
+                        "_write_all",
+                        side_effect=fail_write,
+                    )
+                    expected_traceback_name = "fail_write"
+                elif stage == "validation":
+                    stage_patch = mock.patch.object(
+                        project_journal,
+                        "_snapshot_hook_target",
+                        side_effect=fail_validation,
+                    )
+                    expected_traceback_name = "fail_validation"
+                else:
+                    stage_patch = mock.patch.object(
+                        project_journal,
+                        "_commit_hook_target_atomically",
+                        side_effect=fail_commit,
+                    )
+                    expected_traceback_name = "fail_commit"
+
+                def fail_temporary_unlink(
+                    path: os.PathLike[str] | str,
+                    *args: object,
+                    dir_fd: int | None = None,
+                    **kwargs: object,
+                ) -> None:
+                    nonlocal cleanup_injected
+                    leaf = os.fsdecode(os.fspath(path))
+                    if (
+                        leaf.startswith(".project-journal-")
+                        and leaf.endswith(".tmp")
+                        and not cleanup_injected
+                    ):
+                        cleanup_injected = True
+                        raise cleanup_error
+                    if dir_fd is None:
+                        actual_unlink(path, *args, **kwargs)
+                    else:
+                        actual_unlink(path, *args, dir_fd=dir_fd, **kwargs)
+
+                args = mock.Mock(repo=str(repo))
+                with stage_patch:
+                    with mock.patch.object(
+                        project_journal.os,
+                        "unlink",
+                        side_effect=fail_temporary_unlink,
+                    ):
+                        try:
+                            project_journal.command_install_hooks(args)
+                        except BaseException as exc:
+                            raised_error = exc
+                        else:
+                            self.fail(f"expected original {stage} failure")
+
+                self.assertIs(raised_error, original_error)
+                self.assertIs(type(raised_error), type(original_error))
+                self.assertEqual(raised_error.args, original_args)
+                if isinstance(original_error, LegacyUnsupportedPlatform):
+                    self.assertEqual(
+                        raised_error.code,
+                        project_journal.UnsupportedPlatform.code,
+                    )
+                exception_notes = getattr(raised_error, "__notes__", ())
+                notes = "\n".join(exception_notes)
+                self.assertIn("hook temporary-entry cleanup-incomplete", notes)
+                self.assertIn("descriptor-bound/path-verified", notes)
+                self.assertIn(str(cleanup_error), notes)
+                recovery_note = next(
+                    detail
+                    for detail in exception_notes
+                    if "recovery_evidence=" in detail
+                )
+                evidence = self.recovery_evidence(recovery_note)
+                self.assertEqual(evidence["path_status"], "path_verified")
+                self.assertEqual(evidence["held_object_status"], "verified")
+                traceback_names = self.exception_traceback_names(raised_error)
+                self.assertIn(expected_traceback_name, traceback_names)
+                self.assertNotIn(
+                    "_cleanup_hook_temporary_entry",
+                    traceback_names,
+                )
+                self.assertTrue(stage_injected)
+                self.assertTrue(cleanup_injected)
+                recoveries = list(
+                    (repo / ".githooks").glob(".project-journal-post-merge-*.tmp")
+                )
+                self.assertEqual(len(recoveries), 1)
+                self.assertEqual(evidence["path"], str(recoveries[0].resolve()))
+                recoveries[0].unlink()
+
+    def test_hook_cleanup_without_primary_reports_its_own_failure(self) -> None:
+        repo = self.init_repo("repo-standalone-hook-cleanup").resolve()
+        hooks = repo / ".githooks"
+        hooks.mkdir()
+        temporary_name = ".project-journal-post-merge-standalone.tmp"
+        temporary = hooks / temporary_name
+        temporary.write_text("staged hook\n", encoding="utf-8")
+        temporary.chmod(0o600)
+        binding = project_journal._bind_hook_directory(
+            project_journal._HookPathPlan(
+                root=repo,
+                components=(".githooks",),
+            )
+        )
+        cleanup_error = PermissionError(
+            errno.EACCES,
+            "simulated standalone hook cleanup denial",
+        )
+        actual_unlink = project_journal.os.unlink
+
+        def fail_temporary_unlink(
+            path: os.PathLike[str] | str,
+            *args: object,
+            dir_fd: int | None = None,
+            **kwargs: object,
+        ) -> None:
+            if os.fsdecode(os.fspath(path)) == temporary_name:
+                raise cleanup_error
+            if dir_fd is None:
+                actual_unlink(path, *args, **kwargs)
+            else:
+                actual_unlink(path, *args, dir_fd=dir_fd, **kwargs)
+
+        try:
+            with mock.patch.object(
+                project_journal.os,
+                "unlink",
+                side_effect=fail_temporary_unlink,
+            ):
+                with self.assertRaises(project_journal.UserError) as raised:
+                    project_journal._cleanup_hook_temporary_entry(
+                        binding,
+                        temporary_name,
+                        None,
+                    )
+
+            self.assertIs(raised.exception.__cause__, cleanup_error)
+            message = str(raised.exception)
+            self.assertIn("hook temporary-entry cleanup-incomplete", message)
+            self.assertIn("descriptor-bound/path-verified", message)
+            evidence = self.recovery_evidence(message)
+            self.assertEqual(evidence["path_status"], "path_verified")
+            self.assertEqual(evidence["path"], str(temporary))
+            self.assertTrue(temporary.exists())
+
+            cleanup_interrupt = LegacyInterrupt(
+                "simulated standalone hook cleanup interruption",
+            )
+            cleanup_error = cleanup_interrupt
+            try:
+                with mock.patch.object(
+                    project_journal.os,
+                    "unlink",
+                    side_effect=fail_temporary_unlink,
+                ):
+                    project_journal._cleanup_hook_temporary_entry(
+                        binding,
+                        temporary_name,
+                        None,
+                    )
+            except LegacyInterrupt as exc:
+                raised_interrupt = exc
+            else:
+                self.fail("expected standalone hook cleanup interruption")
+
+            self.assertIs(raised_interrupt, cleanup_interrupt)
+            interrupt_notes = "\n".join(getattr(raised_interrupt, "__notes__", ()))
+            self.assertIn("hook temporary-entry cleanup-incomplete", interrupt_notes)
+            self.assertIn("descriptor-bound/path-verified", interrupt_notes)
+            self.assertTrue(temporary.exists())
+        finally:
+            try:
+                actual_unlink(temporary_name, dir_fd=binding.fd)
+            except FileNotFoundError:
+                pass
+            project_journal._close_hook_binding(binding)
 
     def test_install_hooks_cleans_staged_hook_only_after_uncommitted_exchange_error(
         self,
