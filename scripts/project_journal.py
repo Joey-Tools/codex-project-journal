@@ -23,7 +23,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from typing import Any
 
 
@@ -74,6 +74,7 @@ MAX_GIT_VERSION_OUTPUT_BYTES = 4096
 MAX_GLOBAL_GIT_CONFIG_OUTPUT_BYTES = 16 * 1024
 MAX_GLOBAL_GIT_CONFIG_SOURCE_BYTES = 1024 * 1024
 MAX_EXISTING_HOOK_BYTES = 1024 * 1024
+MAX_HOOK_RECOVERY_PATH_SCAN_ENTRIES = 4096
 MAX_GENERIC_GIT_STDOUT_BYTES = 4 * 1024 * 1024
 MAX_GIT_EXECUTABLE_BYTES = 64 * 1024 * 1024
 GIT_INDEX_SNAPSHOT_TIMEOUT_SECONDS = 10.0
@@ -643,24 +644,53 @@ def _merge_terminal_error(
     return primary
 
 
-def _add_exception_detail(error: BaseException, detail: object) -> None:
-    text = str(detail)
-    add_note = getattr(error, "add_note", None)
-    if callable(add_note):
-        add_note(text)
+def _add_exception_details(
+    error: BaseException,
+    details: Iterable[object],
+) -> None:
+    additions = [_bounded_signal_report_detail(detail) for detail in details]
+    if not additions:
         return
+    if len(additions) > MAX_DEFERRED_SIGNAL_REPORT_DETAILS:
+        additions = [
+            *additions[: MAX_DEFERRED_SIGNAL_REPORT_DETAILS - 1],
+            additions[-1],
+        ]
     existing = getattr(error, "__notes__", ())
     notes = (
         [note for note in existing if isinstance(note, str)]
         if isinstance(existing, (list, tuple))
         else []
     )
-    notes = notes[: MAX_DEFERRED_SIGNAL_REPORT_DETAILS - 1]
-    notes.append(text)
+    retained = max(0, MAX_DEFERRED_SIGNAL_REPORT_DETAILS - len(additions))
+    notes = [*notes[:retained], *additions]
     try:
         error.__notes__ = notes
+        return
     except (AttributeError, TypeError):
-        pass
+        add_note = getattr(error, "add_note", None)
+        if not callable(add_note):
+            return
+    for detail in additions:
+        add_note(detail)
+
+
+def _add_exception_detail(error: BaseException, detail: object) -> None:
+    _add_exception_details(error, (detail,))
+
+
+def _exception_details(
+    error: BaseException,
+    label: str,
+) -> list[str]:
+    details = [f"{label}: {error}"]
+    details.extend(
+        str(detail)
+        for detail in getattr(error, "__notes__", ())[
+            :MAX_DEFERRED_SIGNAL_REPORT_DETAILS
+        ]
+    )
+    return details
 
 
 def _run_with_deferred_termination(action: Callable[[], Any]) -> Any:
@@ -782,17 +812,30 @@ def _run_with_deferred_termination(action: Callable[[], Any]) -> Any:
                 )
         _ACTIVE_DEFERRED_TERMINATION = None
 
+    interruption_details: list[object] = []
+    if interruption is not None and terminal_error is not None:
+        interruption_details.extend(
+            _exception_details(
+                terminal_error,
+                "terminal convergence failed",
+            )
+        )
+        terminal_error = None
+
     if runtime_cleanup_issue is not None and state.pending_signal is None:
-        if terminal_error is not None:
+        if interruption is not None:
+            interruption_details.append(runtime_cleanup_issue)
+        elif terminal_error is not None:
             terminal_error = _merge_terminal_error(
                 terminal_error,
                 UserError(runtime_cleanup_issue),
                 "runtime cleanup also failed",
             )
-        elif interruption is None:
-            interruption = UserError(runtime_cleanup_issue)
         else:
-            _add_exception_detail(interruption, runtime_cleanup_issue)
+            interruption = UserError(runtime_cleanup_issue)
+
+    if interruption is not None and interruption_details:
+        _add_exception_details(interruption, interruption_details)
 
     if propagation_status is not None:
         return propagation_status
@@ -5069,20 +5112,403 @@ def _rollback_hook_exchange(
     return None
 
 
+def _hook_recovery_exception_evidence(error: BaseException) -> dict[str, object]:
+    evidence: dict[str, object] = {"type": type(error).__name__}
+    candidates = (error, error.__cause__, error.__context__)
+    for candidate in candidates:
+        error_number = getattr(candidate, "errno", None)
+        if isinstance(error_number, int):
+            evidence["errno"] = error_number
+            error_name = errno.errorcode.get(error_number)
+            if error_name is not None:
+                evidence["error_name"] = error_name
+            break
+    return evidence
+
+
+def _hook_recovery_exception_summary(error: BaseException) -> str:
+    evidence = _hook_recovery_exception_evidence(error)
+    summary = str(evidence["type"])
+    if "errno" in evidence:
+        summary += f" errno={evidence['errno']}"
+    if "error_name" in evidence:
+        summary += f" ({evidence['error_name']})"
+    return summary
+
+
+def _hook_leaf_identity_evidence(
+    identity: tuple[int, ...],
+    digest: str | None,
+) -> dict[str, object]:
+    evidence: dict[str, object] = {
+        "device": identity[0],
+        "inode": identity[1],
+        "type": f"0o{identity[2]:o}",
+        "uid": identity[3],
+        "gid": identity[4],
+        "mode": f"0o{identity[5]:03o}",
+        "size": identity[6],
+    }
+    if digest is not None:
+        evidence["digest"] = digest
+    return evidence
+
+
+def _bound_hook_child_component(
+    parent: _BoundHookDirectory,
+    child: _BoundHookDirectory,
+) -> tuple[str | None, str | None]:
+    if child.component is None or child.parent_fd != parent.fd:
+        return None, "bound ancestor parent relationship is invalid"
+
+    def matches(name: str) -> bool:
+        try:
+            value = os.stat(
+                name,
+                dir_fd=parent.fd,
+                follow_symlinks=False,
+            )
+        except OSError:
+            return False
+        if not stat.S_ISDIR(value.st_mode):
+            return False
+        try:
+            identity = _validate_hook_directory_stat(
+                pathlib.Path(name),
+                value,
+                require_access_policy=child.access_policy_required,
+            )
+        except UserError:
+            return False
+        return identity == child.identity
+
+    if matches(child.component):
+        return child.component, None
+
+    matched: list[str] = []
+    try:
+        with os.scandir(parent.fd) as entries:
+            for index, entry in enumerate(entries, start=1):
+                if index > MAX_HOOK_RECOVERY_PATH_SCAN_ENTRIES:
+                    return (
+                        None,
+                        "bound parent directory exceeds the recovery path "
+                        f"scan limit of {MAX_HOOK_RECOVERY_PATH_SCAN_ENTRIES} entries",
+                    )
+                name = os.fsdecode(entry.name)
+                if name == child.component:
+                    continue
+                if matches(name):
+                    matched.append(name)
+                    if len(matched) > 1:
+                        return (
+                            None,
+                            "bound ancestor has multiple descriptor-relative "
+                            "names under its held parent",
+                        )
+    except OSError as exc:
+        return (
+            None,
+            "bound parent directory scan failed: "
+            f"{_hook_recovery_exception_summary(exc)}",
+        )
+    if not matched:
+        return (
+            None,
+            "bound ancestor is no longer a descriptor-relative entry of its "
+            "held parent",
+        )
+    return matched[0], None
+
+
+def _resolve_bound_hook_directory_path(
+    binding: _HookDirectoryBinding,
+) -> tuple[pathlib.Path | None, str | None]:
+    if not binding.ancestors:
+        return None, "hook directory ancestor binding is empty"
+    resolved = pathlib.Path(os.sep)
+    for index, ancestor in enumerate(binding.ancestors):
+        descriptor_label = pathlib.Path(f"<held-hook-ancestor-{index}>")
+        try:
+            descriptor_identity = _validate_hook_directory_stat(
+                descriptor_label,
+                os.fstat(ancestor.fd),
+                require_access_policy=ancestor.access_policy_required,
+            )
+            if ancestor.access_policy_required:
+                _reject_extended_acl(
+                    ancestor.fd,
+                    descriptor_label,
+                    "recovery hook path ancestor",
+                )
+        except BaseException as exc:
+            return (
+                None,
+                f"held ancestor {index} revalidation failed or is unreadable: "
+                f"{_hook_recovery_exception_summary(exc)}",
+            )
+        if descriptor_identity != ancestor.identity:
+            return (
+                None,
+                f"held ancestor {index} object identity or access policy changed",
+            )
+        if index == 0:
+            try:
+                root_identity = _validate_hook_directory_stat(
+                    pathlib.Path(os.sep),
+                    os.stat(os.sep, follow_symlinks=False),
+                    require_access_policy=False,
+                )
+            except BaseException as exc:
+                return (
+                    None,
+                    "filesystem root revalidation failed or is unreadable: "
+                    f"{_hook_recovery_exception_summary(exc)}",
+                )
+            if root_identity != ancestor.identity:
+                return None, "filesystem root object identity changed"
+            continue
+        component, error = _bound_hook_child_component(
+            binding.ancestors[index - 1],
+            ancestor,
+        )
+        if component is None:
+            return None, f"held ancestor {index} path is unverified: {error}"
+        resolved /= component
+    if binding.fd != binding.ancestors[-1].fd:
+        return None, "hook directory descriptor does not match its final ancestor"
+    return resolved, None
+
+
+def _hook_recovery_reference(
+    binding: _HookDirectoryBinding,
+    temporary_name: str,
+    expected: _HookTargetSnapshot,
+) -> str:
+    evidence: dict[str, Any] = {
+        "leaf": temporary_name,
+        "path_status": "path_unverified",
+    }
+    reasons: list[str] = []
+    try:
+        directory_stat = os.fstat(binding.fd)
+        raw_directory_identity = _directory_identity(directory_stat)
+        evidence["directory"] = {
+            "device": raw_directory_identity[0],
+            "inode": raw_directory_identity[1],
+            "uid": raw_directory_identity[2],
+            "gid": raw_directory_identity[3],
+            "mode": f"0o{raw_directory_identity[4]:03o}",
+        }
+        directory_identity = _validate_hook_directory_stat(
+            pathlib.Path("<held-hook-directory>"),
+            directory_stat,
+        )
+        _reject_extended_acl(
+            binding.fd,
+            pathlib.Path("<held-hook-directory>"),
+            "recovery hook directory",
+        )
+    except BaseException as exc:
+        evidence["directory_status"] = "unreadable"
+        evidence["directory_error"] = _hook_recovery_exception_evidence(exc)
+        reasons.append(
+            "held hook directory revalidation failed or is unreadable: "
+            f"{_hook_recovery_exception_summary(exc)}"
+        )
+    else:
+        if directory_identity != binding.identity:
+            evidence["directory_status"] = "mismatched"
+            reasons.append("held hook directory identity or access policy changed")
+        else:
+            evidence["directory_status"] = "verified"
+
+    recovered: _HookTargetSnapshot | None = None
+    try:
+        recovered, _recovered_content = _snapshot_hook_target(
+            binding,
+            temporary_name,
+        )
+    except BaseException as exc:
+        evidence["held_object_status"] = "unreadable"
+        evidence["held_object_error"] = _hook_recovery_exception_evidence(exc)
+        reasons.append(
+            "descriptor-relative recovery leaf revalidation failed or is "
+            f"unreadable: {_hook_recovery_exception_summary(exc)}"
+        )
+        try:
+            observed_stat = os.stat(
+                temporary_name,
+                dir_fd=binding.fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            evidence["leaf_observation_status"] = "missing"
+        except OSError as observation_error:
+            evidence["leaf_observation_status"] = "unreadable"
+            evidence["leaf_observation_error"] = _hook_recovery_exception_evidence(
+                observation_error
+            )
+        else:
+            evidence["leaf_observation_status"] = "observed"
+            evidence["leaf_identity"] = _hook_leaf_identity_evidence(
+                _hook_target_identity(observed_stat),
+                None,
+            )
+    else:
+        if not recovered.exists:
+            evidence["held_object_status"] = "missing"
+            reasons.append("descriptor-relative recovery leaf is missing")
+        else:
+            assert recovered.identity is not None
+            evidence["leaf_identity"] = _hook_leaf_identity_evidence(
+                recovered.identity,
+                recovered.digest,
+            )
+            if recovered == expected:
+                evidence["held_object_status"] = "verified"
+            else:
+                evidence["held_object_status"] = "mismatched"
+                reasons.append(
+                    _hook_snapshot_match_status(
+                        recovered,
+                        expected,
+                        "descriptor-relative recovery leaf",
+                    )
+                )
+
+    first_path, first_error = _resolve_bound_hook_directory_path(binding)
+    if first_path is None:
+        reasons.append(first_error or "first ancestor-chain resolution failed")
+    if (
+        first_path is not None
+        and recovered is not None
+        and recovered.exists
+        and evidence.get("directory_status") == "verified"
+    ):
+        second_path, second_error = _resolve_bound_hook_directory_path(binding)
+        if second_path != first_path:
+            reasons.append(
+                second_error
+                or "bound ancestor chain changed during recovery-leaf validation"
+            )
+        else:
+            recovery_path = second_path / temporary_name
+            try:
+                path_stat = os.stat(recovery_path, follow_symlinks=False)
+            except OSError as exc:
+                reasons.append(
+                    "resolved recovery leaf became unavailable: "
+                    f"{_bounded_signal_report_detail(exc)}"
+                )
+            else:
+                if _hook_target_identity(path_stat) != recovered.identity:
+                    reasons.append(
+                        "resolved recovery leaf does not bind the held object identity"
+                    )
+                else:
+                    final_path, final_error = _resolve_bound_hook_directory_path(
+                        binding
+                    )
+                    if final_path != second_path:
+                        reasons.append(
+                            final_error
+                            or "bound ancestor chain changed after recovery-leaf "
+                            "path validation"
+                        )
+                    else:
+                        try:
+                            rebound, _rebound_content = _snapshot_hook_target(
+                                binding,
+                                temporary_name,
+                            )
+                        except BaseException as exc:
+                            reasons.append(
+                                "final descriptor-relative recovery leaf "
+                                "revalidation failed or is unreadable: "
+                                f"{_hook_recovery_exception_summary(exc)}"
+                            )
+                        else:
+                            confirmed_path, confirmed_error = (
+                                _resolve_bound_hook_directory_path(binding)
+                            )
+                            if rebound != recovered:
+                                reasons.append(
+                                    "descriptor-relative recovery leaf changed "
+                                    "during path validation"
+                                )
+                            elif confirmed_path != final_path:
+                                reasons.append(
+                                    confirmed_error
+                                    or "bound ancestor chain changed during final "
+                                    "recovery-leaf revalidation"
+                                )
+                            else:
+                                try:
+                                    confirmed_stat = os.stat(
+                                        recovery_path,
+                                        follow_symlinks=False,
+                                    )
+                                except OSError as exc:
+                                    reasons.append(
+                                        "resolved recovery leaf became unavailable "
+                                        "after final descriptor-relative "
+                                        "revalidation: "
+                                        f"{_bounded_signal_report_detail(exc)}"
+                                    )
+                                else:
+                                    if (
+                                        _hook_target_identity(confirmed_stat)
+                                        != rebound.identity
+                                    ):
+                                        reasons.append(
+                                            "resolved recovery leaf changed after "
+                                            "final descriptor-relative "
+                                            "revalidation"
+                                        )
+                                    else:
+                                        evidence["path_status"] = "path_verified"
+                                        evidence["path"] = str(recovery_path)
+
+    if reasons:
+        evidence["reason"] = "; ".join(reasons)
+    encoded = json.dumps(
+        evidence,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    if evidence["path_status"] == "path_verified":
+        return (
+            f"preserved recovery locator: {evidence['path']}; "
+            f"recovery_evidence={encoded}"
+        )
+    if evidence.get("held_object_status") == "verified":
+        return (
+            "preserved recovery object with path_unverified; "
+            f"recovery_evidence={encoded}"
+        )
+    return f"recovery path_unverified; recovery_evidence={encoded}"
+
+
 def _recovery_error(
     binding: _HookDirectoryBinding,
     temporary_name: str,
+    expected: _HookTargetSnapshot,
     detail: str,
 ) -> _HookExchangeRecoveryRequired:
-    recovery_path = binding.path / temporary_name
     try:
         os.fsync(binding.fd)
     except OSError as exc:
         detail = f"{detail}; directory fsync failed: {exc}"
+    recovery = _hook_recovery_reference(
+        binding,
+        temporary_name,
+        expected,
+    )
     return _HookExchangeRecoveryRequired(
         f"hook exchange state is uncertain and cleanup is incomplete: "
-        f"{detail}; preserved recovery locator: "
-        f"{recovery_path}",
+        f"{detail}; {recovery}",
         temporary_name,
     )
 
@@ -5092,7 +5518,6 @@ def _interrupted_hook_exchange_recovery_note(
     target: _HookTargetSnapshot,
     temporary_name: str,
 ) -> str:
-    recovery_path = binding.path / temporary_name
     durability_error: str | None = None
     try:
         os.fsync(binding.fd)
@@ -5107,17 +5532,21 @@ def _interrupted_hook_exchange_recovery_note(
     else:
         if recovered == expected:
             verification = (
-                "preserved recovery locator with verified displaced-hook "
-                "identity and content"
+                "descriptor-relative displaced-hook identity, content, and "
+                "access policy remain verified"
             )
         else:
             verification = (
-                "recovery locator was retained, but its identity or content "
-                "does not match the displaced hook"
+                "descriptor-relative recovery leaf does not match the displaced hook"
             )
     if durability_error is not None:
         verification += f"; directory durability is unverified: {durability_error}"
-    return f"hook exchange may have committed; {verification}: {recovery_path}"
+    recovery = _hook_recovery_reference(
+        binding,
+        temporary_name,
+        expected,
+    )
+    return f"hook exchange may have committed; {verification}; {recovery}"
 
 
 def _hook_snapshot_match_status(
@@ -5150,16 +5579,21 @@ def _hook_snapshot_match_status(
 def _uncertain_absent_hook_rename_error(
     binding: _HookDirectoryBinding,
     temporary_name: str,
+    expected: _HookTargetSnapshot,
     detail: str,
 ) -> _HookExchangeRecoveryRequired:
-    recovery_path = binding.path / temporary_name
     try:
         os.fsync(binding.fd)
     except OSError as exc:
         detail = f"{detail}; directory fsync failed: {exc}"
+    recovery = _hook_recovery_reference(
+        binding,
+        temporary_name,
+        expected,
+    )
     return _HookExchangeRecoveryRequired(
         "absent-target no-replace rename state is uncertain and cleanup is "
-        f"incomplete: {detail}; preserved recovery locator: {recovery_path}",
+        f"incomplete: {detail}; {recovery}",
         temporary_name,
     )
 
@@ -5231,6 +5665,7 @@ def _revalidate_failed_absent_hook_rename(
     raise _uncertain_absent_hook_rename_error(
         binding,
         temporary_name,
+        staged,
         f"atomic no-replace rename reported {rename_error}; {target_status}; "
         f"{temporary_status}",
     ) from rename_error
@@ -5243,6 +5678,7 @@ def _interrupted_absent_hook_commit_note(
     staged: _HookTargetSnapshot,
 ) -> str:
     durability_error: str | None = None
+    recovery: str | None = None
     try:
         os.fsync(binding.fd)
     except BaseException as exc:
@@ -5285,14 +5721,16 @@ def _interrupted_absent_hook_commit_note(
                 "recovery object exists"
             )
         elif temporary == staged:
-            temporary_status = (
-                f"staged temporary remains at cleanup locator: "
-                f"{binding.path / temporary_name}"
+            temporary_status = "staged temporary remains after interrupted cleanup"
+            recovery = _hook_recovery_reference(
+                binding,
+                temporary_name,
+                staged,
             )
         else:
             temporary_status = (
                 "temporary entry mismatches the staged hook; no displaced-hook "
-                f"recovery object is claimed: {binding.path / temporary_name}"
+                "recovery object or path is claimed"
             )
 
     commit_status = (
@@ -5303,6 +5741,8 @@ def _interrupted_absent_hook_commit_note(
     detail = f"{commit_status}; {installed_status}; {temporary_status}"
     if durability_error is not None:
         detail += f"; directory durability is unverified: {durability_error}"
+    if recovery is not None:
+        detail += f"; {recovery}"
     return detail
 
 
@@ -5312,8 +5752,8 @@ def _interrupted_hook_post_commit_note(
     temporary_name: str,
     staged: _HookTargetSnapshot,
 ) -> str:
-    cleanup_path = binding.path / temporary_name
     durability_error: str | None = None
+    recovery: str | None = None
     try:
         os.fsync(binding.fd)
     except BaseException as exc:
@@ -5352,14 +5792,16 @@ def _interrupted_hook_post_commit_note(
                     "was consumed and no recovery object exists"
                 )
             elif temporary == expected_temporary:
-                cleanup_status = (
-                    f"displaced-hook cleanup was interrupted; retained cleanup "
-                    f"locator: {cleanup_path}"
+                cleanup_status = "displaced-hook cleanup was interrupted"
+                recovery = _hook_recovery_reference(
+                    binding,
+                    temporary_name,
+                    expected_temporary,
                 )
             else:
                 cleanup_status = (
-                    f"temporary entry mismatches the verified displaced hook; "
-                    f"no recovery identity is claimed: {cleanup_path}"
+                    "temporary entry mismatches the verified displaced hook; "
+                    "no recovery identity or path is claimed"
                 )
         else:
             if not temporary.exists:
@@ -5368,14 +5810,16 @@ def _interrupted_hook_post_commit_note(
                     "no-replace rename; no displaced-hook recovery object exists"
                 )
             elif temporary == staged:
-                cleanup_status = (
-                    f"staged temporary unexpectedly remains at cleanup locator: "
-                    f"{cleanup_path}"
+                cleanup_status = "staged temporary unexpectedly remains after commit"
+                recovery = _hook_recovery_reference(
+                    binding,
+                    temporary_name,
+                    staged,
                 )
             else:
                 cleanup_status = (
                     "temporary entry mismatches the staged hook; no "
-                    f"displaced-hook recovery object is claimed: {cleanup_path}"
+                    "displaced-hook recovery object or path is claimed"
                 )
 
     detail = (
@@ -5384,6 +5828,8 @@ def _interrupted_hook_post_commit_note(
     )
     if durability_error is not None:
         detail += f"; directory durability is unverified: {durability_error}"
+    if recovery is not None:
+        detail += f"; {recovery}"
     return detail
 
 
@@ -5449,6 +5895,7 @@ def _revalidate_failed_hook_exchange(
     raise _recovery_error(
         binding,
         temporary_name,
+        expected_displaced,
         f"atomic exchange reported {exchange_error}; {target_status}; "
         f"{temporary_status}",
     ) from exchange_error
@@ -5524,16 +5971,17 @@ def _commit_hook_target_atomically(
             ) from exc
         raise
 
+    expected_displaced = dataclasses.replace(target, name=temporary_name)
     try:
         displaced, _content = _snapshot_hook_target(binding, temporary_name)
     except BaseException as exc:
         raise _recovery_error(
             binding,
             temporary_name,
+            expected_displaced,
             f"the displaced entry could not be inspected: {exc}",
         ) from exc
 
-    expected_displaced = dataclasses.replace(target, name=temporary_name)
     if displaced == expected_displaced:
         try:
             installed, _installed_content = _snapshot_hook_target(
@@ -5544,6 +5992,7 @@ def _commit_hook_target_atomically(
             raise _recovery_error(
                 binding,
                 temporary_name,
+                expected_displaced,
                 f"the installed target could not be verified before cleanup: {exc}",
             ) from exc
         expected_installed = dataclasses.replace(staged, name=target.name)
@@ -5551,6 +6000,7 @@ def _commit_hook_target_atomically(
             raise _recovery_error(
                 binding,
                 temporary_name,
+                expected_displaced,
                 "the installed target does not match the staged hook before cleanup",
             )
         commit_state.mark_installed_target_committed("displaced-hook cleanup")
@@ -5571,6 +6021,7 @@ def _commit_hook_target_atomically(
         raise _recovery_error(
             binding,
             temporary_name,
+            expected_displaced,
             f"the installed target could not be rebound: {ownership_exc}",
         ) from mismatch
     expected_installed = dataclasses.replace(staged, name=target.name)
@@ -5578,6 +6029,7 @@ def _commit_hook_target_atomically(
         raise _recovery_error(
             binding,
             temporary_name,
+            expected_displaced,
             "the installed target is no longer owned by this transaction",
         ) from mismatch
     rollback_error = _rollback_hook_exchange(
@@ -5589,6 +6041,7 @@ def _commit_hook_target_atomically(
         raise _recovery_error(
             binding,
             temporary_name,
+            expected_displaced,
             rollback_error,
         ) from mismatch
     try:
@@ -5604,6 +6057,7 @@ def _commit_hook_target_atomically(
         raise _recovery_error(
             binding,
             temporary_name,
+            staged,
             f"rollback result could not be inspected: {verification_exc}",
         ) from mismatch
     expected_restored = dataclasses.replace(displaced, name=target.name)
@@ -5611,6 +6065,7 @@ def _commit_hook_target_atomically(
         raise _recovery_error(
             binding,
             temporary_name,
+            staged,
             "rollback result could not be bound to the staged and displaced objects",
         ) from mismatch
     commit_state.mark_cleanup_safe()
@@ -5708,17 +6163,22 @@ def _install_hook(
             ) from exc
         if commit_state.must_preserve_temporary:
             temporary_created = False
-            recovery = binding.path / temporary_name
+            durability_detail = ""
             try:
                 os.fsync(binding.fd)
             except OSError as fsync_exc:
-                raise UserError(
-                    f"hook exchange may have committed; preserved recovery "
-                    f"locator {recovery}, but directory fsync failed: {fsync_exc}"
-                ) from exc
+                durability_detail = f"; directory fsync failed: {fsync_exc}"
+            expected_recovery = dataclasses.replace(
+                target,
+                name=temporary_name,
+            )
+            recovery = _hook_recovery_reference(
+                binding,
+                temporary_name,
+                expected_recovery,
+            )
             raise UserError(
-                f"hook exchange may have committed; preserved recovery "
-                f"locator: {recovery}"
+                f"hook exchange may have committed{durability_detail}; {recovery}"
             ) from exc
         if commit_state.installed_target_committed:
             temporary_created = False

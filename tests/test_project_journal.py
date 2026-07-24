@@ -167,6 +167,48 @@ class ProjectJournalTests(unittest.TestCase):
             snapshot_owner=snapshot_owner,
         )
 
+    def make_terminal_mask_failure_runtime(
+        self,
+        handled: int,
+        *,
+        persistent: bool,
+    ) -> tuple[project_journal._PosixSignalRuntime, list[int]]:
+        actual_runtime = project_journal._load_posix_signal_runtime()
+        managed_block_attempts = [0]
+
+        def fail_terminal_block(
+            how: int,
+            signals: set[int],
+        ) -> set[int]:
+            if how == actual_runtime.sig_block and signals == {handled}:
+                managed_block_attempts[0] += 1
+                if managed_block_attempts[0] == 2 or (
+                    persistent and managed_block_attempts[0] >= 2
+                ):
+                    failure = (
+                        "persistent terminal block failure"
+                        if persistent
+                        else "terminal block failure"
+                    )
+                    raise project_journal.UnsupportedPlatform(failure)
+            return actual_runtime.pthread_sigmask(how, signals)
+
+        return (
+            project_journal._PosixSignalRuntime(
+                pthread_sigmask=fail_terminal_block,
+                sigpending=actual_runtime.sigpending,
+                sigwait=actual_runtime.sigwait,
+                sig_block=actual_runtime.sig_block,
+                sig_setmask=actual_runtime.sig_setmask,
+            ),
+            managed_block_attempts,
+        )
+
+    def recovery_evidence(self, reference: str) -> dict[str, object]:
+        marker = "recovery_evidence="
+        self.assertIn(marker, reference)
+        return json.loads(reference.split(marker, 1)[1])
+
     def write_journal(
         self,
         repo: pathlib.Path,
@@ -3503,9 +3545,26 @@ class ProjectJournalTests(unittest.TestCase):
             signal.signal(handled, original_handler)
             signal.pthread_sigmask(signal.SIG_SETMASK, original_mask)
 
+    @unittest.skipUnless(
+        os.name == "posix"
+        and hasattr(signal, "pthread_sigmask")
+        and hasattr(signal, "sigpending"),
+        "POSIX deferred termination mask contract",
+    )
     def test_main_reports_cleanup_locator_without_exception_add_note(
         self,
     ) -> None:
+        handled = signal.SIGTERM
+        wrapped_runtime, managed_block_attempts = (
+            self.make_terminal_mask_failure_runtime(
+                handled,
+                persistent=False,
+            )
+        )
+        original_handler = signal.getsignal(handled)
+        original_mask = {
+            int(value) for value in signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        }
         cleanup_issue = (
             "Git runtime snapshot cleanup-incomplete; retained locator "
             "/tmp/project-journal-command-error"
@@ -3517,34 +3576,134 @@ class ProjectJournalTests(unittest.TestCase):
 
         parser.parse_args.return_value = mock.Mock(func=fail_command)
         stderr = io.StringIO()
-        with mock.patch.object(project_journal.UserError, "add_note", None):
+        try:
+            with mock.patch.object(project_journal.UserError, "add_note", None):
+                with mock.patch.object(
+                    project_journal,
+                    "_load_posix_signal_runtime",
+                    return_value=wrapped_runtime,
+                ):
+                    with mock.patch.object(
+                        project_journal,
+                        "_termination_signals",
+                        return_value=(handled,),
+                    ):
+                        with mock.patch.object(
+                            project_journal,
+                            "_initialize_git_runtime",
+                            return_value=None,
+                        ):
+                            with mock.patch.object(
+                                project_journal,
+                                "build_parser",
+                                return_value=parser,
+                            ):
+                                with mock.patch.object(
+                                    project_journal,
+                                    "_cleanup_git_runtime_at_terminal",
+                                    return_value=cleanup_issue,
+                                ) as cleanup:
+                                    with mock.patch.object(
+                                        project_journal.sys,
+                                        "stderr",
+                                        stderr,
+                                    ):
+                                        status = project_journal.main([])
+        finally:
+            signal.signal(handled, original_handler)
+            signal.pthread_sigmask(signal.SIG_SETMASK, original_mask)
+
+        self.assertEqual(status, 1)
+        self.assertEqual(managed_block_attempts, [3])
+        cleanup.assert_called_once_with()
+        parser.parse_args.assert_called_once_with([])
+        self.assertIn("error: command rejected", stderr.getvalue())
+        self.assertIn(
+            "note: terminal convergence failed: terminal block failure",
+            stderr.getvalue(),
+        )
+        self.assertIn(f"note: {cleanup_issue}", stderr.getvalue())
+
+    @unittest.skipUnless(
+        os.name == "posix"
+        and hasattr(signal, "pthread_sigmask")
+        and hasattr(signal, "sigpending"),
+        "POSIX deferred termination mask contract",
+    )
+    def test_action_exception_remains_primary_after_persistent_terminal_failure(
+        self,
+    ) -> None:
+        handled = signal.SIGTERM
+        wrapped_runtime, managed_block_attempts = (
+            self.make_terminal_mask_failure_runtime(
+                handled,
+                persistent=True,
+            )
+        )
+        original_handler = signal.getsignal(handled)
+        original_mask = {
+            int(value) for value in signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        }
+        cleanup_issue = (
+            "Git runtime snapshot cleanup-incomplete; retained locator "
+            "/tmp/project-journal-persistent-terminal"
+        )
+        action_error = ValueError("action failed")
+        action_error.__notes__ = [
+            f"action recovery note {index}"
+            for index in range(project_journal.MAX_DEFERRED_SIGNAL_REPORT_DETAILS)
+        ]
+
+        def fail_action() -> int:
+            raise action_error
+
+        try:
             with mock.patch.object(
                 project_journal,
-                "_initialize_git_runtime",
-                return_value=None,
+                "_load_posix_signal_runtime",
+                return_value=wrapped_runtime,
             ):
                 with mock.patch.object(
                     project_journal,
-                    "build_parser",
-                    return_value=parser,
+                    "_termination_signals",
+                    return_value=(handled,),
                 ):
                     with mock.patch.object(
                         project_journal,
                         "_cleanup_git_runtime_at_terminal",
                         return_value=cleanup_issue,
                     ) as cleanup:
-                        with mock.patch.object(
-                            project_journal.sys,
-                            "stderr",
-                            stderr,
-                        ):
-                            status = project_journal.main([])
+                        with self.assertRaises(ValueError) as raised:
+                            project_journal._run_with_deferred_termination(fail_action)
+        finally:
+            signal.signal(handled, original_handler)
+            signal.pthread_sigmask(signal.SIG_SETMASK, original_mask)
 
-        self.assertEqual(status, 1)
+        self.assertIs(raised.exception, action_error)
+        self.assertEqual(managed_block_attempts, [3])
         cleanup.assert_called_once_with()
-        parser.parse_args.assert_called_once_with([])
-        self.assertIn("error: command rejected", stderr.getvalue())
-        self.assertIn(f"note: {cleanup_issue}", stderr.getvalue())
+        action_notes = getattr(raised.exception, "__notes__", ())
+        self.assertLessEqual(
+            len(action_notes),
+            project_journal.MAX_DEFERRED_SIGNAL_REPORT_DETAILS,
+        )
+        retained_action_notes = project_journal.MAX_DEFERRED_SIGNAL_REPORT_DETAILS - 3
+        self.assertEqual(
+            action_notes[:retained_action_notes],
+            [f"action recovery note {index}" for index in range(retained_action_notes)],
+        )
+        self.assertEqual(action_notes[-1], cleanup_issue)
+        notes = "\n".join(action_notes)
+        self.assertIn("action recovery note", notes)
+        self.assertIn(
+            "terminal convergence failed: persistent terminal block failure",
+            notes,
+        )
+        self.assertIn(
+            "terminal convergence also failed: persistent terminal block failure",
+            notes,
+        )
+        self.assertIn(cleanup_issue, notes)
 
     def test_normal_main_invocations_reinitialize_after_terminal_cleanup(
         self,
@@ -5241,7 +5400,23 @@ class ProjectJournalTests(unittest.TestCase):
         )
         self.assertIn("required `O_NOFOLLOW|O_NONBLOCK`", skill)
         self.assertIn("every ancestor identity/access policy", skill)
-        self.assertIn("allowing timestamp-only transitions", skill)
+        self.assertIn(
+            "preserve that exact action exception as primary",
+            skill,
+        )
+        self.assertIn(
+            "without `BaseException.add_note`",
+            skill,
+        )
+        self.assertIn(
+            "held root-to-directory descriptor chain",
+            skill,
+        )
+        self.assertIn("`path_unverified`", skill)
+        self.assertIn(
+            "allowing timestamp and directory child-entry churn",
+            skill,
+        )
         self.assertIn(
             "do not overwrite authoritative index adoption",
             skill,
@@ -5699,7 +5874,16 @@ class ProjectJournalTests(unittest.TestCase):
             project_journal.HOOK_BEGIN,
             installed.read_text(encoding="utf-8"),
         )
-        self.assertIn("preserved recovery locator", str(raised.exception))
+        message = str(raised.exception)
+        self.assertIn("recovery path_unverified", message)
+        evidence = self.recovery_evidence(message)
+        self.assertEqual(evidence["path_status"], "path_unverified")
+        self.assertEqual(evidence["held_object_status"], "unreadable")
+        self.assertEqual(evidence["leaf_observation_status"], "observed")
+        self.assertIsInstance(evidence["leaf_identity"]["device"], int)
+        self.assertIsInstance(evidence["leaf_identity"]["inode"], int)
+        self.assertEqual(evidence["leaf_identity"]["type"], "0o120000")
+        self.assertNotIn("preserved recovery locator", message)
         recoveries = list(
             (repo / ".githooks").glob(".project-journal-post-merge-*.tmp")
         )
@@ -6832,6 +7016,161 @@ class ProjectJournalTests(unittest.TestCase):
             project_journal.HOOK_BEGIN,
             (moved_hooks / "post-merge").read_text(encoding="utf-8"),
         )
+
+    def test_hook_recovery_locator_rebinds_renamed_parent_after_exchange(
+        self,
+    ) -> None:
+        repo = self.init_repo().resolve()
+        hooks = repo / ".githooks"
+        hooks.mkdir()
+        target_name = "post-merge"
+        temporary_name = ".project-journal-post-merge-recovery.tmp"
+        (hooks / target_name).write_text("displaced hook\n", encoding="utf-8")
+        (hooks / temporary_name).write_text("installed hook\n", encoding="utf-8")
+        binding = project_journal._bind_hook_directory(
+            project_journal._HookPathPlan(
+                root=repo,
+                components=(".githooks",),
+            )
+        )
+        try:
+            displaced, _content = project_journal._snapshot_hook_target(
+                binding,
+                target_name,
+            )
+            project_journal._rename_hook_entry_with_flag(
+                binding.fd,
+                temporary_name,
+                target_name,
+                exchange=True,
+            )
+            expected = project_journal.dataclasses.replace(
+                displaced,
+                name=temporary_name,
+            )
+            renamed_hooks = repo / ".githooks-renamed"
+            hooks.rename(renamed_hooks)
+            benign_entry = renamed_hooks / "benign-child-churn"
+            benign_entry.write_text("benign\n", encoding="utf-8")
+            benign_entry.unlink()
+
+            reference = project_journal._hook_recovery_reference(
+                binding,
+                temporary_name,
+                expected,
+            )
+            evidence = self.recovery_evidence(reference)
+            held, _held_content = project_journal._snapshot_hook_target(
+                binding,
+                temporary_name,
+            )
+
+            self.assertIn("preserved recovery locator", reference)
+            self.assertEqual(evidence["path_status"], "path_verified")
+            self.assertEqual(evidence["held_object_status"], "verified")
+            self.assertEqual(
+                evidence["path"],
+                str(renamed_hooks / temporary_name),
+            )
+            self.assertNotIn(str(hooks / temporary_name), reference)
+            self.assertEqual(held, expected)
+            self.assertEqual(
+                evidence["directory"]["inode"],
+                binding.identity[1],
+            )
+            self.assertEqual(
+                evidence["leaf_identity"]["inode"],
+                expected.identity[1],
+            )
+        finally:
+            project_journal._close_hook_binding(binding)
+
+    def test_hook_recovery_evidence_survives_unresolved_ancestor_replacement(
+        self,
+    ) -> None:
+        repo = self.init_repo().resolve()
+        hooks = repo / ".githooks"
+        hooks.mkdir()
+        target_name = "post-merge"
+        temporary_name = ".project-journal-post-merge-recovery.tmp"
+        (hooks / target_name).write_text("displaced hook\n", encoding="utf-8")
+        (hooks / temporary_name).write_text("installed hook\n", encoding="utf-8")
+        binding = project_journal._bind_hook_directory(
+            project_journal._HookPathPlan(
+                root=repo,
+                components=(".githooks",),
+            )
+        )
+        try:
+            displaced, _content = project_journal._snapshot_hook_target(
+                binding,
+                target_name,
+            )
+            project_journal._rename_hook_entry_with_flag(
+                binding.fd,
+                temporary_name,
+                target_name,
+                exchange=True,
+            )
+            expected = project_journal.dataclasses.replace(
+                displaced,
+                name=temporary_name,
+            )
+            relocated_root = repo.parent / "relocated"
+            relocated_root.mkdir()
+            moved_repo = relocated_root / "repo-moved"
+            repo.rename(moved_repo)
+            repo.mkdir()
+            replacement_hooks = repo / ".githooks"
+            replacement_hooks.mkdir()
+            (replacement_hooks / temporary_name).write_text(
+                "decoy recovery object\n",
+                encoding="utf-8",
+            )
+
+            reference = project_journal._hook_recovery_reference(
+                binding,
+                temporary_name,
+                expected,
+            )
+            evidence = self.recovery_evidence(reference)
+            held, _held_content = project_journal._snapshot_hook_target(
+                binding,
+                temporary_name,
+            )
+
+            self.assertIn(
+                "preserved recovery object with path_unverified",
+                reference,
+            )
+            self.assertEqual(evidence["path_status"], "path_unverified")
+            self.assertEqual(evidence["directory_status"], "verified")
+            self.assertEqual(evidence["held_object_status"], "verified")
+            self.assertNotIn("path", evidence)
+            self.assertEqual(held, expected)
+            self.assertEqual(
+                evidence["directory"]["device"],
+                binding.identity[0],
+            )
+            self.assertEqual(
+                evidence["directory"]["inode"],
+                binding.identity[1],
+            )
+            self.assertEqual(
+                evidence["leaf_identity"]["device"],
+                expected.identity[0],
+            )
+            self.assertEqual(
+                evidence["leaf_identity"]["inode"],
+                expected.identity[1],
+            )
+            self.assertTrue((moved_repo / ".githooks" / temporary_name).exists())
+            self.assertNotEqual(
+                (replacement_hooks / temporary_name).stat().st_ino,
+                expected.identity[1],
+            )
+        finally:
+            project_journal._close_hook_binding(binding)
 
     def test_install_hooks_detects_racing_allowed_root_replacement(self) -> None:
         repo = self.init_repo()
