@@ -3201,26 +3201,64 @@ def _capture_bounded_process_with_launch(
                 selector_open = False
             raise
         cleanup_error: str | None = None
+        cleanup_details: list[object] = []
         if ownership.permits_group_cleanup:
             try:
                 ownership.claim_group_cleanup()
                 cleanup_error = _terminate_process_group_and_reap(
                     process,
                     selector,
+                    ownership,
                 )
             except BaseException as cleanup_exc:
-                ownership.abandon_incomplete()
-                _close_selector(selector)
-                selector_open = False
-                _annotate_cleanup_interruption(
-                    cleanup_exc,
-                    operation,
-                    "process-group cleanup",
+                cleanup_details.extend(
+                    _exception_details(
+                        cleanup_exc,
+                        f"{operation} process-group cleanup raised",
+                    )
                 )
-                raise
-            selector_open = False
-            if cleanup_error is None:
-                ownership.release()
+                if selector_open:
+                    _close_selector(selector)
+                    selector_open = False
+                if ownership.needs_reap:
+                    try:
+                        cleanup_error = _reap_after_final_group_signal(
+                            process,
+                            ownership.expected_returncode,
+                            time.monotonic() + GIT_PROCESS_KILL_DRAIN_SECONDS,
+                        )
+                    except BaseException as reap_exc:
+                        cleanup_details.extend(
+                            _exception_details(
+                                reap_exc,
+                                f"{operation} reap-only cleanup also raised",
+                            )
+                        )
+                        if isinstance(process.returncode, int):
+                            ownership.release()
+                        else:
+                            ownership.abandon_incomplete()
+                            cleanup_details.append(
+                                f"{operation} cleanup-incomplete: final "
+                                "direct-child reap was interrupted"
+                            )
+                    else:
+                        if cleanup_error is None:
+                            ownership.release()
+                        else:
+                            ownership.abandon_incomplete()
+                elif ownership.state != "released":
+                    ownership.abandon_incomplete()
+                    cleanup_details.append(
+                        f"{operation} cleanup-incomplete: process-group cleanup "
+                        "was interrupted before the reap-only handoff"
+                    )
+            else:
+                selector_open = False
+                if cleanup_error is None:
+                    ownership.release()
+                else:
+                    ownership.abandon_incomplete()
         elif ownership.needs_reap:
             if selector_open:
                 _close_selector(selector)
@@ -3231,33 +3269,44 @@ def _capture_bounded_process_with_launch(
                     ownership.expected_returncode,
                     time.monotonic() + GIT_PROCESS_KILL_DRAIN_SECONDS,
                 )
-            except BaseException:
-                _annotate_cleanup_interruption(
-                    exc,
-                    operation,
-                    "reap-only cleanup",
+            except BaseException as reap_exc:
+                cleanup_details.extend(
+                    _exception_details(
+                        reap_exc,
+                        f"{operation} reap-only cleanup raised",
+                    )
                 )
-                raise exc
-            if cleanup_error is None:
-                ownership.release()
+                if isinstance(process.returncode, int):
+                    ownership.release()
+                else:
+                    ownership.abandon_incomplete()
+                    cleanup_details.append(
+                        f"{operation} cleanup-incomplete: final direct-child "
+                        "reap was interrupted"
+                    )
+            else:
+                if cleanup_error is None:
+                    ownership.release()
+                else:
+                    ownership.abandon_incomplete()
         elif ownership.state == "cleanup-claimed":
             ownership.abandon_incomplete()
             if selector_open:
                 _close_selector(selector)
                 selector_open = False
-            _annotate_cleanup_interruption(
-                exc,
-                operation,
-                "cleanup ownership handoff",
+            cleanup_details.append(
+                f"{operation} cleanup-incomplete: cleanup ownership handoff "
+                "was interrupted before the reap-only state"
             )
         elif selector_open:
             _close_selector(selector)
             selector_open = False
         if cleanup_error is not None:
-            _add_exception_detail(
-                exc,
+            cleanup_details.append(
                 f"{operation} cleanup-incomplete: {cleanup_error}",
             )
+        if cleanup_details:
+            _add_exception_details(exc, cleanup_details)
         raise
     finally:
         if launch is not None and ownership.state == "released":
@@ -6755,9 +6804,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     def dispatch() -> int:
-        _initialize_git_runtime()
         parser = build_parser()
         args = parser.parse_args(argv)
+        _initialize_git_runtime()
         return int(args.func(args))
 
     try:

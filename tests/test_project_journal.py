@@ -3811,6 +3811,43 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertEqual((first, second), (0, 0), stderr.getvalue())
         self.assertEqual(stdout.getvalue().count('"tracked_journal_adopted": false'), 2)
 
+    def test_help_avoids_cleanup_failure_prone_runtime_initialization(self) -> None:
+        old_runtime = project_journal._GIT_RUNTIME
+        old_error = project_journal._GIT_RUNTIME_ERROR
+        runtime = mock.Mock()
+        runtime.snapshot_owner.name = str(self.root / "help-runtime")
+        runtime.snapshot_owner.cleanup.side_effect = OSError(
+            "simulated help runtime cleanup failure"
+        )
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        def initialize_failure_prone_runtime() -> None:
+            project_journal._GIT_RUNTIME = runtime
+
+        project_journal._GIT_RUNTIME = None
+        project_journal._GIT_RUNTIME_ERROR = None
+        try:
+            with mock.patch.object(
+                project_journal,
+                "_initialize_git_runtime",
+                side_effect=initialize_failure_prone_runtime,
+            ) as initialize:
+                with mock.patch.object(project_journal.sys, "stdout", stdout):
+                    with mock.patch.object(project_journal.sys, "stderr", stderr):
+                        with self.assertRaises(SystemExit) as raised:
+                            project_journal.main(["--help"])
+        finally:
+            project_journal._GIT_RUNTIME = old_runtime
+            project_journal._GIT_RUNTIME_ERROR = old_error
+
+        self.assertEqual(raised.exception.code, 0)
+        self.assertEqual(getattr(raised.exception, "__notes__", ()), ())
+        initialize.assert_not_called()
+        runtime.snapshot_owner.cleanup.assert_not_called()
+        self.assertIn("usage:", stdout.getvalue())
+        self.assertNotIn("retained locator", stderr.getvalue())
+
     @unittest.skipUnless(os.name == "posix", "POSIX Git runtime contract")
     def test_failed_runtime_initialization_can_retry_after_repair(self) -> None:
         repo = self.init_repo()
@@ -4853,6 +4890,7 @@ class ProjectJournalTests(unittest.TestCase):
             "original bounded-process action failure",
         )
         original_args = original_error.args
+        observed_ownership: list[project_journal._ProcessOwnership] = []
 
         def reject_output(_chunk: bytes) -> None:
             raise original_error
@@ -4860,9 +4898,11 @@ class ProjectJournalTests(unittest.TestCase):
         def cleanup_then_report(
             process: subprocess.Popen[bytes],
             selector: object,
-            ownership: project_journal._ProcessOwnership | None = None,
+            ownership: project_journal._ProcessOwnership,
             known_returncode: int | None = None,
         ) -> str:
+            observed_ownership.append(ownership)
+            self.assertEqual(ownership.state, "cleanup-claimed")
             actual_error = original_cleanup(
                 process,
                 selector,
@@ -4903,6 +4943,8 @@ class ProjectJournalTests(unittest.TestCase):
             project_journal.UnsupportedPlatform.code,
         )
         self.assertEqual(raised_error.args, original_args)
+        self.assertEqual(len(observed_ownership), 1)
+        self.assertEqual(observed_ownership[0].state, "cleanup-incomplete")
         notes = "\n".join(getattr(raised_error, "__notes__", ()))
         self.assertIn("cleanup-incomplete", notes)
         self.assertIn("simulated process-group cleanup failure", notes)
@@ -4913,6 +4955,123 @@ class ProjectJournalTests(unittest.TestCase):
             traceback = traceback.tb_next
         self.assertIn("reject_output", traceback_names)
         self.assertNotIn("_add_exception_detail", traceback_names)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX process-group contract")
+    def test_error_cleanup_exception_preserves_original_across_ownership_states(
+        self,
+    ) -> None:
+        actual_cleanup = project_journal._terminate_process_group_and_reap
+
+        for mode, cleanup_failure, expected_state in (
+            (
+                "cleanup-claimed",
+                RuntimeError("simulated claimed cleanup exception"),
+                "cleanup-incomplete",
+            ),
+            (
+                "reap-only",
+                LegacyInterrupt("simulated reap handoff interruption"),
+                "released",
+            ),
+            (
+                "released",
+                RuntimeError("simulated post-cleanup exception"),
+                "released",
+            ),
+        ):
+            with self.subTest(mode=mode):
+                original_error = LegacyUnsupportedPlatform(
+                    f"original action failure before {mode}",
+                )
+                original_args = original_error.args
+                observed_ownership: list[project_journal._ProcessOwnership] = []
+                observed_processes: list[subprocess.Popen[bytes]] = []
+
+                def reject_output(_chunk: bytes) -> None:
+                    raise original_error
+
+                def cleanup_then_raise(
+                    process: subprocess.Popen[bytes],
+                    selector: object,
+                    ownership: project_journal._ProcessOwnership,
+                    known_returncode: int | None = None,
+                ) -> str | None:
+                    observed_ownership.append(ownership)
+                    observed_processes.append(process)
+                    self.assertEqual(ownership.state, "cleanup-claimed")
+                    self.assertIsNone(known_returncode)
+                    if mode == "cleanup-claimed":
+                        process.terminate()
+                        process.wait(timeout=5)
+                    elif mode == "reap-only":
+                        process.terminate()
+                        expected_returncode = (
+                            project_journal._wait_for_process_status_without_reaping(
+                                process,
+                                time.monotonic() + 5,
+                                "test child did not reach terminal state",
+                                interruptible=False,
+                            )
+                        )
+                        ownership.transfer_to_reap(expected_returncode)
+                    else:
+                        self.assertIsNone(
+                            actual_cleanup(
+                                process,
+                                selector,
+                                ownership,
+                                known_returncode=known_returncode,
+                            )
+                        )
+                        self.assertEqual(ownership.state, "released")
+                    raise cleanup_failure
+
+                with mock.patch.object(
+                    project_journal,
+                    "_terminate_process_group_and_reap",
+                    side_effect=cleanup_then_raise,
+                ):
+                    try:
+                        self.capture_process(
+                            [
+                                sys.executable,
+                                "-c",
+                                "import os, time; os.write(1, b'x'); time.sleep(30)",
+                            ],
+                            timeout_seconds=5,
+                            stdout_limit=1024,
+                            stdout_feed=reject_output,
+                        )
+                    except LegacyUnsupportedPlatform as exc:
+                        raised_error = exc
+                    else:
+                        self.fail("expected original bounded-process action failure")
+
+                self.assertIs(raised_error, original_error)
+                self.assertIs(type(raised_error), LegacyUnsupportedPlatform)
+                self.assertEqual(
+                    raised_error.code,
+                    project_journal.UnsupportedPlatform.code,
+                )
+                self.assertEqual(raised_error.args, original_args)
+                self.assertEqual(len(observed_ownership), 1)
+                self.assertEqual(observed_ownership[0].state, expected_state)
+                self.assertEqual(len(observed_processes), 1)
+                self.assertIsNotNone(observed_processes[0].returncode)
+                notes = "\n".join(getattr(raised_error, "__notes__", ()))
+                self.assertIn(str(cleanup_failure), notes)
+                if expected_state == "cleanup-incomplete":
+                    self.assertIn(
+                        "interrupted before the reap-only handoff",
+                        notes,
+                    )
+                traceback_names: list[str] = []
+                traceback = raised_error.__traceback__
+                while traceback is not None:
+                    traceback_names.append(traceback.tb_frame.f_code.co_name)
+                    traceback = traceback.tb_next
+                self.assertIn("reject_output", traceback_names)
+                self.assertNotIn("cleanup_then_raise", traceback_names)
 
     def test_bounded_capture_kills_process_group_on_stdout_overflow(
         self,
@@ -5555,6 +5714,11 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertIn("stays unreaped as the PID/PGID identity fence", skill)
         self.assertIn("status is observed with `WNOWAIT`", skill)
         self.assertIn("Explicit ownership states", skill)
+        self.assertIn("reuses the already claimed ownership object", skill)
+        self.assertIn(
+            "bounded cleanup exception evidence attaches to the original action exception",
+            skill,
+        )
         self.assertIn(
             "requires a POSIX host and rejects other platforms",
             skill,
@@ -5610,6 +5774,10 @@ class ProjectJournalTests(unittest.TestCase):
         )
         self.assertIn("clears a cached initialization failure", skill)
         self.assertIn("reserves its final bounded detail slot", skill)
+        self.assertIn(
+            "CLI parsing, including `--help`, completes before Git runtime initialization",
+            skill,
+        )
         self.assertIn(
             "held root-to-directory descriptor chain",
             skill,
