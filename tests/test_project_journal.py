@@ -4093,6 +4093,196 @@ class ProjectJournalTests(unittest.TestCase):
         )
         self.assertIn(cleanup_issue, notes)
 
+    @unittest.skipUnless(os.name == "posix", "POSIX Git runtime contract")
+    def test_terminal_runtime_cleanup_exception_returns_bounded_issue(
+        self,
+    ) -> None:
+        old_runtime = project_journal._GIT_RUNTIME
+        old_error = project_journal._GIT_RUNTIME_ERROR
+        runtime = self.make_fake_git_runtime("terminal-cleanup-exception")
+        locator = pathlib.Path(runtime.snapshot_owner.name)
+        cleanup_error = OSError(
+            errno.EIO,
+            "simulated terminal runtime cleanup failure",
+        )
+        expected_issue = (
+            "Git runtime snapshot cleanup-incomplete; retained locator "
+            f"{locator}: {cleanup_error}"
+        )
+
+        project_journal._GIT_RUNTIME = runtime
+        project_journal._GIT_RUNTIME_ERROR = None
+        try:
+            with mock.patch.object(
+                runtime.snapshot_owner,
+                "cleanup",
+                side_effect=cleanup_error,
+            ) as cleanup:
+                issue = project_journal._cleanup_git_runtime_at_terminal()
+
+            self.assertEqual(issue, expected_issue)
+            cleanup.assert_called_once_with()
+            self.assertIs(project_journal._GIT_RUNTIME, runtime)
+            self.assertIsInstance(
+                project_journal._GIT_RUNTIME_ERROR,
+                project_journal.UnsupportedGitVersion,
+            )
+            assert project_journal._GIT_RUNTIME_ERROR is not None
+            self.assertEqual(str(project_journal._GIT_RUNTIME_ERROR), expected_issue)
+            self.assertTrue(locator.exists())
+            self.assertEqual(getattr(cleanup_error, "__notes__", ()), ())
+        finally:
+            runtime.snapshot_owner.cleanup()
+            project_journal._GIT_RUNTIME = old_runtime
+            project_journal._GIT_RUNTIME_ERROR = old_error
+
+    @unittest.skipUnless(
+        os.name == "posix"
+        and hasattr(signal, "pthread_sigmask")
+        and hasattr(signal, "sigpending"),
+        "POSIX deferred termination mask contract",
+    )
+    def test_terminal_cleanup_baseexception_remains_primary_without_action_error(
+        self,
+    ) -> None:
+        old_runtime = project_journal._GIT_RUNTIME
+        old_error = project_journal._GIT_RUNTIME_ERROR
+        runtime = self.make_fake_git_runtime("terminal-cleanup-interrupt")
+        locator = pathlib.Path(runtime.snapshot_owner.name)
+        cleanup_error = KeyboardInterrupt(
+            "simulated terminal cleanup interruption "
+            + "x" * (project_journal.MAX_DEFERRED_SIGNAL_REPORT_CHARS + 256)
+        )
+        original_args = cleanup_error.args
+        action = mock.Mock(return_value=37)
+
+        def interrupt_cleanup() -> None:
+            raise cleanup_error
+
+        project_journal._GIT_RUNTIME = runtime
+        project_journal._GIT_RUNTIME_ERROR = None
+        try:
+            with mock.patch.object(
+                project_journal,
+                "_termination_signals",
+                return_value=(),
+            ):
+                with mock.patch.object(
+                    runtime.snapshot_owner,
+                    "cleanup",
+                    side_effect=interrupt_cleanup,
+                ) as cleanup:
+                    try:
+                        project_journal._run_with_deferred_termination(action)
+                    except KeyboardInterrupt as exc:
+                        raised_error = exc
+                    else:
+                        self.fail("expected terminal cleanup interruption")
+
+            self.assertIs(raised_error, cleanup_error)
+            self.assertIs(type(raised_error), KeyboardInterrupt)
+            self.assertEqual(raised_error.args, original_args)
+            action.assert_called_once_with()
+            cleanup.assert_called_once_with()
+            notes = getattr(raised_error, "__notes__", ())
+            self.assertEqual(len(notes), 1)
+            self.assertIn(str(locator), notes[0])
+            self.assertTrue(notes[0].endswith("…[truncated]"))
+            self.assertLessEqual(
+                len(notes[0]),
+                project_journal.MAX_DEFERRED_SIGNAL_REPORT_CHARS + len("…[truncated]"),
+            )
+            traceback_names = self.exception_traceback_names(raised_error)
+            self.assertIn("interrupt_cleanup", traceback_names)
+            self.assertIn("_cleanup_git_runtime_at_terminal", traceback_names)
+            self.assertIn("_run_with_deferred_termination", traceback_names)
+            self.assertIs(project_journal._GIT_RUNTIME, runtime)
+            self.assertIsInstance(
+                project_journal._GIT_RUNTIME_ERROR,
+                project_journal.UnsupportedGitVersion,
+            )
+            assert project_journal._GIT_RUNTIME_ERROR is not None
+            self.assertEqual(str(project_journal._GIT_RUNTIME_ERROR), notes[0])
+            self.assertTrue(locator.exists())
+            self.assertIsNone(project_journal._ACTIVE_DEFERRED_TERMINATION)
+        finally:
+            runtime.snapshot_owner.cleanup()
+            project_journal._GIT_RUNTIME = old_runtime
+            project_journal._GIT_RUNTIME_ERROR = old_error
+
+    @unittest.skipUnless(
+        os.name == "posix"
+        and hasattr(signal, "pthread_sigmask")
+        and hasattr(signal, "sigpending"),
+        "POSIX deferred termination mask contract",
+    )
+    def test_action_error_remains_primary_when_terminal_cleanup_exits(
+        self,
+    ) -> None:
+        old_runtime = project_journal._GIT_RUNTIME
+        old_error = project_journal._GIT_RUNTIME_ERROR
+        runtime = self.make_fake_git_runtime("terminal-cleanup-system-exit")
+        locator = pathlib.Path(runtime.snapshot_owner.name)
+        action_error = ValueError("simulated action failure")
+        action_args = action_error.args
+        cleanup_error = SystemExit("simulated terminal cleanup exit")
+
+        def fail_action() -> int:
+            raise action_error
+
+        def exit_cleanup() -> None:
+            raise cleanup_error
+
+        project_journal._GIT_RUNTIME = runtime
+        project_journal._GIT_RUNTIME_ERROR = None
+        try:
+            with mock.patch.object(
+                project_journal,
+                "_termination_signals",
+                return_value=(),
+            ):
+                with mock.patch.object(
+                    runtime.snapshot_owner,
+                    "cleanup",
+                    side_effect=exit_cleanup,
+                ) as cleanup:
+                    try:
+                        project_journal._run_with_deferred_termination(fail_action)
+                    except ValueError as exc:
+                        raised_error = exc
+                    else:
+                        self.fail("expected active action failure")
+
+            self.assertIs(raised_error, action_error)
+            self.assertIs(type(raised_error), ValueError)
+            self.assertEqual(raised_error.args, action_args)
+            cleanup.assert_called_once_with()
+            notes = "\n".join(getattr(raised_error, "__notes__", ()))
+            self.assertIn(
+                "terminal convergence failed: simulated terminal cleanup exit",
+                notes,
+            )
+            self.assertIn(
+                "Git runtime snapshot cleanup-incomplete; retained locator",
+                notes,
+            )
+            self.assertIn(str(locator), notes)
+            action_traceback_names = self.exception_traceback_names(raised_error)
+            self.assertIn("fail_action", action_traceback_names)
+            self.assertNotIn("exit_cleanup", action_traceback_names)
+            cleanup_traceback_names = self.exception_traceback_names(cleanup_error)
+            self.assertIn("exit_cleanup", cleanup_traceback_names)
+            cleanup_notes = getattr(cleanup_error, "__notes__", ())
+            self.assertEqual(len(cleanup_notes), 1)
+            self.assertIn(str(locator), cleanup_notes[0])
+            self.assertIs(project_journal._GIT_RUNTIME, runtime)
+            self.assertTrue(locator.exists())
+            self.assertIsNone(project_journal._ACTIVE_DEFERRED_TERMINATION)
+        finally:
+            runtime.snapshot_owner.cleanup()
+            project_journal._GIT_RUNTIME = old_runtime
+            project_journal._GIT_RUNTIME_ERROR = old_error
+
     def test_normal_main_invocations_reinitialize_after_terminal_cleanup(
         self,
     ) -> None:
@@ -6082,6 +6272,15 @@ class ProjectJournalTests(unittest.TestCase):
             skill,
         )
         self.assertIn(
+            "preserving the same object, type, arguments, and traceback",
+            skill,
+        )
+        self.assertIn(
+            "existing precedence for an earlier terminal-convergence failure "
+            "or managed-signal propagation is unchanged",
+            skill,
+        )
+        self.assertIn(
             "without `BaseException.add_note`",
             skill,
         )
@@ -6203,6 +6402,15 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertIn("installed-target-committed state", readme)
         self.assertIn(
             "completed cleanup and never claims a missing recovery object",
+            readme,
+        )
+        self.assertIn(
+            "preserving the same object, type, arguments, and traceback",
+            readme,
+        )
+        self.assertIn(
+            "existing precedence for an earlier terminal-convergence failure "
+            "or managed-signal propagation is unchanged",
             readme,
         )
         self.assertIn("bind the complete absolute path", readme)

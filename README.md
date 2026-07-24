@@ -14,6 +14,8 @@ Repository discovery treats `adoption_status` as the authoritative `adopted`, `u
 
 Snapshot cleanup during creation, the version probe, or final validation follows the same failure precedence as launch cleanup: an active failure remains the exact primary exception with bounded retained-locator evidence, while a cleanup failure with no active exception becomes the reported initialization failure.
 
+Terminal runtime cleanup converts an ordinary `Exception` into the locator-bearing cleanup issue. A non-`Exception` `BaseException` such as `KeyboardInterrupt` or `SystemExit` instead receives bounded retained-locator evidence. When that interruption is the sole terminal failure and no managed signal is being propagated, it is re-raised without replacement, preserving the same object, type, arguments, and traceback. Against the cleanup failure, an active action exception remains primary and receives the cleanup evidence; existing precedence for an earlier terminal-convergence failure or managed-signal propagation is unchanged.
+
 If cleanup of an uncommitted hook staging entry fails while another installation error is active, that exact installation error remains primary and receives bounded descriptor-bound locator evidence after path verification; an unresolved path is reported as structured `path_unverified` evidence instead. Without an active error, the cleanup failure is reported on its own.
 
 ## Test

@@ -1173,11 +1173,14 @@ def _cleanup_git_runtime_at_terminal() -> str | None:
     try:
         runtime.snapshot_owner.cleanup()
     except BaseException as exc:
-        issue = (
+        issue = _bounded_signal_report_detail(
             "Git runtime snapshot cleanup-incomplete; retained locator "
-            f"{locator}: {exc}"
+            f"{locator}: {exc}",
         )
         _GIT_RUNTIME_ERROR = UnsupportedGitVersion(issue)
+        if not isinstance(exc, Exception):
+            _add_exception_detail(exc, issue)
+            raise
         return issue
     _GIT_RUNTIME = None
     _GIT_RUNTIME_ERROR = None
