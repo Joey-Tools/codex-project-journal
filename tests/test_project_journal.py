@@ -358,6 +358,72 @@ class ProjectJournalTests(unittest.TestCase):
         validate = self.run_cli("validate", "--repo", str(repo))
         self.assertEqual(validate.returncode, 0, validate.stderr)
 
+    def test_generated_index_status_distinguishes_missing_and_content(self) -> None:
+        root = self.root / "marker-status"
+        root.mkdir()
+        missing = root / "missing.md"
+        ordinary = root / "ordinary.md"
+        generated = root / "generated.md"
+        ordinary.write_text("---\nid: ordinary\n", encoding="utf-8")
+        generated.write_text(
+            f"# Project Journal Index\n\n{project_journal.INDEX_GENERATED_LINE}\n",
+            encoding="utf-8",
+        )
+
+        self.assertEqual(
+            project_journal._generated_index_status(missing),
+            "missing",
+        )
+        self.assertEqual(
+            project_journal._generated_index_status(ordinary),
+            "non-generated",
+        )
+        self.assertEqual(
+            project_journal._generated_index_status(generated),
+            "generated",
+        )
+
+    def test_generated_index_status_propagates_dangling_symlink(self) -> None:
+        dangling = self.root / "dangling.md"
+        dangling.symlink_to(self.root / "missing-target")
+
+        with self.assertRaises(project_journal.GeneratedIndexInspectionError) as raised:
+            project_journal._generated_index_status(dangling)
+        self.assertEqual(raised.exception.errno, errno.ENOENT)
+
+    def test_generated_index_status_bounds_marker_prefix(self) -> None:
+        marker = self.root / "oversized-marker.md"
+        marker.write_bytes(
+            b"# Project Journal Index\n\n"
+            + b"x" * (project_journal.MAX_GENERATED_INDEX_MARKER_LINE_BYTES + 1)
+        )
+
+        with self.assertRaisesRegex(
+            project_journal.GeneratedIndexInspectionError,
+            "marker line exceeds",
+        ):
+            project_journal._generated_index_status(marker)
+
+    def test_journal_scan_treats_disappeared_entry_as_missing(self) -> None:
+        repo = self.init_repo()
+        journal = repo / "docs/project_journal/disappearing.md"
+        journal.parent.mkdir(parents=True)
+        journal.write_text("---\n", encoding="utf-8")
+        original_status = project_journal._generated_index_status
+
+        def disappear(path: pathlib.Path) -> str:
+            path.unlink()
+            return original_status(path)
+
+        with mock.patch.object(
+            project_journal,
+            "_generated_index_status",
+            side_effect=disappear,
+        ):
+            paths = project_journal._journal_paths(repo)
+
+        self.assertEqual(paths, [])
+
     def test_adoption_status_rejects_empty_journal_directory(self) -> None:
         repo = self.init_repo()
         (repo / "docs/project_journal").mkdir(parents=True)
@@ -6410,6 +6476,12 @@ class ProjectJournalTests(unittest.TestCase):
         )
         self.assertIn("each root is enriched at most twice", skill)
         self.assertIn(
+            "active `sessions` and flat `archived_sessions`",
+            skill,
+        )
+        self.assertIn("Require `coverage_status: complete`", skill)
+        self.assertIn("bounded three-line marker prefix", skill)
+        self.assertIn(
             "Inaccessible journal, index, exclude, or hook paths remain null",
             skill,
         )
@@ -6477,6 +6549,10 @@ class ProjectJournalTests(unittest.TestCase):
         )
         self.assertIn("task has an explicit durable-state need", openai_yaml)
         self.assertIn("supported macOS or Linux hosts", openai_yaml)
+        self.assertIn(
+            "partial active/archive discovery coverage as inconclusive",
+            openai_yaml,
+        )
         self.assertNotIn("ignored local journal index", openai_yaml)
         self.assertIn(
             "valid tracked non-generated journal entry",
@@ -6534,6 +6610,13 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertIn("including other POSIX systems", readme)
         self.assertNotIn("other POSIX hosts retain signal-zero", readme)
         self.assertIn("each root is enriched at most twice", readme)
+        self.assertIn(
+            "active `sessions` and flat `archived_sessions`",
+            readme,
+        )
+        self.assertIn("one shared 60-second monotonic deadline", readme)
+        self.assertIn("`coverage_status: complete`", readme)
+        self.assertIn("three-line marker prefix", readme)
         self.assertIn(
             "Inaccessible journal, index, exclude, or hook paths",
             readme,
@@ -9285,6 +9368,366 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertIsNotNone(dated)
         self.assertEqual(dated.isoformat(), "2026-05-05")
 
+    def test_path_date_reads_flat_archived_rollout_name(self) -> None:
+        path = pathlib.Path(
+            "/tmp/.codex/archived_sessions/rollout-2026-05-06T12-34-56-abcdef.jsonl"
+        )
+
+        dated = project_journal._path_date(path)
+
+        self.assertIsNotNone(dated)
+        self.assertEqual(dated.isoformat(), "2026-05-06")
+
+    def test_discover_repos_reads_archive_without_active_sessions(self) -> None:
+        repo = self.init_repo()
+        codex_home = self.root / "codex-home"
+        archive = codex_home / "archived_sessions"
+        archive.mkdir(parents=True)
+        (archive / "rollout-2026-05-06T12-34-56-archive-only.jsonl").write_text(
+            json.dumps({"payload": {"cwd": str(repo)}}) + "\n",
+            encoding="utf-8",
+        )
+
+        rows = project_journal._discover_repos(codex_home, 9999)
+
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(os.path.samefile(rows[0]["repo"], repo))
+        self.assertEqual(rows[0]["rollout_count"], 1)
+        self.assertEqual(rows[0]["coverage_status"], "complete")
+
+    def test_discover_repos_aggregates_and_deduplicates_active_archive(
+        self,
+    ) -> None:
+        repo = self.init_repo()
+        codex_home = self.root / "codex-home"
+        active = codex_home / "sessions/2026/05/05"
+        archive = codex_home / "archived_sessions"
+        active.mkdir(parents=True)
+        archive.mkdir(parents=True)
+        duplicate_name = "rollout-2026-05-05T10-00-00-duplicate.jsonl"
+        payload = json.dumps({"payload": {"cwd": str(repo)}}) + "\n"
+        (active / duplicate_name).write_text(payload, encoding="utf-8")
+        (archive / duplicate_name).write_text(payload, encoding="utf-8")
+        (archive / "rollout-2026-05-06T10-00-00-distinct.jsonl").write_text(
+            payload,
+            encoding="utf-8",
+        )
+
+        rows = project_journal._discover_repos(codex_home, 9999)
+
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(os.path.samefile(rows[0]["repo"], repo))
+        self.assertEqual(rows[0]["rollout_count"], 2)
+        self.assertEqual(rows[0]["coverage_status"], "complete")
+
+    def test_discover_repos_marks_oversized_rollout_line_partial(self) -> None:
+        codex_home = self.root / "codex-home"
+        rollout_dir = codex_home / "sessions/2026/05/05"
+        rollout_dir.mkdir(parents=True)
+        (rollout_dir / "rollout-oversized-line.jsonl").write_bytes(b"x" * 65)
+
+        with mock.patch.object(
+            project_journal,
+            "MAX_DISCOVERY_LINE_BYTES",
+            64,
+        ):
+            rows = project_journal._discover_repos(codex_home, 9999)
+
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertIsNone(row["repo"])
+        self.assertEqual(row["coverage_status"], "partial")
+        self.assertEqual(row["discovery_status"], "inconclusive")
+        coverage = row["discovery_error"]["discovery_coverage"]
+        self.assertEqual(coverage["code"], "discovery_limit_exceeded")
+        self.assertEqual(coverage["limit_name"], "rollout line bytes")
+        self.assertEqual(coverage["limit"], 64)
+
+    def test_discover_repos_marks_deep_json_partial(self) -> None:
+        codex_home = self.root / "codex-home"
+        rollout_dir = codex_home / "sessions/2026/05/05"
+        rollout_dir.mkdir(parents=True)
+        (rollout_dir / "rollout-deep-json.jsonl").write_text(
+            json.dumps({"one": {"two": {"cwd": "/tmp/repo"}}}) + "\n",
+            encoding="utf-8",
+        )
+
+        with mock.patch.object(
+            project_journal,
+            "MAX_DISCOVERY_JSON_DEPTH",
+            2,
+        ):
+            rows = project_journal._discover_repos(codex_home, 9999)
+
+        coverage = rows[0]["discovery_error"]["discovery_coverage"]
+        self.assertEqual(rows[0]["coverage_status"], "partial")
+        self.assertEqual(coverage["code"], "discovery_limit_exceeded")
+        self.assertEqual(coverage["limit_name"], "JSON nesting depth")
+        self.assertEqual(coverage["observed"], 3)
+
+    def test_discover_repos_normalizes_cwd_aliases_before_resolution(self) -> None:
+        repo = self.init_repo().resolve()
+        codex_home = self.root / "codex-home"
+        rollout_dir = codex_home / "sessions/2026/05/05"
+        rollout_dir.mkdir(parents=True)
+        aliases = [
+            str(repo),
+            f"{repo}/.",
+            f"{repo}//",
+            str(repo),
+        ]
+        (rollout_dir / "rollout-aliases.jsonl").write_text(
+            "".join(
+                json.dumps({"payload": {"cwd": alias}}) + "\n" for alias in aliases
+            ),
+            encoding="utf-8",
+        )
+        resolution_calls: list[str] = []
+
+        def resolve_candidate(
+            path_text: str,
+            *,
+            codex_home: pathlib.Path | None = None,
+            deadline: float | None = None,
+        ) -> pathlib.Path:
+            del codex_home, deadline
+            resolution_calls.append(path_text)
+            return repo
+
+        def enrich_candidate(
+            root: pathlib.Path,
+            row: dict[str, object],
+            script: pathlib.Path,
+            *,
+            deadline: float | None = None,
+        ) -> None:
+            del root, script, deadline
+            row.update(
+                {
+                    "adoption_status": "unadopted",
+                    "adoption_error": None,
+                    "discovery_status": "complete",
+                    "discovery_error": None,
+                }
+            )
+
+        with mock.patch.object(
+            project_journal,
+            "_repo_root_for_path",
+            side_effect=resolve_candidate,
+        ):
+            with mock.patch.object(
+                project_journal,
+                "_enrich_discovered_repo",
+                side_effect=enrich_candidate,
+            ):
+                rows = project_journal._discover_repos(codex_home, 9999)
+
+        self.assertEqual(resolution_calls, [str(repo)])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["rollout_count"], 1)
+
+    def test_discover_repos_bounds_distinct_cwds(self) -> None:
+        codex_home = self.root / "codex-home"
+        rollout_dir = codex_home / "sessions/2026/05/05"
+        rollout_dir.mkdir(parents=True)
+        (rollout_dir / "rollout-many-cwds.jsonl").write_text(
+            "".join(
+                json.dumps({"payload": {"cwd": f"/tmp/candidate-{index}"}}) + "\n"
+                for index in range(3)
+            ),
+            encoding="utf-8",
+        )
+
+        with mock.patch.object(
+            project_journal,
+            "MAX_DISCOVERY_DISTINCT_CWDS",
+            2,
+        ):
+            with mock.patch.object(
+                project_journal,
+                "_repo_root_for_path",
+                return_value=None,
+            ):
+                rows = project_journal._discover_repos(codex_home, 9999)
+
+        coverage = rows[0]["discovery_error"]["discovery_coverage"]
+        self.assertEqual(rows[0]["coverage_status"], "partial")
+        self.assertEqual(coverage["limit_name"], "distinct CWD count")
+        self.assertEqual(coverage["observed"], 3)
+
+    def test_discover_repos_shares_rollout_cap_across_active_archive(self) -> None:
+        repo = self.init_repo().resolve()
+        codex_home = self.root / "codex-home"
+        active = codex_home / "sessions/2026/05/05"
+        archive = codex_home / "archived_sessions"
+        active.mkdir(parents=True)
+        archive.mkdir(parents=True)
+        payload = json.dumps({"payload": {"cwd": str(repo)}}) + "\n"
+        (active / "rollout-active.jsonl").write_text(payload, encoding="utf-8")
+        (archive / "rollout-2026-05-06T10-00-00-archive.jsonl").write_text(
+            payload,
+            encoding="utf-8",
+        )
+
+        with mock.patch.object(project_journal, "MAX_DISCOVERY_ROLLOUTS", 1):
+            rows = project_journal._discover_repos(codex_home, 9999)
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["rollout_count"], 1)
+        self.assertEqual(rows[0]["coverage_status"], "partial")
+        coverage = rows[0]["discovery_error"]["discovery_coverage"]
+        self.assertEqual(coverage["limit_name"], "rollout count")
+        self.assertEqual(coverage["observed"], 2)
+
+    def test_discover_repos_shares_byte_and_record_caps_across_sources(
+        self,
+    ) -> None:
+        repo = self.init_repo().resolve()
+        codex_home = self.root / "codex-home"
+        active = codex_home / "sessions/2026/05/05"
+        archive = codex_home / "archived_sessions"
+        active.mkdir(parents=True)
+        archive.mkdir(parents=True)
+        payload = (json.dumps({"payload": {"cwd": str(repo)}}) + "\n").encode()
+        (active / "rollout-active.jsonl").write_bytes(payload)
+        (archive / "rollout-2026-05-06T10-00-00-archive.jsonl").write_bytes(payload)
+
+        for constant, limit, limit_name, observed in (
+            (
+                "MAX_DISCOVERY_TOTAL_BYTES",
+                len(payload),
+                "total rollout bytes",
+                len(payload) * 2,
+            ),
+            ("MAX_DISCOVERY_RECORDS", 1, "rollout record count", 2),
+        ):
+            with self.subTest(constant=constant):
+                with mock.patch.object(project_journal, constant, limit):
+                    rows = project_journal._discover_repos(codex_home, 9999)
+
+                self.assertEqual(rows[0]["rollout_count"], 1)
+                self.assertEqual(rows[0]["coverage_status"], "partial")
+                coverage = rows[0]["discovery_error"]["discovery_coverage"]
+                self.assertEqual(coverage["limit_name"], limit_name)
+                self.assertEqual(coverage["observed"], observed)
+
+    def test_discover_repos_shares_deadline_across_active_archive(self) -> None:
+        repo = self.init_repo().resolve()
+        codex_home = self.root / "codex-home"
+        active = codex_home / "sessions/2026/05/05/rollout-active.jsonl"
+        active.parent.mkdir(parents=True)
+        active.write_text(
+            json.dumps({"payload": {"cwd": str(repo)}}) + "\n",
+            encoding="utf-8",
+        )
+        clock = {"now": 100.0}
+        state_ids: list[int] = []
+
+        def iter_rollouts(
+            root: pathlib.Path,
+            state: project_journal._DiscoveryScanState,
+        ) -> object:
+            state_ids.append(id(state))
+            if root.name == "sessions":
+                yield active
+                clock["now"] = 100.75
+                return
+            clock["now"] = 101.0
+            state.check_deadline()
+
+        def enrich_candidate(
+            root: pathlib.Path,
+            row: dict[str, object],
+            script: pathlib.Path,
+            *,
+            deadline: float | None = None,
+        ) -> None:
+            del root, script, deadline
+            row.update(
+                {
+                    "adoption_status": "unadopted",
+                    "adoption_error": None,
+                    "discovery_status": "complete",
+                    "discovery_error": None,
+                }
+            )
+
+        with mock.patch.object(project_journal, "DISCOVERY_TIMEOUT_SECONDS", 1.0):
+            with mock.patch.object(
+                project_journal.time,
+                "monotonic",
+                side_effect=lambda: clock["now"],
+            ):
+                with mock.patch.object(
+                    project_journal,
+                    "_iter_rollout_paths",
+                    side_effect=iter_rollouts,
+                ):
+                    with mock.patch.object(
+                        project_journal,
+                        "_repo_root_for_path",
+                        return_value=repo,
+                    ):
+                        with mock.patch.object(
+                            project_journal,
+                            "_enrich_discovered_repo",
+                            side_effect=enrich_candidate,
+                        ):
+                            rows = project_journal._discover_repos(
+                                codex_home,
+                                9999,
+                            )
+
+        self.assertEqual(len(set(state_ids)), 1)
+        self.assertEqual(rows[0]["rollout_count"], 1)
+        self.assertEqual(rows[0]["coverage_status"], "partial")
+        coverage = rows[0]["discovery_error"]["discovery_coverage"]
+        self.assertEqual(coverage["code"], "discovery_deadline_exceeded")
+        self.assertEqual(
+            pathlib.Path(coverage["source"]).name,
+            "archived_sessions",
+        )
+
+    def test_discover_repos_keeps_archive_when_active_scan_fails(self) -> None:
+        repo = self.init_repo().resolve()
+        codex_home = self.root / "codex-home"
+        archive = codex_home / "archived_sessions"
+        archive.mkdir(parents=True)
+        archived_rollout = archive / "rollout-2026-05-06T10-00-00-archive.jsonl"
+        archived_rollout.write_text(
+            json.dumps({"payload": {"cwd": str(repo)}}) + "\n",
+            encoding="utf-8",
+        )
+
+        def iter_rollouts(
+            root: pathlib.Path,
+            state: project_journal._DiscoveryScanState,
+        ) -> object:
+            del state
+            if root.name == "sessions":
+                raise PermissionError(
+                    errno.EACCES,
+                    "injected active session scan failure",
+                    str(root),
+                )
+            yield archived_rollout
+
+        with mock.patch.object(
+            project_journal,
+            "_iter_rollout_paths",
+            side_effect=iter_rollouts,
+        ):
+            rows = project_journal._discover_repos(codex_home, 9999)
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(pathlib.Path(rows[0]["repo"]), repo)
+        self.assertEqual(rows[0]["rollout_count"], 1)
+        self.assertEqual(rows[0]["coverage_status"], "partial")
+        coverage = rows[0]["discovery_error"]["discovery_coverage"]
+        self.assertEqual(coverage["errno"], errno.EACCES)
+        self.assertEqual(pathlib.Path(coverage["source"]).name, "sessions")
+
     def test_discover_repos_reads_synthetic_rollouts(self) -> None:
         repo = self.init_repo()
         nested = repo / "nested"
@@ -9604,6 +10047,141 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertEqual(set(errors), {"journal_count"})
         self.assertEqual(errors["journal_count"]["errno"], errno.EIO)
         self.assertEqual(errors["journal_count"]["error_name"], "EIO")
+
+    def test_enrich_reports_generated_marker_read_failures(self) -> None:
+        adoption = {
+            "adoption_status": "unadopted",
+            "adoption_error": None,
+            "tracked_journal_adopted": False,
+            "tracked_non_generated_journal_count": 0,
+            "valid_tracked_journal_count": 0,
+        }
+        actual_open = pathlib.Path.open
+
+        for error_number in (errno.EACCES, errno.EIO):
+            with self.subTest(error_number=error_number):
+                repo = self.init_repo(f"marker-error-{error_number}").resolve()
+                journal = repo / "docs/project_journal/entry.md"
+                journal.parent.mkdir(parents=True)
+                journal.write_text("---\n", encoding="utf-8")
+                row: dict[str, object] = {"repo": str(repo)}
+
+                def fail_marker_open(
+                    path: pathlib.Path,
+                    *args: object,
+                    **kwargs: object,
+                ) -> object:
+                    if path == journal:
+                        raise OSError(
+                            error_number,
+                            "injected marker read failure",
+                            str(path),
+                        )
+                    return actual_open(path, *args, **kwargs)
+
+                with mock.patch.object(
+                    project_journal,
+                    "_discover_adoption_status",
+                    return_value=adoption,
+                ):
+                    with mock.patch.object(
+                        project_journal,
+                        "_is_excluded",
+                        return_value=False,
+                    ):
+                        with mock.patch.object(
+                            project_journal,
+                            "_has_hook_marker",
+                            return_value=False,
+                        ):
+                            with mock.patch.object(
+                                pathlib.Path,
+                                "open",
+                                autospec=True,
+                                side_effect=fail_marker_open,
+                            ):
+                                project_journal._enrich_discovered_repo(
+                                    repo,
+                                    row,
+                                    SCRIPT,
+                                )
+
+                self.assertIsNone(row["journal_count"])
+                self.assertEqual(row["discovery_status"], "inconclusive")
+                error = row["discovery_error"]["journal_count"]
+                self.assertEqual(
+                    error["code"],
+                    "generated_index_inspection_failed",
+                )
+                self.assertEqual(error["errno"], error_number)
+                self.assertEqual(
+                    error["error_name"],
+                    errno.errorcode[error_number],
+                )
+
+    def test_enrich_reports_non_file_journal_marker_entries(self) -> None:
+        adoption = {
+            "adoption_status": "unadopted",
+            "adoption_error": None,
+            "tracked_journal_adopted": False,
+            "tracked_non_generated_journal_count": 0,
+            "valid_tracked_journal_count": 0,
+        }
+
+        for kind, expected_code, expected_errno in (
+            ("dangling", "generated_index_inspection_failed", errno.ENOENT),
+            ("directory", "generated_index_inspection_failed", errno.EISDIR),
+            (
+                "oversized",
+                "generated_index_inspection_limit_exceeded",
+                None,
+            ),
+        ):
+            with self.subTest(kind=kind):
+                repo = self.init_repo(f"marker-entry-{kind}").resolve()
+                journal = repo / "docs/project_journal/entry.md"
+                journal.parent.mkdir(parents=True)
+                if kind == "dangling":
+                    journal.symlink_to(repo / "missing-target")
+                elif kind == "directory":
+                    journal.mkdir()
+                else:
+                    journal.write_bytes(
+                        b"# Project Journal Index\n\n"
+                        + b"x"
+                        * (project_journal.MAX_GENERATED_INDEX_MARKER_LINE_BYTES + 1)
+                    )
+                row: dict[str, object] = {"repo": str(repo)}
+
+                with mock.patch.object(
+                    project_journal,
+                    "_discover_adoption_status",
+                    return_value=adoption,
+                ):
+                    with mock.patch.object(
+                        project_journal,
+                        "_is_excluded",
+                        return_value=False,
+                    ):
+                        with mock.patch.object(
+                            project_journal,
+                            "_has_hook_marker",
+                            return_value=False,
+                        ):
+                            project_journal._enrich_discovered_repo(
+                                repo,
+                                row,
+                                SCRIPT,
+                            )
+
+                self.assertIsNone(row["journal_count"])
+                self.assertEqual(row["discovery_status"], "inconclusive")
+                error = row["discovery_error"]["journal_count"]
+                self.assertEqual(error["code"], expected_code)
+                if expected_errno is None:
+                    self.assertNotIn("errno", error)
+                else:
+                    self.assertEqual(error["errno"], expected_errno)
 
     def test_enrich_isolates_inaccessible_index_exclude_and_hook_paths(
         self,

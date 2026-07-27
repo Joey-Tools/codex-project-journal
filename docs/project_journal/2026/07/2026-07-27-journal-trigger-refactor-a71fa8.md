@@ -18,14 +18,18 @@ superseded_by:
 - A task spanning Codex sessions, a PR, or a durable workstream triggers an adoption assessment but does not authorize the first tracker; first adoption still requires an explicit product need.
 - Automatic updates target the smallest applicable layer, while index generation and hook installation remain workflow-specific and opt-in.
 - The three findings from GitHub Codex review `4784362350` are addressed without changing index-authoritative adoption semantics.
+- The final fresh-review findings are closed by adding bounded active/archive session coverage, one aggregate discovery deadline and cap ledger, and explicit generated-index marker outcomes.
 
 ## Current State
 
 - The skill frontmatter, body, UI metadata, templates, migration guidance, helper, and tests implement the adoption boundary and preserve concise top-level tracker and squash-merge target-branch semantics.
 - The index parser ignores a structurally valid record whose path is exactly `docs/project_journal`, so a same-name file, symlink, or gitlink remains unadopted while real child entries retain normal validation.
 - Repository discovery gives a still-inconclusive same-root adoption check one retry only when a later CWD retains at least one additional second of its deadline; two attempts per root is the hard cap, and auxiliary-only uncertainty does not trigger the retry.
+- Repository discovery now streams both `sessions` and flat `archived_sessions`, deduplicates an active/archive rollout basename, normalizes harmless CWD aliases before caching, and shares one 60-second absolute deadline plus filesystem-entry, rollout, total-byte, line-byte, record, distinct-CWD, JSON-depth, and retained-error limits across both sources.
+- Complete candidate coverage is explicit. A source I/O failure, deadline, or cap preserves healthy rows already found but marks `coverage_status: partial` with bounded counters and structured `discovery_coverage`; when no repository was found, an inconclusive sentinel prevents partial coverage from looking like authoritative `[]`.
 - The helper and hook rename primitive now reject every host other than macOS and Linux before Git selection or platform-specific libc lookup.
 - Missing auxiliary paths remain authoritative negatives, while EACCES, EIO, and other inspection failures independently null `has_journal_dir`, `journal_count`, `has_index`, `index_ignored`, or `hooks_installed` and attach structured errno evidence.
+- Worktree generated-index classification reads only a bounded three-line prefix. A truly disappeared entry is skipped, while EACCES, EIO, a dangling symlink, a directory, or an oversized marker produces a dedicated structured error and leaves `journal_count` unknown.
 - This is the repository's intentional first journal entry because the finalization task explicitly requires durable repo-owned validation and handoff evidence; no top-level tracker, generated index, or local hook is introduced.
 
 ## Next Steps
@@ -45,3 +49,6 @@ superseded_by:
 - Review-finding focused suite: 14 passed in 0.452 seconds with Python 3.13.0 and 14 passed in 1.087 seconds with Xcode Python 3.9.6.
 - Final Python 3.13 full suite: 198 passed, 2 skipped in 241.751 seconds.
 - The Python 3.9.6 full-suite attempt hit the existing runtime gate because this host interpreter omits required POSIX `WNOWAIT`; its focused compatibility suite and `py_compile` both passed without installing another runtime.
+- Final discovery/marker focused suite: 17 passed in 0.465 seconds with Xcode Python 3.9.6; the same focused coverage and all existing discovery regressions passed with Python 3.13.0.
+- Final Python 3.13 full suite after the coverage and marker fixes: 215 passed, 2 skipped in 248.617 seconds.
+- Xcode Python 3.9.6 `py_compile` passed for the helper and tests. Its fail-fast full-suite probe again stopped at the existing explicit `POSIX WNOWAIT status observation is unavailable` safety gate.
