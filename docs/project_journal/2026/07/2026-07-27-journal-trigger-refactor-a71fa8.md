@@ -21,6 +21,7 @@ superseded_by:
 ## Current State
 
 - The skill frontmatter, body, UI metadata, templates, migration guidance, helper, and tests implement the adoption boundary and preserve concise top-level tracker and squash-merge target-branch semantics.
+- The index parser ignores a structurally valid record whose path is exactly `docs/project_journal`, so a same-name file, symlink, or gitlink remains unadopted while real child entries retain normal validation.
 - This is the repository's intentional first journal entry because the finalization task explicitly requires durable repo-owned validation and handoff evidence; no top-level tracker, generated index, or local hook is introduced.
 
 ## Next Steps
@@ -29,9 +30,9 @@ superseded_by:
 
 ## Evidence
 
-- Implementation range: `15521e327477444bf11e8b83502720fe4237aa8c..a71fa8cb0261c6e04fc79e77cadc668498442b5c`.
-- Focused adoption and trigger tests: 6 passed in 6.458 seconds with Python 3.13.0.
-- Full test suite: 188 passed, 2 skipped in 239.691 seconds with Python 3.13.0.
+- Original refactor range: `15521e327477444bf11e8b83502720fe4237aa8c..a71fa8cb0261c6e04fc79e77cadc668498442b5c`; fresh-review closure continues after journal commit `45a912083bc82557c582eaeb055fa2126d4e0c7e`.
+- Focused exact-root adoption regressions: 3 passed in 7.883 seconds with Python 3.13.0.
+- Full test suite: 189 passed, 2 skipped in 244.487 seconds with Python 3.13.0.
 - `python3 -m py_compile scripts/project_journal.py tests/test_project_journal.py`: passed.
 - `ruff check` and `ruff format --check` for the helper and tests: passed.
 - Joey skill validation wrapper: 1 skill passed with no runtime errors.

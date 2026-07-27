@@ -368,6 +368,39 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertEqual(status["tracked_non_generated_journal_count"], 0)
         self.assertEqual(status["valid_tracked_journal_count"], 0)
 
+    def test_adoption_status_ignores_exact_journal_root_index_entries(self) -> None:
+        for kind in ("file", "symlink", "gitlink"):
+            with self.subTest(kind=kind):
+                repo = self.init_repo(f"exact-root-{kind}")
+                docs = repo / "docs"
+                docs.mkdir()
+                root = docs / "project_journal"
+
+                if kind == "file":
+                    root.write_text("not a journal directory\n", encoding="utf-8")
+                    staged = run_git(repo, "add", "--", "docs/project_journal")
+                elif kind == "symlink":
+                    target = repo / "journal-root-target"
+                    target.write_text("not a journal directory\n", encoding="utf-8")
+                    root.symlink_to(target)
+                    staged = run_git(repo, "add", "--", "docs/project_journal")
+                else:
+                    staged = run_git(
+                        repo,
+                        "update-index",
+                        "--add",
+                        "--info-only",
+                        "--cacheinfo",
+                        f"160000,{'a' * 40},docs/project_journal",
+                    )
+                self.assertEqual(staged.returncode, 0, staged.stderr)
+
+                status = self.adoption_status(repo)
+
+                self.assertFalse(status["tracked_journal_adopted"])
+                self.assertEqual(status["tracked_non_generated_journal_count"], 0)
+                self.assertEqual(status["valid_tracked_journal_count"], 0)
+
     def test_adoption_status_rejects_generated_index_only_directory(self) -> None:
         repo = self.init_repo()
         generate = self.run_cli(
@@ -2888,11 +2921,23 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertEqual(len(parsed), 1)
         self.assertEqual(os.fsencode(parsed[0].rel_path), raw_path)
 
+        exact_root_records = b"".join(
+            mode + b" " + oid + b" 0\tdocs/project_journal\0"
+            for mode in (b"100644", b"120000", b"160000")
+        )
+        parsed_with_root_entries = project_journal._parse_index_journal_blobs(
+            exact_root_records + b"100644 " + oid + b" 0\t" + raw_path + b"\0"
+        )
+        self.assertEqual(len(parsed_with_root_entries), 1)
+        self.assertEqual(os.fsencode(parsed_with_root_entries[0].rel_path), raw_path)
+
         malformed_outputs = (
             b"100644 " + oid + b" 0\t" + raw_path,
             b"100644 not-an-oid 0\t" + raw_path + b"\0",
+            b"100644 not-an-oid 0\tdocs/project_journal\0",
             b"100644 " + oid + b" 0 docs/project_journal/bad.md\0",
             b"100644 " + oid + b" 0\tdocs/project_journal/../outside.md\0",
+            b"100644 " + oid + b" 0\tdocs/project_journal-other/bad.md\0",
         )
         for output in malformed_outputs:
             with self.subTest(output=output):

@@ -2255,7 +2255,8 @@ def _parse_index_stage_record(
     record: bytes,
     records: dict[bytes, list[tuple[bytes, bytes, bytes]]],
 ) -> None:
-    journal_prefix = JOURNAL_ROOT.as_posix().encode("ascii") + b"/"
+    journal_root = JOURNAL_ROOT.as_posix().encode("ascii")
+    journal_prefix = journal_root + b"/"
     default_index = DEFAULT_INDEX.as_posix().encode("ascii")
 
     metadata, separator, raw_path = record.partition(b"\t")
@@ -2269,6 +2270,8 @@ def _parse_index_stage_record(
         raise UserError("malformed git ls-files object id")
     if stage not in {b"0", b"1", b"2", b"3"}:
         raise UserError("malformed git ls-files stage")
+    if raw_path == journal_root:
+        return
     if not raw_path.startswith(journal_prefix):
         raise UserError("git ls-files returned a path outside the journal root")
     path_parts = raw_path.split(b"/")
