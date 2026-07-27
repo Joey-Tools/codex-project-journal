@@ -3171,25 +3171,83 @@ class ProjectJournalTests(unittest.TestCase):
 
         popen.assert_not_called()
 
-    def test_non_posix_runtime_is_explicitly_unsupported(self) -> None:
+    def test_unsupported_runtime_is_rejected_before_git_selection(self) -> None:
         original_runtime = project_journal._GIT_RUNTIME
         original_error = project_journal._GIT_RUNTIME_ERROR
         try:
-            project_journal._GIT_RUNTIME = None
-            project_journal._GIT_RUNTIME_ERROR = None
-            with mock.patch.object(project_journal.os, "name", "nt"):
-                project_journal._initialize_git_runtime()
-            self.assertIsInstance(
-                project_journal._GIT_RUNTIME_ERROR,
-                project_journal.UnsupportedPlatform,
-            )
-            self.assertIn(
-                "requires a POSIX host",
-                str(project_journal._GIT_RUNTIME_ERROR),
-            )
+            for os_name, platform in (
+                ("nt", "win32"),
+                ("posix", "freebsd14"),
+            ):
+                with self.subTest(os_name=os_name, platform=platform):
+                    project_journal._GIT_RUNTIME = None
+                    project_journal._GIT_RUNTIME_ERROR = None
+                    with mock.patch.object(project_journal.os, "name", os_name):
+                        with mock.patch.object(
+                            project_journal.sys,
+                            "platform",
+                            platform,
+                        ):
+                            with mock.patch.object(
+                                project_journal.shutil,
+                                "which",
+                            ) as which:
+                                project_journal._initialize_git_runtime()
+                    self.assertIsInstance(
+                        project_journal._GIT_RUNTIME_ERROR,
+                        project_journal.UnsupportedPlatform,
+                    )
+                    self.assertIn(
+                        "requires macOS or Linux",
+                        str(project_journal._GIT_RUNTIME_ERROR),
+                    )
+                    which.assert_not_called()
         finally:
             project_journal._GIT_RUNTIME = original_runtime
             project_journal._GIT_RUNTIME_ERROR = original_error
+
+    def test_other_posix_cli_fails_before_git_selection_or_execution(self) -> None:
+        original_runtime = project_journal._GIT_RUNTIME
+        original_error = project_journal._GIT_RUNTIME_ERROR
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        project_journal._GIT_RUNTIME = None
+        project_journal._GIT_RUNTIME_ERROR = None
+        try:
+            with mock.patch.object(project_journal.os, "name", "posix"):
+                with mock.patch.object(project_journal.sys, "platform", "freebsd14"):
+                    with mock.patch.object(
+                        project_journal.shutil,
+                        "which",
+                    ) as which:
+                        with mock.patch.object(project_journal, "_run_git") as run_git:
+                            with mock.patch.object(
+                                project_journal.sys,
+                                "stdout",
+                                stdout,
+                            ):
+                                with mock.patch.object(
+                                    project_journal.sys,
+                                    "stderr",
+                                    stderr,
+                                ):
+                                    status = project_journal.main(
+                                        [
+                                            "discover-repos",
+                                            "--codex-home",
+                                            str(self.root / "missing-codex-home"),
+                                            "--json",
+                                        ]
+                                    )
+        finally:
+            project_journal._GIT_RUNTIME = original_runtime
+            project_journal._GIT_RUNTIME_ERROR = original_error
+
+        self.assertEqual(status, 1)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("requires macOS or Linux", stderr.getvalue())
+        which.assert_not_called()
+        run_git.assert_not_called()
 
     @unittest.skipUnless(
         os.name == "posix" and hasattr(os, "WNOWAIT"),
@@ -6268,9 +6326,11 @@ class ProjectJournalTests(unittest.TestCase):
             skill,
         )
         self.assertIn(
-            "requires a POSIX host and rejects other platforms",
+            "supports only macOS and Linux",
             skill,
         )
+        self.assertIn("including other POSIX systems", skill)
+        self.assertNotIn("other POSIX hosts retain signal-zero", skill)
         self.assertIn(
             "no numeric PGID is signalled after that fence is released",
             skill,
@@ -6348,6 +6408,15 @@ class ProjectJournalTests(unittest.TestCase):
             "do not overwrite authoritative index adoption",
             skill,
         )
+        self.assertIn("each root is enriched at most twice", skill)
+        self.assertIn(
+            "Inaccessible journal, index, exclude, or hook paths remain null",
+            skill,
+        )
+        self.assertIn(
+            "Hook installation supports macOS and Linux only",
+            skill,
+        )
         self.assertIn(
             "leave `docs/PROJECT_STATE.md`, `docs/PROJECT_TODO.md`, and `docs/project_journal/` unchanged",
             skill,
@@ -6407,6 +6476,7 @@ class ProjectJournalTests(unittest.TestCase):
             openai_yaml,
         )
         self.assertIn("task has an explicit durable-state need", openai_yaml)
+        self.assertIn("supported macOS or Linux hosts", openai_yaml)
         self.assertNotIn("ignored local journal index", openai_yaml)
         self.assertIn(
             "valid tracked non-generated journal entry",
@@ -6460,6 +6530,18 @@ class ProjectJournalTests(unittest.TestCase):
         )
         self.assertIn("bind the complete absolute path", readme)
         self.assertIn("structured `discovery_error`", readme)
+        self.assertIn("supports only macOS and Linux", readme)
+        self.assertIn("including other POSIX systems", readme)
+        self.assertNotIn("other POSIX hosts retain signal-zero", readme)
+        self.assertIn("each root is enriched at most twice", readme)
+        self.assertIn(
+            "Inaccessible journal, index, exclude, or hook paths",
+            readme,
+        )
+        self.assertIn(
+            "Opt-in hook installation supports macOS and Linux only",
+            readme,
+        )
         self.assertIn("duplicate-ID group invalidation", readme)
         self.assertIn("without erasing authoritative index adoption", readme)
         self.assertIn("`adopted`, `unadopted`, or `inconclusive`", readme)
@@ -8437,6 +8519,23 @@ class ProjectJournalTests(unittest.TestCase):
             ):
                 project_journal._bind_hook_directory(plan)
 
+    def test_hook_rename_rejects_other_posix_before_loading_libc(self) -> None:
+        with mock.patch.object(project_journal.os, "name", "posix"):
+            with mock.patch.object(project_journal.sys, "platform", "freebsd14"):
+                with mock.patch.object(project_journal.ctypes, "CDLL") as cdll:
+                    with self.assertRaisesRegex(
+                        project_journal.UnsupportedPlatform,
+                        "supported only on macOS and Linux",
+                    ):
+                        project_journal._rename_hook_entry_with_flag(
+                            -1,
+                            "source",
+                            "destination",
+                            exchange=False,
+                        )
+
+        cdll.assert_not_called()
+
     def test_hook_target_timestamp_only_transition_preserves_identity(self) -> None:
         repo = self.init_repo().resolve()
         configured = run_git(
@@ -9344,6 +9443,252 @@ class ProjectJournalTests(unittest.TestCase):
             discovery_error["index_ignored"]["message"],
         )
 
+    def test_enrich_missing_auxiliary_paths_are_authoritative_negatives(
+        self,
+    ) -> None:
+        repo = self.init_repo().resolve()
+        row: dict[str, object] = {"repo": str(repo)}
+        adoption = {
+            "adoption_status": "unadopted",
+            "adoption_error": None,
+            "tracked_journal_adopted": False,
+            "tracked_non_generated_journal_count": 0,
+            "valid_tracked_journal_count": 0,
+        }
+        missing_exclude = repo / "missing-exclude"
+        missing_hook = repo / "missing-hook"
+
+        with mock.patch.object(
+            project_journal,
+            "_discover_adoption_status",
+            return_value=adoption,
+        ):
+            with mock.patch.object(
+                project_journal,
+                "_git_path",
+                return_value=missing_exclude,
+            ):
+                with mock.patch.object(
+                    project_journal,
+                    "_hook_path",
+                    return_value=missing_hook,
+                ):
+                    project_journal._enrich_discovered_repo(repo, row, SCRIPT)
+
+        self.assertFalse(row["has_journal_dir"])
+        self.assertEqual(row["journal_count"], 0)
+        self.assertFalse(row["has_index"])
+        self.assertFalse(row["index_ignored"])
+        self.assertFalse(row["hooks_installed"])
+        self.assertEqual(row["discovery_status"], "complete")
+        self.assertIsNone(row["discovery_error"])
+
+    def test_enrich_reports_inaccessible_journal_root_fields(self) -> None:
+        repo = self.init_repo().resolve()
+        journal_root = repo / project_journal.JOURNAL_ROOT
+        row: dict[str, object] = {"repo": str(repo)}
+        adoption = {
+            "adoption_status": "unadopted",
+            "adoption_error": None,
+            "tracked_journal_adopted": False,
+            "tracked_non_generated_journal_count": 0,
+            "valid_tracked_journal_count": 0,
+        }
+        actual_stat = project_journal.os.stat
+
+        def inaccessible_root(
+            path: os.PathLike[str] | str | int,
+            *args: object,
+            **kwargs: object,
+        ) -> os.stat_result:
+            if not isinstance(path, int) and pathlib.Path(path) == journal_root:
+                raise PermissionError(
+                    errno.EACCES,
+                    "injected inaccessible journal root",
+                    str(path),
+                )
+            return actual_stat(path, *args, **kwargs)
+
+        with mock.patch.object(
+            project_journal,
+            "_discover_adoption_status",
+            return_value=adoption,
+        ):
+            with mock.patch.object(
+                project_journal,
+                "_is_excluded",
+                return_value=False,
+            ):
+                with mock.patch.object(
+                    project_journal,
+                    "_has_hook_marker",
+                    return_value=False,
+                ):
+                    with mock.patch.object(
+                        project_journal.os,
+                        "stat",
+                        side_effect=inaccessible_root,
+                    ):
+                        project_journal._enrich_discovered_repo(repo, row, SCRIPT)
+
+        self.assertIsNone(row["has_journal_dir"])
+        self.assertIsNone(row["journal_count"])
+        self.assertFalse(row["has_index"])
+        self.assertFalse(row["index_ignored"])
+        self.assertFalse(row["hooks_installed"])
+        self.assertEqual(row["discovery_status"], "inconclusive")
+        errors = row["discovery_error"]
+        self.assertIsInstance(errors, dict)
+        assert isinstance(errors, dict)
+        self.assertEqual(set(errors), {"has_journal_dir", "journal_count"})
+        for field in errors:
+            self.assertEqual(errors[field]["errno"], errno.EACCES)
+            self.assertEqual(errors[field]["error_name"], "EACCES")
+
+    def test_enrich_reports_journal_scan_io_failure_only_for_count(self) -> None:
+        repo = self.init_repo().resolve()
+        journal_root = repo / project_journal.JOURNAL_ROOT
+        journal_root.mkdir(parents=True)
+        row: dict[str, object] = {"repo": str(repo)}
+        adoption = {
+            "adoption_status": "unadopted",
+            "adoption_error": None,
+            "tracked_journal_adopted": False,
+            "tracked_non_generated_journal_count": 0,
+            "valid_tracked_journal_count": 0,
+        }
+        actual_scandir = project_journal.os.scandir
+
+        def unreadable_directory(
+            path: os.PathLike[str] | str,
+        ) -> os.ScandirIterator[str]:
+            if pathlib.Path(path) == journal_root:
+                raise OSError(
+                    errno.EIO,
+                    "injected journal directory scan failure",
+                    str(path),
+                )
+            return actual_scandir(path)
+
+        with mock.patch.object(
+            project_journal,
+            "_discover_adoption_status",
+            return_value=adoption,
+        ):
+            with mock.patch.object(
+                project_journal,
+                "_is_excluded",
+                return_value=False,
+            ):
+                with mock.patch.object(
+                    project_journal,
+                    "_has_hook_marker",
+                    return_value=False,
+                ):
+                    with mock.patch.object(
+                        project_journal.os,
+                        "scandir",
+                        side_effect=unreadable_directory,
+                    ):
+                        project_journal._enrich_discovered_repo(repo, row, SCRIPT)
+
+        self.assertTrue(row["has_journal_dir"])
+        self.assertIsNone(row["journal_count"])
+        self.assertFalse(row["has_index"])
+        self.assertFalse(row["index_ignored"])
+        self.assertFalse(row["hooks_installed"])
+        self.assertEqual(row["discovery_status"], "inconclusive")
+        errors = row["discovery_error"]
+        self.assertIsInstance(errors, dict)
+        assert isinstance(errors, dict)
+        self.assertEqual(set(errors), {"journal_count"})
+        self.assertEqual(errors["journal_count"]["errno"], errno.EIO)
+        self.assertEqual(errors["journal_count"]["error_name"], "EIO")
+
+    def test_enrich_isolates_inaccessible_index_exclude_and_hook_paths(
+        self,
+    ) -> None:
+        repo = self.init_repo().resolve()
+        journal_root = repo / project_journal.JOURNAL_ROOT
+        journal_root.mkdir(parents=True)
+        index_path = repo / project_journal.DEFAULT_INDEX
+        exclude_path = repo / "blocked-exclude"
+        hook_path = repo / "blocked-hook"
+        adoption = {
+            "adoption_status": "unadopted",
+            "adoption_error": None,
+            "tracked_journal_adopted": False,
+            "tracked_non_generated_journal_count": 0,
+            "valid_tracked_journal_count": 0,
+        }
+        actual_stat = project_journal.os.stat
+
+        for field, blocked_path, error_number in (
+            ("has_index", index_path, errno.EIO),
+            ("index_ignored", exclude_path, errno.EACCES),
+            ("hooks_installed", hook_path, errno.EIO),
+        ):
+            with self.subTest(field=field):
+                row: dict[str, object] = {"repo": str(repo)}
+
+                def inaccessible_path(
+                    path: os.PathLike[str] | str | int,
+                    *args: object,
+                    **kwargs: object,
+                ) -> os.stat_result:
+                    if not isinstance(path, int) and pathlib.Path(path) == blocked_path:
+                        raise OSError(
+                            error_number,
+                            f"injected inaccessible {field}",
+                            str(path),
+                        )
+                    return actual_stat(path, *args, **kwargs)
+
+                with mock.patch.object(
+                    project_journal,
+                    "_discover_adoption_status",
+                    return_value=adoption,
+                ):
+                    with mock.patch.object(
+                        project_journal,
+                        "_git_path",
+                        return_value=exclude_path,
+                    ):
+                        with mock.patch.object(
+                            project_journal,
+                            "_hook_path",
+                            return_value=hook_path,
+                        ):
+                            with mock.patch.object(
+                                project_journal.os,
+                                "stat",
+                                side_effect=inaccessible_path,
+                            ):
+                                project_journal._enrich_discovered_repo(
+                                    repo,
+                                    row,
+                                    SCRIPT,
+                                )
+
+                self.assertEqual(row["journal_count"], 0)
+                self.assertEqual(row["discovery_status"], "inconclusive")
+                errors = row["discovery_error"]
+                self.assertIsInstance(errors, dict)
+                assert isinstance(errors, dict)
+                self.assertEqual(set(errors), {field})
+                self.assertIsNone(row[field])
+                self.assertEqual(errors[field]["errno"], error_number)
+                self.assertEqual(
+                    errors[field]["error_name"],
+                    errno.errorcode[error_number],
+                )
+                for healthy_field in {
+                    "has_index",
+                    "index_ignored",
+                    "hooks_installed",
+                } - {field}:
+                    self.assertFalse(row[healthy_field])
+
     def test_discover_repos_keeps_healthy_rows_when_adoption_is_inconclusive(
         self,
     ) -> None:
@@ -9569,6 +9914,227 @@ class ProjectJournalTests(unittest.TestCase):
 
         expected = 100.0 + project_journal.GIT_ADOPTION_VALIDATION_TIMEOUT_SECONDS
         self.assertEqual(observed, {"resolution": expected, "adoption": expected})
+
+    def test_discover_repos_retries_inconclusive_with_later_fresh_budget(
+        self,
+    ) -> None:
+        repo = self.init_repo("healthy").resolve()
+        slow = self.root / "slow-candidate"
+        fresh = self.root / "fresh-candidate"
+        codex_home = self.root / "codex-home"
+        rollout_dir = codex_home / "sessions/2026/05/05"
+        rollout_dir.mkdir(parents=True)
+        (rollout_dir / "rollout-fresh-retry.jsonl").write_text(
+            json.dumps({"payload": {"cwd": str(slow)}})
+            + "\n"
+            + json.dumps({"payload": {"cwd": str(fresh)}})
+            + "\n",
+            encoding="utf-8",
+        )
+        clock = {"now": 100.0}
+        remaining_by_candidate = {
+            str(slow): 0.5,
+            str(fresh): 5.0,
+        }
+        enrichment_budgets: list[float] = []
+
+        def resolve_candidate(
+            path_text: str,
+            *,
+            codex_home: pathlib.Path | None = None,
+            deadline: float | None = None,
+        ) -> pathlib.Path:
+            del codex_home
+            self.assertIsNotNone(deadline)
+            assert deadline is not None
+            clock["now"] = deadline - remaining_by_candidate[path_text]
+            return repo
+
+        def enrich_candidate(
+            root: pathlib.Path,
+            row: dict[str, object],
+            script: pathlib.Path,
+            *,
+            deadline: float | None = None,
+        ) -> None:
+            del script
+            self.assertEqual(root, repo)
+            self.assertIsNotNone(deadline)
+            assert deadline is not None
+            enrichment_budgets.append(deadline - clock["now"])
+            if len(enrichment_budgets) == 1:
+                row["adoption_status"] = "inconclusive"
+                row["adoption_error"] = {"code": "adoption_check_failed"}
+            else:
+                row["adoption_status"] = "adopted"
+                row["adoption_error"] = None
+
+        with mock.patch.object(
+            project_journal.time,
+            "monotonic",
+            side_effect=lambda: clock["now"],
+        ):
+            with mock.patch.object(
+                project_journal,
+                "_repo_root_for_path",
+                side_effect=resolve_candidate,
+            ):
+                with mock.patch.object(
+                    project_journal,
+                    "_enrich_discovered_repo",
+                    side_effect=enrich_candidate,
+                ):
+                    rows = project_journal._discover_repos(codex_home, 9999)
+
+        self.assertEqual(enrichment_budgets, [0.5, 5.0])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["adoption_status"], "adopted")
+        self.assertEqual(rows[0]["rollout_count"], 1)
+
+    def test_discover_repos_bounds_persistent_inconclusive_retries(self) -> None:
+        repo = self.init_repo("healthy").resolve()
+        candidates = [self.root / f"candidate-{index}" for index in range(4)]
+        remaining_budgets = [0.5, 2.0, 4.0, 8.0]
+        codex_home = self.root / "codex-home"
+        rollout_dir = codex_home / "sessions/2026/05/05"
+        rollout_dir.mkdir(parents=True)
+        (rollout_dir / "rollout-persistent-inconclusive.jsonl").write_text(
+            "".join(
+                json.dumps({"payload": {"cwd": str(candidate)}}) + "\n"
+                for candidate in candidates
+            ),
+            encoding="utf-8",
+        )
+        clock = {"now": 100.0}
+        remaining_by_candidate = dict(
+            zip((str(candidate) for candidate in candidates), remaining_budgets)
+        )
+        resolved: list[str] = []
+        enrichment_budgets: list[float] = []
+
+        def resolve_candidate(
+            path_text: str,
+            *,
+            codex_home: pathlib.Path | None = None,
+            deadline: float | None = None,
+        ) -> pathlib.Path:
+            del codex_home
+            self.assertIsNotNone(deadline)
+            assert deadline is not None
+            resolved.append(path_text)
+            clock["now"] = deadline - remaining_by_candidate[path_text]
+            return repo
+
+        def enrich_candidate(
+            root: pathlib.Path,
+            row: dict[str, object],
+            script: pathlib.Path,
+            *,
+            deadline: float | None = None,
+        ) -> None:
+            del script
+            self.assertEqual(root, repo)
+            self.assertIsNotNone(deadline)
+            assert deadline is not None
+            enrichment_budgets.append(deadline - clock["now"])
+            row["adoption_status"] = "inconclusive"
+            row["adoption_error"] = {"code": "persistent-test-failure"}
+
+        with mock.patch.object(
+            project_journal.time,
+            "monotonic",
+            side_effect=lambda: clock["now"],
+        ):
+            with mock.patch.object(
+                project_journal,
+                "_repo_root_for_path",
+                side_effect=resolve_candidate,
+            ):
+                with mock.patch.object(
+                    project_journal,
+                    "_enrich_discovered_repo",
+                    side_effect=enrich_candidate,
+                ):
+                    rows = project_journal._discover_repos(codex_home, 9999)
+
+        self.assertEqual(resolved, [str(candidate) for candidate in candidates])
+        self.assertEqual(
+            len(enrichment_budgets),
+            project_journal.DISCOVERY_ENRICHMENT_MAX_ATTEMPTS_PER_ROOT,
+        )
+        self.assertEqual(enrichment_budgets, [0.5, 2.0])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["adoption_status"], "inconclusive")
+        self.assertEqual(rows[0]["rollout_count"], 1)
+
+    def test_discover_repos_does_not_retry_auxiliary_only_inconclusive(
+        self,
+    ) -> None:
+        repo = self.init_repo("healthy").resolve()
+        candidates = [self.root / "first", self.root / "second"]
+        codex_home = self.root / "codex-home"
+        rollout_dir = codex_home / "sessions/2026/05/05"
+        rollout_dir.mkdir(parents=True)
+        (rollout_dir / "rollout-auxiliary-only.jsonl").write_text(
+            "".join(
+                json.dumps({"payload": {"cwd": str(candidate)}}) + "\n"
+                for candidate in candidates
+            ),
+            encoding="utf-8",
+        )
+        clock = {"now": 100.0}
+        enrichment_calls = 0
+
+        def resolve_candidate(
+            path_text: str,
+            *,
+            codex_home: pathlib.Path | None = None,
+            deadline: float | None = None,
+        ) -> pathlib.Path:
+            del path_text, codex_home
+            self.assertIsNotNone(deadline)
+            assert deadline is not None
+            clock["now"] = deadline - (0.5 if enrichment_calls == 0 else 8.0)
+            return repo
+
+        def enrich_candidate(
+            root: pathlib.Path,
+            row: dict[str, object],
+            script: pathlib.Path,
+            *,
+            deadline: float | None = None,
+        ) -> None:
+            nonlocal enrichment_calls
+            del root, script, deadline
+            enrichment_calls += 1
+            row["adoption_status"] = "adopted"
+            row["adoption_error"] = None
+            row["discovery_status"] = "inconclusive"
+            row["discovery_error"] = {
+                "hooks_installed": {"code": "repo_discovery_failed"}
+            }
+
+        with mock.patch.object(
+            project_journal.time,
+            "monotonic",
+            side_effect=lambda: clock["now"],
+        ):
+            with mock.patch.object(
+                project_journal,
+                "_repo_root_for_path",
+                side_effect=resolve_candidate,
+            ):
+                with mock.patch.object(
+                    project_journal,
+                    "_enrich_discovered_repo",
+                    side_effect=enrich_candidate,
+                ):
+                    rows = project_journal._discover_repos(codex_home, 9999)
+
+        self.assertEqual(enrichment_calls, 1)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["adoption_status"], "adopted")
+        self.assertEqual(rows[0]["discovery_status"], "inconclusive")
 
     def test_discover_repos_isolates_worktree_journal_count_limit(self) -> None:
         healthy = self.init_repo("healthy")

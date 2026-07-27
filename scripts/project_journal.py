@@ -80,6 +80,8 @@ MAX_GIT_EXECUTABLE_BYTES = 64 * 1024 * 1024
 GIT_INDEX_SNAPSHOT_TIMEOUT_SECONDS = 10.0
 GIT_CAT_FILE_BATCH_TIMEOUT_SECONDS = 10.0
 GIT_ADOPTION_VALIDATION_TIMEOUT_SECONDS = 10.0
+DISCOVERY_ENRICHMENT_MAX_ATTEMPTS_PER_ROOT = 2
+DISCOVERY_ENRICHMENT_RETRY_MIN_BUDGET_GAIN_SECONDS = 1.0
 GIT_COMMAND_TIMEOUT_SECONDS = 10.0
 GIT_VERSION_TIMEOUT_SECONDS = 2.0
 GIT_EXECUTABLE_SNAPSHOT_TIMEOUT_SECONDS = 5.0
@@ -2009,6 +2011,14 @@ def _git_path(repo: pathlib.Path, rel: str) -> pathlib.Path:
     return path
 
 
+def _stat_path_if_present(path: pathlib.Path) -> os.stat_result | None:
+    """Return a following stat while keeping absent distinct from unreadable."""
+    try:
+        return os.stat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+
+
 def _to_repo_rel(repo: pathlib.Path, path_arg: str) -> str:
     path = pathlib.Path(path_arg)
     if path.is_absolute():
@@ -2237,17 +2247,25 @@ def _as_list(
 
 def _journal_paths(repo: pathlib.Path) -> list[pathlib.Path]:
     root = repo / JOURNAL_ROOT
-    if not root.exists():
+    root_stat = _stat_path_if_present(root)
+    if root_stat is None or not stat.S_ISDIR(root_stat.st_mode):
         return []
     paths: list[pathlib.Path] = []
-    for path in root.rglob("*.md"):
-        if _is_generated_index(path):
-            continue
-        paths.append(path)
-        if len(paths) > MAX_JOURNAL_ENTRIES:
-            raise JournalLimitExceeded(
-                f"journal entry count exceeds {MAX_JOURNAL_ENTRIES}"
-            )
+    pending = [root]
+    while pending:
+        directory = pending.pop()
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                path = pathlib.Path(entry.path)
+                if entry.is_dir(follow_symlinks=False):
+                    pending.append(path)
+                if not entry.name.endswith(".md") or _is_generated_index(path):
+                    continue
+                paths.append(path)
+                if len(paths) > MAX_JOURNAL_ENTRIES:
+                    raise JournalLimitExceeded(
+                        f"journal entry count exceeds {MAX_JOURNAL_ENTRIES}"
+                    )
     return sorted(paths)
 
 
@@ -3572,10 +3590,12 @@ def _initialize_git_runtime() -> None:
 
     if _GIT_RUNTIME is not None or _GIT_RUNTIME_ERROR is not None:
         return
-    if os.name != "posix":
+    if os.name != "posix" or not (
+        sys.platform == "darwin" or sys.platform.startswith("linux")
+    ):
         _GIT_RUNTIME_ERROR = UnsupportedPlatform(
-            "project_journal.py requires a POSIX host for its bounded process "
-            "and filesystem safety contracts"
+            "project_journal.py requires macOS or Linux for its bounded "
+            "process and filesystem safety contracts"
         )
         return
     candidate = shutil.which("git", path=os.environ.get("PATH"))
@@ -5164,9 +5184,11 @@ def _rename_hook_entry_with_flag(
     *,
     exchange: bool,
 ) -> None:
-    if os.name != "posix":
-        raise UserError(
-            "atomic hook installation requires POSIX conditional rename support"
+    if os.name != "posix" or not (
+        sys.platform == "darwin" or sys.platform.startswith("linux")
+    ):
+        raise UnsupportedPlatform(
+            "atomic hook installation is supported only on macOS and Linux"
         )
     library = ctypes.CDLL(None, use_errno=True)
     source_bytes = os.fsencode(source)
@@ -5187,7 +5209,7 @@ def _rename_hook_entry_with_flag(
         )
         rename_function.restype = ctypes.c_int
         flag = 0x00000002 if exchange else 0x00000004
-    else:
+    elif sys.platform.startswith("linux"):
         try:
             rename_function = library.renameat2
         except AttributeError as exc:
@@ -6696,7 +6718,7 @@ def _unique_preserving_order(values: list[str]) -> list[str]:
 def _has_hook_marker(repo: pathlib.Path) -> bool:
     for name in HOOK_NAMES:
         hook = _hook_path(repo, name)
-        if not hook.exists():
+        if _stat_path_if_present(hook) is None:
             return False
         content = hook.read_text(encoding="utf-8", errors="replace")
         if HOOK_BEGIN not in content or HOOK_END not in content:
@@ -6706,7 +6728,7 @@ def _has_hook_marker(repo: pathlib.Path) -> bool:
 
 def _is_excluded(repo: pathlib.Path, rel: str) -> bool:
     exclude = _git_path(repo, "info/exclude")
-    if not exclude.exists():
+    if _stat_path_if_present(exclude) is None:
         return False
     return rel in exclude.read_text(encoding="utf-8", errors="replace").splitlines()
 
@@ -6740,11 +6762,18 @@ def _discover_adoption_status(
     }
 
 
-def _discovery_error(exc: BaseException) -> dict[str, str]:
-    return {
+def _discovery_error(exc: BaseException) -> dict[str, Any]:
+    error: dict[str, Any] = {
         "code": getattr(exc, "code", "repo_discovery_failed"),
         "message": str(exc),
     }
+    error_number = getattr(exc, "errno", None)
+    if isinstance(error_number, int):
+        error["errno"] = error_number
+        error_name = errno.errorcode.get(error_number)
+        if error_name is not None:
+            error["error_name"] = error_name
+    return error
 
 
 def _enrich_discovered_repo(
@@ -6757,7 +6786,16 @@ def _enrich_discovered_repo(
     journal_root = root / JOURNAL_ROOT
     index_rel = DEFAULT_INDEX.as_posix()
     adoption = _discover_adoption_status(root, deadline=deadline)
-    auxiliary_errors: dict[str, dict[str, str]] = {}
+    auxiliary_errors: dict[str, dict[str, Any]] = {}
+
+    try:
+        journal_root_stat = _stat_path_if_present(journal_root)
+        has_journal_dir = journal_root_stat is not None and stat.S_ISDIR(
+            journal_root_stat.st_mode
+        )
+    except OSError as exc:
+        has_journal_dir = None
+        auxiliary_errors["has_journal_dir"] = _discovery_error(exc)
 
     try:
         journal_count = len(_journal_paths(root))
@@ -6777,6 +6815,13 @@ def _enrich_discovered_repo(
         hooks_installed = None
         auxiliary_errors["hooks_installed"] = _discovery_error(exc)
 
+    try:
+        index_stat = _stat_path_if_present(root / index_rel)
+        has_index = index_stat is not None and stat.S_ISREG(index_stat.st_mode)
+    except OSError as exc:
+        has_index = None
+        auxiliary_errors["has_index"] = _discovery_error(exc)
+
     discovery_status = (
         "inconclusive"
         if auxiliary_errors or adoption["adoption_status"] == "inconclusive"
@@ -6784,9 +6829,9 @@ def _enrich_discovered_repo(
     )
     row.update(
         {
-            "has_journal_dir": journal_root.is_dir(),
+            "has_journal_dir": has_journal_dir,
             "journal_count": journal_count,
-            "has_index": (root / index_rel).is_file(),
+            "has_index": has_index,
             "index_ignored": index_ignored,
             "hooks_installed": hooks_installed,
             "discovery_status": discovery_status,
@@ -6801,7 +6846,7 @@ def _enrich_discovered_repo(
 def _repository_resolution_error_row(
     cwd: str,
     last_seen: str,
-    error: dict[str, str],
+    error: dict[str, Any],
 ) -> dict[str, Any]:
     adoption_error = {
         "code": error["code"],
@@ -6839,9 +6884,11 @@ def _discover_repos(codex_home: pathlib.Path, since_days: int) -> list[dict[str,
     cutoff = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=since_days)).date()
     seen: dict[pathlib.Path, dict[str, Any]] = {}
     resolved_roots: dict[str, pathlib.Path | None] = {}
-    resolution_errors: dict[str, dict[str, str]] = {}
+    resolution_errors: dict[str, dict[str, Any]] = {}
     unresolved: dict[str, dict[str, Any]] = {}
     resolution_deadlines: dict[str, float] = {}
+    enrichment_remaining_budgets: dict[pathlib.Path, float] = {}
+    enrichment_attempts: dict[pathlib.Path, int] = {}
     script = pathlib.Path(__file__).resolve()
 
     for rollout in sorted(sessions.rglob("rollout-*.jsonl")):
@@ -6887,12 +6934,42 @@ def _discover_repos(codex_home: pathlib.Path, since_days: int) -> list[dict[str,
                     "rollout_count": 0,
                 }
                 seen[root] = row
+                remaining_budget = max(
+                    0.0,
+                    resolution_deadlines[cwd] - time.monotonic(),
+                )
+                enrichment_remaining_budgets[root] = remaining_budget
+                enrichment_attempts[root] = 1
                 _enrich_discovered_repo(
                     root,
                     row,
                     script,
                     deadline=resolution_deadlines[cwd],
                 )
+            else:
+                row = seen[root]
+                remaining_budget = max(
+                    0.0,
+                    resolution_deadlines[cwd] - time.monotonic(),
+                )
+                if (
+                    row.get("adoption_status") == "inconclusive"
+                    and enrichment_attempts[root]
+                    < DISCOVERY_ENRICHMENT_MAX_ATTEMPTS_PER_ROOT
+                    and remaining_budget
+                    >= (
+                        enrichment_remaining_budgets[root]
+                        + DISCOVERY_ENRICHMENT_RETRY_MIN_BUDGET_GAIN_SECONDS
+                    )
+                ):
+                    enrichment_remaining_budgets[root] = remaining_budget
+                    enrichment_attempts[root] += 1
+                    _enrich_discovered_repo(
+                        root,
+                        row,
+                        script,
+                        deadline=resolution_deadlines[cwd],
+                    )
             roots_for_rollout.add(root)
         for root in roots_for_rollout:
             row = seen[root]
@@ -6983,6 +7060,8 @@ def main(argv: list[str] | None = None) -> int:
         parser = build_parser()
         args = parser.parse_args(argv)
         _initialize_git_runtime()
+        if isinstance(_GIT_RUNTIME_ERROR, UnsupportedPlatform):
+            raise _GIT_RUNTIME_ERROR
         return int(args.func(args))
 
     try:
