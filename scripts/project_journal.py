@@ -7520,6 +7520,11 @@ def _install_hook(
                 f"hook target failed post-write verification: "
                 f"{binding.path / target.name}: {status}"
             )
+        # The descriptor-relative snapshot proves the installed target in the
+        # held directory, but not that the configured path still names that
+        # directory after the snapshot. Revalidate the complete ancestor chain
+        # before recording the transaction as verified.
+        _revalidate_hook_directory(binding)
         commit_state.mark_verified()
         _raise_if_termination_pending()
     except _HookExchangeRecoveryRequired:

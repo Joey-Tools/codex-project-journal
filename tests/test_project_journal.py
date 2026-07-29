@@ -9874,6 +9874,108 @@ class ProjectJournalTests(unittest.TestCase):
                 )
                 self.assertNotIn("recovery locator", message)
 
+    def test_install_hooks_detects_directory_replacement_during_final_snapshot(
+        self,
+    ) -> None:
+        for initially_exists in (False, True):
+            with self.subTest(initially_exists=initially_exists):
+                repo = self.init_repo(f"repo-final-binding-{initially_exists}")
+                configured = run_git(
+                    repo,
+                    "config",
+                    "--local",
+                    "core.hooksPath",
+                    ".githooks",
+                )
+                self.assertEqual(configured.returncode, 0, configured.stderr)
+                if initially_exists:
+                    first = self.run_cli("install-hooks", "--repo", str(repo))
+                    self.assertEqual(first.returncode, 0, first.stderr)
+
+                hooks_dir = repo / ".githooks"
+                moved_hooks = repo / ".githooks-validated-object"
+                actual_commit = project_journal._commit_hook_target_atomically
+                actual_snapshot = project_journal._snapshot_hook_target
+                actual_mark_verified = project_journal._HookCommitState.mark_verified
+                commit_returned = False
+                raced_commit_state: project_journal._HookCommitState | None = None
+                raced = False
+                raced_target_verified = False
+
+                def commit_and_mark(
+                    binding: project_journal._HookDirectoryBinding,
+                    target: project_journal._HookTargetSnapshot,
+                    temporary_name: str,
+                    staged: project_journal._HookTargetSnapshot,
+                    commit_state: project_journal._HookCommitState,
+                ) -> None:
+                    nonlocal commit_returned, raced_commit_state
+                    actual_commit(
+                        binding,
+                        target,
+                        temporary_name,
+                        staged,
+                        commit_state,
+                    )
+                    if target.name == "post-rewrite":
+                        commit_returned = True
+                        raced_commit_state = commit_state
+
+                def replace_directory_during_final_snapshot(
+                    binding: project_journal._HookDirectoryBinding,
+                    name: str,
+                ) -> tuple[project_journal._HookTargetSnapshot, bytes | None]:
+                    nonlocal raced
+                    snapshot = actual_snapshot(binding, name)
+                    if commit_returned and name == "post-rewrite" and not raced:
+                        raced = True
+                        hooks_dir.rename(moved_hooks)
+                        hooks_dir.mkdir()
+                    return snapshot
+
+                def record_mark_verified(
+                    commit_state: project_journal._HookCommitState,
+                ) -> None:
+                    nonlocal raced_target_verified
+                    if commit_state is raced_commit_state:
+                        raced_target_verified = True
+                    actual_mark_verified(commit_state)
+
+                args = mock.Mock(repo=str(repo))
+                with mock.patch.object(
+                    project_journal,
+                    "_commit_hook_target_atomically",
+                    side_effect=commit_and_mark,
+                ):
+                    with mock.patch.object(
+                        project_journal,
+                        "_snapshot_hook_target",
+                        side_effect=replace_directory_during_final_snapshot,
+                    ):
+                        with mock.patch.object(
+                            project_journal._HookCommitState,
+                            "mark_verified",
+                            autospec=True,
+                            side_effect=record_mark_verified,
+                        ):
+                            with self.assertRaisesRegex(
+                                project_journal.UserError,
+                                "ancestor identity or access policy changed",
+                            ) as raised:
+                                project_journal.command_install_hooks(args)
+
+                self.assertTrue(raced)
+                self.assertFalse(raced_target_verified)
+                self.assertIn(
+                    "final installed-target verification is incomplete",
+                    str(raised.exception),
+                )
+                self.assertFalse((hooks_dir / "post-rewrite").exists())
+                self.assertIn(
+                    project_journal.HOOK_BEGIN,
+                    (moved_hooks / "post-rewrite").read_text(encoding="utf-8"),
+                )
+
     def test_install_hooks_reports_post_commit_verification_interrupt(
         self,
     ) -> None:
