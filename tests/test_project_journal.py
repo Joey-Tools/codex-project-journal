@@ -9420,6 +9420,64 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertEqual(rows[0]["rollout_count"], 2)
         self.assertEqual(rows[0]["coverage_status"], "complete")
 
+    def test_discover_repos_merges_conflicting_duplicate_rollout_cwds_once(
+        self,
+    ) -> None:
+        first_repo = self.init_repo("first-repo")
+        second_repo = self.init_repo("second-repo")
+        codex_home = self.root / "codex-home"
+        active = codex_home / "sessions/2026/05/05"
+        archive = codex_home / "archived_sessions"
+        active.mkdir(parents=True)
+        archive.mkdir(parents=True)
+        duplicate_name = "rollout-2026-05-05T10-00-00-duplicate.jsonl"
+        (active / duplicate_name).write_text(
+            json.dumps({"payload": {"cwd": str(first_repo)}}) + "\n",
+            encoding="utf-8",
+        )
+        (archive / duplicate_name).write_text(
+            json.dumps({"payload": {"cwd": str(second_repo)}}) + "\n",
+            encoding="utf-8",
+        )
+
+        rows = project_journal._discover_repos(codex_home, 9999)
+
+        rows_by_repo = {pathlib.Path(str(row["repo"])).name: row for row in rows}
+        self.assertEqual(set(rows_by_repo), {"first-repo", "second-repo"})
+        for row in rows_by_repo.values():
+            self.assertEqual(row["rollout_count"], 1)
+            self.assertEqual(row["coverage_status"], "complete")
+
+    def test_discover_repos_marks_broken_duplicate_rollout_partial(
+        self,
+    ) -> None:
+        repo = self.init_repo()
+        codex_home = self.root / "codex-home"
+        active = codex_home / "sessions/2026/05/05"
+        archive = codex_home / "archived_sessions"
+        active.mkdir(parents=True)
+        archive.mkdir(parents=True)
+        duplicate_name = "rollout-2026-05-05T10-00-00-duplicate.jsonl"
+        (active / duplicate_name).write_text(
+            json.dumps({"payload": {"cwd": str(repo)}}) + "\n",
+            encoding="utf-8",
+        )
+        (archive / duplicate_name).write_bytes(b'{"payload":\n')
+
+        rows = project_journal._discover_repos(codex_home, 9999)
+
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(os.path.samefile(rows[0]["repo"], repo))
+        self.assertEqual(rows[0]["rollout_count"], 1)
+        self.assertEqual(rows[0]["coverage_status"], "partial")
+        coverage = rows[0]["discovery_error"]["discovery_coverage"]
+        self.assertEqual(coverage["code"], "discovery_rollout_parse_failed")
+        self.assertEqual(coverage["parse_reason"], "invalid_json")
+        self.assertEqual(
+            pathlib.Path(coverage["source"]).parent.name,
+            "archived_sessions",
+        )
+
     def test_discover_repos_marks_oversized_rollout_line_partial(self) -> None:
         codex_home = self.root / "codex-home"
         rollout_dir = codex_home / "sessions/2026/05/05"
@@ -9464,6 +9522,188 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertEqual(coverage["code"], "discovery_limit_exceeded")
         self.assertEqual(coverage["limit_name"], "JSON nesting depth")
         self.assertEqual(coverage["observed"], 3)
+
+    def test_discover_repos_reports_rollout_parse_failures(self) -> None:
+        parse_failures = (
+            ("truncated", b'{"payload":{"cwd":"/tmp/repo"}\n', "invalid_json"),
+            ("corrupt", b"not-json\n", "invalid_json"),
+            (
+                "invalid-utf8",
+                b'{"payload":{"cwd":"\xff"}}\n',
+                "invalid_utf8",
+            ),
+            (
+                "oversized-integer",
+                (
+                    b'{"payload":{"sequence":'
+                    + b"9" * (project_journal.MAX_DISCOVERY_JSON_INTEGER_DIGITS + 1)
+                    + b"}}\n"
+                ),
+                "integer_digit_limit",
+            ),
+        )
+        for name, payload, expected_reason in parse_failures:
+            with self.subTest(name=name):
+                codex_home = self.root / f"codex-home-{name}"
+                rollout_dir = codex_home / "sessions/2026/05/05"
+                rollout_dir.mkdir(parents=True)
+                rollout = rollout_dir / f"rollout-{name}.jsonl"
+                rollout.write_bytes(payload)
+
+                rows = project_journal._discover_repos(codex_home, 9999)
+
+                self.assertEqual(len(rows), 1)
+                row = rows[0]
+                self.assertIsNone(row["repo"])
+                self.assertEqual(row["coverage_status"], "partial")
+                self.assertEqual(row["discovery_status"], "inconclusive")
+                coverage = row["discovery_error"]["discovery_coverage"]
+                self.assertEqual(
+                    coverage["code"],
+                    "discovery_rollout_parse_failed",
+                )
+                self.assertEqual(coverage["parse_reason"], expected_reason)
+                self.assertEqual(coverage["record_number"], 1)
+                self.assertEqual(coverage["byte_offset"], 0)
+                self.assertEqual(coverage["rollout_records_scanned"], 1)
+                self.assertEqual(coverage["rollout_bytes_scanned"], len(payload))
+
+    def test_discover_repos_keeps_prior_rows_when_later_record_is_invalid(
+        self,
+    ) -> None:
+        repo = self.init_repo()
+        codex_home = self.root / "codex-home"
+        rollout_dir = codex_home / "sessions/2026/05/05"
+        rollout_dir.mkdir(parents=True)
+        first_record = (json.dumps({"payload": {"cwd": str(repo)}}) + "\n").encode()
+        (rollout_dir / "rollout-late-invalid.jsonl").write_bytes(
+            first_record + b'{"payload":\n'
+        )
+
+        rows = project_journal._discover_repos(codex_home, 9999)
+
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(os.path.samefile(rows[0]["repo"], repo))
+        self.assertEqual(rows[0]["rollout_count"], 1)
+        self.assertEqual(rows[0]["coverage_status"], "partial")
+        coverage = rows[0]["discovery_error"]["discovery_coverage"]
+        self.assertEqual(coverage["parse_reason"], "invalid_json")
+        self.assertEqual(coverage["record_number"], 2)
+        self.assertEqual(coverage["byte_offset"], len(first_record))
+
+    def test_normalize_discovery_cwd_applies_caps_before_path_construction(
+        self,
+    ) -> None:
+        cases = (
+            (
+                "utf8-bytes",
+                "/éé",
+                "MAX_DISCOVERY_CWD_UTF8_BYTES",
+                4,
+                project_journal.DiscoveryLimitExceeded,
+            ),
+            (
+                "components",
+                "/one/two/three",
+                "MAX_DISCOVERY_CWD_COMPONENTS",
+                2,
+                project_journal.DiscoveryLimitExceeded,
+            ),
+            (
+                "invalid-utf8",
+                "\ud800",
+                "MAX_DISCOVERY_CWD_UTF8_BYTES",
+                project_journal.MAX_DISCOVERY_CWD_UTF8_BYTES,
+                project_journal.DiscoveryCwdValidationError,
+            ),
+        )
+        for name, cwd, constant, limit, expected_error in cases:
+            with self.subTest(name=name):
+                with mock.patch.object(project_journal, constant, limit):
+                    with mock.patch.object(
+                        project_journal.pathlib,
+                        "Path",
+                    ) as path_constructor:
+                        with self.assertRaises(expected_error):
+                            project_journal._normalize_discovery_cwd(cwd)
+                        path_constructor.assert_not_called()
+
+    def test_discover_repos_marks_oversized_cwd_bytes_partial(self) -> None:
+        codex_home = self.root / "codex-home"
+        rollout_dir = codex_home / "sessions/2026/05/05"
+        rollout_dir.mkdir(parents=True)
+        (rollout_dir / "rollout-oversized-cwd.jsonl").write_text(
+            json.dumps({"payload": {"cwd": "/éé"}}) + "\n",
+            encoding="utf-8",
+        )
+
+        with mock.patch.object(
+            project_journal,
+            "MAX_DISCOVERY_CWD_UTF8_BYTES",
+            4,
+        ):
+            with mock.patch.object(
+                project_journal,
+                "_repo_root_for_path",
+            ) as resolver:
+                rows = project_journal._discover_repos(codex_home, 9999)
+
+        resolver.assert_not_called()
+        coverage = rows[0]["discovery_error"]["discovery_coverage"]
+        self.assertEqual(rows[0]["coverage_status"], "partial")
+        self.assertEqual(coverage["code"], "discovery_limit_exceeded")
+        self.assertEqual(coverage["limit_name"], "CWD UTF-8 bytes")
+        self.assertEqual(coverage["observed"], 5)
+
+    def test_discover_repos_marks_excessive_cwd_components_partial(
+        self,
+    ) -> None:
+        codex_home = self.root / "codex-home"
+        rollout_dir = codex_home / "sessions/2026/05/05"
+        rollout_dir.mkdir(parents=True)
+        (rollout_dir / "rollout-deep-cwd.jsonl").write_text(
+            json.dumps({"payload": {"cwd": "/one/two/three"}}) + "\n",
+            encoding="utf-8",
+        )
+
+        with mock.patch.object(
+            project_journal,
+            "MAX_DISCOVERY_CWD_COMPONENTS",
+            2,
+        ):
+            with mock.patch.object(
+                project_journal,
+                "_repo_root_for_path",
+            ) as resolver:
+                rows = project_journal._discover_repos(codex_home, 9999)
+
+        resolver.assert_not_called()
+        coverage = rows[0]["discovery_error"]["discovery_coverage"]
+        self.assertEqual(rows[0]["coverage_status"], "partial")
+        self.assertEqual(coverage["code"], "discovery_limit_exceeded")
+        self.assertEqual(coverage["limit_name"], "CWD component count")
+        self.assertEqual(coverage["observed"], 3)
+
+    def test_discover_repos_marks_invalid_utf8_cwd_partial(self) -> None:
+        codex_home = self.root / "codex-home"
+        rollout_dir = codex_home / "sessions/2026/05/05"
+        rollout_dir.mkdir(parents=True)
+        (rollout_dir / "rollout-invalid-cwd.jsonl").write_text(
+            json.dumps({"payload": {"cwd": "\ud800"}}) + "\n",
+            encoding="utf-8",
+        )
+
+        with mock.patch.object(
+            project_journal,
+            "_repo_root_for_path",
+        ) as resolver:
+            rows = project_journal._discover_repos(codex_home, 9999)
+
+        resolver.assert_not_called()
+        coverage = rows[0]["discovery_error"]["discovery_coverage"]
+        self.assertEqual(rows[0]["coverage_status"], "partial")
+        self.assertEqual(coverage["code"], "discovery_cwd_invalid")
+        self.assertEqual(coverage["validation_reason"], "invalid_utf8")
 
     def test_discover_repos_normalizes_cwd_aliases_before_resolution(self) -> None:
         repo = self.init_repo().resolve()

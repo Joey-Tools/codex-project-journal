@@ -91,7 +91,11 @@ MAX_DISCOVERY_LINE_BYTES = 4 * 1024 * 1024
 MAX_DISCOVERY_RECORDS = 1_000_000
 MAX_DISCOVERY_DISTINCT_CWDS = 4096
 MAX_DISCOVERY_JSON_DEPTH = 64
+MAX_DISCOVERY_JSON_INTEGER_DIGITS = 4096
+MAX_DISCOVERY_CWD_UTF8_BYTES = 16 * 1024
+MAX_DISCOVERY_CWD_COMPONENTS = 256
 MAX_DISCOVERY_ERRORS = 32
+MAX_DISCOVERY_ERROR_DETAIL_CHARS = 512
 DISCOVERY_ENRICHMENT_MAX_ATTEMPTS_PER_ROOT = 2
 DISCOVERY_ENRICHMENT_RETRY_MIN_BUDGET_GAIN_SECONDS = 1.0
 GIT_COMMAND_TIMEOUT_SECONDS = 10.0
@@ -220,6 +224,49 @@ class DiscoveryDeadlineExceeded(UserError):
     """Session discovery exhausted its one aggregate wall-clock budget."""
 
     code = "discovery_deadline_exceeded"
+
+
+class DiscoveryRolloutParseError(UserError):
+    """A non-empty rollout record could not be parsed completely."""
+
+    code = "discovery_rollout_parse_failed"
+
+    def __init__(
+        self,
+        *,
+        parse_reason: str,
+        record_number: int,
+        byte_offset: int,
+        detail: str,
+    ) -> None:
+        self.parse_reason = parse_reason
+        self.record_number = record_number
+        self.byte_offset = byte_offset
+        self.detail = detail[:MAX_DISCOVERY_ERROR_DETAIL_CHARS]
+        super().__init__(
+            f"rollout record {record_number} at byte {byte_offset} "
+            f"could not be parsed ({parse_reason}): {self.detail}"
+        )
+
+
+class DiscoveryCwdValidationError(UserError):
+    """A discovered CWD could not be represented as strict UTF-8."""
+
+    code = "discovery_cwd_invalid"
+
+    def __init__(self, detail: str) -> None:
+        self.validation_reason = "invalid_utf8"
+        self.detail = detail[:MAX_DISCOVERY_ERROR_DETAIL_CHARS]
+        super().__init__(f"discovered CWD is not valid strict UTF-8: {self.detail}")
+
+
+class _DiscoveryJsonIntegerLimitExceeded(ValueError):
+    def __init__(self, observed: int) -> None:
+        self.observed = observed
+        super().__init__(
+            f"JSON integer has {observed} digits; "
+            f"limit is {MAX_DISCOVERY_JSON_INTEGER_DIGITS}"
+        )
 
 
 class _ProcessIdentityLost(UserError):
@@ -6837,16 +6884,28 @@ def _walk_for_cwds(value: Any) -> Iterable[str]:
             pending.extend(item)
 
 
+def _parse_discovery_json_integer(value: str) -> int:
+    digit_count = len(value) - (1 if value.startswith("-") else 0)
+    if digit_count > MAX_DISCOVERY_JSON_INTEGER_DIGITS:
+        raise _DiscoveryJsonIntegerLimitExceeded(digit_count)
+    return int(value)
+
+
 def _extract_cwds(
     rollout: pathlib.Path,
     state: _DiscoveryScanState,
 ) -> Iterable[str]:
+    record_number = 0
+    byte_offset = 0
     with rollout.open("rb") as handle:
         while True:
             state.check_deadline()
             line = handle.readline(MAX_DISCOVERY_LINE_BYTES + 1)
             if not line:
                 return
+            record_number += 1
+            record_byte_offset = byte_offset
+            byte_offset += len(line)
             if len(line) > MAX_DISCOVERY_LINE_BYTES:
                 raise DiscoveryLimitExceeded(
                     "rollout line bytes",
@@ -6859,9 +6918,40 @@ def _extract_cwds(
                 continue
             _check_json_depth(stripped)
             try:
-                payload = json.loads(stripped.decode("utf-8", errors="replace"))
-            except json.JSONDecodeError:
-                continue
+                decoded = stripped.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise DiscoveryRolloutParseError(
+                    parse_reason="invalid_utf8",
+                    record_number=record_number,
+                    byte_offset=record_byte_offset,
+                    detail=str(exc),
+                ) from exc
+            try:
+                payload = json.loads(
+                    decoded,
+                    parse_int=_parse_discovery_json_integer,
+                )
+            except _DiscoveryJsonIntegerLimitExceeded as exc:
+                raise DiscoveryRolloutParseError(
+                    parse_reason="integer_digit_limit",
+                    record_number=record_number,
+                    byte_offset=record_byte_offset,
+                    detail=str(exc),
+                ) from exc
+            except json.JSONDecodeError as exc:
+                raise DiscoveryRolloutParseError(
+                    parse_reason="invalid_json",
+                    record_number=record_number,
+                    byte_offset=record_byte_offset,
+                    detail=str(exc),
+                ) from exc
+            except ValueError as exc:
+                raise DiscoveryRolloutParseError(
+                    parse_reason="json_value_limit",
+                    record_number=record_number,
+                    byte_offset=record_byte_offset,
+                    detail=str(exc),
+                ) from exc
             except RecursionError as exc:
                 raise DiscoveryLimitExceeded(
                     "JSON nesting depth",
@@ -6872,7 +6962,25 @@ def _extract_cwds(
 
 
 def _normalize_discovery_cwd(cwd: str) -> str:
-    """Deduplicate harmless spelling aliases without resolving symlinks or `..`."""
+    """Validate before Path construction, then normalize harmless spelling aliases."""
+
+    try:
+        encoded = cwd.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise DiscoveryCwdValidationError(str(exc)) from exc
+    if len(encoded) > MAX_DISCOVERY_CWD_UTF8_BYTES:
+        raise DiscoveryLimitExceeded(
+            "CWD UTF-8 bytes",
+            MAX_DISCOVERY_CWD_UTF8_BYTES,
+            len(encoded),
+        )
+    component_count = sum(component not in {"", "."} for component in cwd.split("/"))
+    if component_count > MAX_DISCOVERY_CWD_COMPONENTS:
+        raise DiscoveryLimitExceeded(
+            "CWD component count",
+            MAX_DISCOVERY_CWD_COMPONENTS,
+            component_count,
+        )
 
     return os.fspath(pathlib.Path(cwd))
 
@@ -7189,6 +7297,16 @@ def _discovery_coverage_error(
                 "observed": exc.observed,
             }
         )
+    elif isinstance(exc, DiscoveryRolloutParseError):
+        error.update(
+            {
+                "parse_reason": exc.parse_reason,
+                "record_number": exc.record_number,
+                "byte_offset": exc.byte_offset,
+            }
+        )
+    elif isinstance(exc, DiscoveryCwdValidationError):
+        error["validation_reason"] = exc.validation_reason
     error.update(state.coverage_counters())
     return error
 
@@ -7257,7 +7375,9 @@ def _discover_repos(codex_home: pathlib.Path, since_days: int) -> list[dict[str,
     enrichment_remaining_budgets: dict[pathlib.Path, float] = {}
     enrichment_attempts: dict[pathlib.Path, int] = {}
     script = pathlib.Path(__file__).resolve()
-    seen_rollouts: set[str] = set()
+    known_rollouts: set[str] = set()
+    counted_repo_rollouts: set[tuple[str, pathlib.Path]] = set()
+    counted_unresolved_rollouts: set[tuple[str, str]] = set()
     coverage_errors: list[dict[str, Any]] = []
     coverage_error_count = 0
     stop_all_sources = False
@@ -7303,10 +7423,9 @@ def _discover_repos(codex_home: pathlib.Path, since_days: int) -> list[dict[str,
                     if not _rollout_in_window(rollout, cutoff):
                         continue
                     rollout_identity = rollout.name
-                    if rollout_identity in seen_rollouts:
-                        continue
-                    seen_rollouts.add(rollout_identity)
-                    state.add_rollout()
+                    if rollout_identity not in known_rollouts:
+                        known_rollouts.add(rollout_identity)
+                        state.add_rollout()
                     last_seen = _rollout_last_seen(rollout)
                     roots_for_rollout: set[pathlib.Path] = set()
                     unresolved_for_rollout: set[str] = set()
@@ -7409,15 +7528,25 @@ def _discover_repos(codex_home: pathlib.Path, since_days: int) -> list[dict[str,
                                 str(row["last_seen"]),
                                 last_seen,
                             )
-                            row["rollout_count"] = int(row["rollout_count"]) + 1
+                            association = (rollout_identity, root)
+                            if association not in counted_repo_rollouts:
+                                counted_repo_rollouts.add(association)
+                                row["rollout_count"] = int(row["rollout_count"]) + 1
                         for cwd in unresolved_for_rollout:
                             row = unresolved[cwd]
-                            row["rollout_count"] = int(row["rollout_count"]) + 1
+                            association = (rollout_identity, cwd)
+                            if association not in counted_unresolved_rollouts:
+                                counted_unresolved_rollouts.add(association)
+                                row["rollout_count"] = int(row["rollout_count"]) + 1
                     state.check_deadline()
                 except (DiscoveryDeadlineExceeded, DiscoveryLimitExceeded) as exc:
                     record_coverage_error(exc, rollout)
                     stop_all_sources = True
-                except OSError as exc:
+                except (
+                    DiscoveryCwdValidationError,
+                    DiscoveryRolloutParseError,
+                    OSError,
+                ) as exc:
                     record_coverage_error(exc, rollout)
         except (DiscoveryDeadlineExceeded, DiscoveryLimitExceeded) as exc:
             record_coverage_error(exc, rollout_root)
