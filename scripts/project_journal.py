@@ -114,6 +114,12 @@ MAX_DEFERRED_SIGNAL_REPORT_CHARS = 4096
 MAX_LINUX_PROC_GROUP_SCAN_PIDS = 131_072
 MAX_LINUX_PROC_STAT_BYTES = 4096
 DARWIN_SA_NOCLDWAIT = 0x0020
+LINUX_SA_NOCLDWAIT = 0x00000002
+LINUX_SIGSET_BYTES = 128
+LINUX_SIGACTION_REVIEWED_MULTIARCH = {
+    "aarch64": frozenset({"aarch64-linux-gnu", "aarch64-linux-musl"}),
+    "x86_64": frozenset({"x86_64-linux-gnu", "x86_64-linux-musl"}),
+}
 MINIMUM_GIT_VERSION = (2, 45, 0)
 GIT_VERSION_RE = re.compile(
     rb"\Agit version ([0-9]+)\.([0-9]+)(?:\.([0-9]+))?(?:[ .].*)?\n?\Z"
@@ -324,14 +330,16 @@ class DiscoveryRolloutInspectionError(UserError):
 
 
 class DiscoveryCwdValidationError(UserError):
-    """A discovered CWD could not be represented as strict UTF-8."""
+    """A discovered CWD is unsafe to pass to filesystem path APIs."""
 
     code = "discovery_cwd_invalid"
 
-    def __init__(self, detail: str) -> None:
-        self.validation_reason = "invalid_utf8"
+    def __init__(self, validation_reason: str, detail: str) -> None:
+        self.validation_reason = validation_reason
         self.detail = detail[:MAX_DISCOVERY_ERROR_DETAIL_CHARS]
-        super().__init__(f"discovered CWD is not valid strict UTF-8: {self.detail}")
+        super().__init__(
+            f"discovered CWD is invalid ({validation_reason}): {self.detail}"
+        )
 
 
 class _DiscoveryJsonIntegerLimitExceeded(ValueError):
@@ -3032,6 +3040,28 @@ class _DarwinSigaction(ctypes.Structure):
     )
 
 
+class _LinuxSigset(ctypes.Structure):
+    """The 1024-bit libc sigset_t used by supported Linux ABIs."""
+
+    _fields_ = (
+        (
+            "bits",
+            ctypes.c_ulong * (LINUX_SIGSET_BYTES // ctypes.sizeof(ctypes.c_ulong)),
+        ),
+    )
+
+
+class _LinuxSigaction(ctypes.Structure):
+    """The libc struct sigaction layout for supported 64-bit Linux ABIs."""
+
+    _fields_ = (
+        ("handler", ctypes.c_void_p),
+        ("mask", _LinuxSigset),
+        ("flags", ctypes.c_int),
+        ("restorer", ctypes.c_void_p),
+    )
+
+
 def _darwin_sigchld_action() -> tuple[int, int]:
     try:
         library = ctypes.CDLL(None, use_errno=True)
@@ -3056,6 +3086,48 @@ def _darwin_sigchld_action() -> tuple[int, int]:
     return int(action.handler or 0), int(action.flags)
 
 
+def _linux_sigchld_action() -> tuple[int, int]:
+    try:
+        machine = os.uname().machine.lower()
+    except (AttributeError, OSError) as exc:
+        raise _WaitableSigchldUnavailable(
+            "Linux SIGCHLD disposition inspection cannot identify the libc ABI"
+        ) from exc
+    multiarch = getattr(sys.implementation, "_multiarch", None)
+    reviewed_multiarch = LINUX_SIGACTION_REVIEWED_MULTIARCH.get(machine)
+    if (
+        ctypes.sizeof(ctypes.c_void_p) != 8
+        or ctypes.sizeof(ctypes.c_ulong) != 8
+        or reviewed_multiarch is None
+        or multiarch not in reviewed_multiarch
+    ):
+        raise _WaitableSigchldUnavailable(
+            "Linux SIGCHLD disposition inspection has no reviewed sigaction "
+            f"layout for machine {machine!r} and multiarch {multiarch!r}"
+        )
+    try:
+        library = ctypes.CDLL(None, use_errno=True)
+        sigaction = library.sigaction
+    except (AttributeError, OSError) as exc:
+        raise _WaitableSigchldUnavailable(
+            "Linux SIGCHLD disposition inspection is unavailable"
+        ) from exc
+    sigaction.argtypes = (
+        ctypes.c_int,
+        ctypes.POINTER(_LinuxSigaction),
+        ctypes.POINTER(_LinuxSigaction),
+    )
+    sigaction.restype = ctypes.c_int
+    action = _LinuxSigaction()
+    ctypes.set_errno(0)
+    if sigaction(int(signal.SIGCHLD), None, ctypes.byref(action)) != 0:
+        error_number = ctypes.get_errno() or errno.EINVAL
+        raise _WaitableSigchldUnavailable(
+            f"failed to inspect Linux SIGCHLD disposition: {os.strerror(error_number)}"
+        )
+    return int(action.handler or 0), int(action.flags)
+
+
 def _waitable_sigchld_failure() -> str | None:
     if os.name != "posix":
         return None
@@ -3075,15 +3147,27 @@ def _waitable_sigchld_failure() -> str | None:
             raw_handler, flags = _darwin_sigchld_action()
         except _WaitableSigchldUnavailable as exc:
             return str(exc)
-        if raw_handler != 0:
-            return (
-                "Darwin SIGCHLD has a non-default native handler that may "
-                "reap direct children"
-            )
-        if flags & DARWIN_SA_NOCLDWAIT:
-            return (
-                "Darwin SIGCHLD has SA_NOCLDWAIT and direct children may be auto-reaped"
-            )
+        platform_name = "Darwin"
+        no_cldwait_flag = DARWIN_SA_NOCLDWAIT
+    elif sys.platform.startswith("linux"):
+        try:
+            raw_handler, flags = _linux_sigchld_action()
+        except _WaitableSigchldUnavailable as exc:
+            return str(exc)
+        platform_name = "Linux"
+        no_cldwait_flag = LINUX_SA_NOCLDWAIT
+    else:
+        return f"native SIGCHLD disposition inspection is unavailable on {sys.platform}"
+    if raw_handler != 0:
+        return (
+            f"{platform_name} SIGCHLD has a non-default native handler that may "
+            "reap direct children"
+        )
+    if flags & no_cldwait_flag:
+        return (
+            f"{platform_name} SIGCHLD has SA_NOCLDWAIT and direct children may "
+            "be auto-reaped"
+        )
     return None
 
 
@@ -8065,7 +8149,12 @@ def _normalize_discovery_cwd(cwd: str) -> str:
     try:
         encoded = cwd.encode("utf-8")
     except UnicodeEncodeError as exc:
-        raise DiscoveryCwdValidationError(str(exc)) from exc
+        raise DiscoveryCwdValidationError("invalid_utf8", str(exc)) from exc
+    if b"\0" in encoded:
+        raise DiscoveryCwdValidationError(
+            "nul_byte",
+            "NUL bytes are not valid in filesystem paths",
+        )
     if len(encoded) > MAX_DISCOVERY_CWD_UTF8_BYTES:
         raise DiscoveryLimitExceeded(
             "CWD UTF-8 bytes",

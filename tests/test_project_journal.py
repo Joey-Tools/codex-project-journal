@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import errno
 import importlib.util
 import io
@@ -3665,6 +3666,320 @@ class ProjectJournalTests(unittest.TestCase):
 
         self.assertIn("SA_NOCLDWAIT", str(raised.exception))
         popen.assert_not_called()
+
+    @unittest.skipUnless(os.name == "posix", "Linux SA_NOCLDWAIT contract")
+    @mock.patch.object(
+        project_journal,
+        "_require_process_status_observation_support",
+    )
+    def test_process_launch_rejects_linux_no_cldwait_before_popen_or_killpg(
+        self,
+        status_support: mock.Mock,
+    ) -> None:
+        with mock.patch.object(project_journal.sys, "platform", "linux"):
+            with mock.patch.object(
+                project_journal.signal,
+                "getsignal",
+                return_value=signal.SIG_DFL,
+            ):
+                with mock.patch.object(
+                    project_journal,
+                    "_linux_sigchld_action",
+                    return_value=(0, project_journal.LINUX_SA_NOCLDWAIT),
+                ):
+                    with mock.patch.object(
+                        project_journal.subprocess,
+                        "Popen",
+                    ) as popen:
+                        with mock.patch.object(project_journal.os, "killpg") as killpg:
+                            with self.assertRaises(
+                                project_journal._WaitableSigchldUnavailable
+                            ) as raised:
+                                self.capture_process(
+                                    [
+                                        sys.executable,
+                                        "-c",
+                                        "raise SystemExit(7)",
+                                    ],
+                                    timeout_seconds=5,
+                                    stdout_limit=1024,
+                                )
+
+        self.assertIn("Linux SIGCHLD has SA_NOCLDWAIT", str(raised.exception))
+        status_support.assert_called_once_with()
+        popen.assert_not_called()
+        killpg.assert_not_called()
+
+    def test_linux_sigaction_layout_matches_reviewed_lp64_libc_abi(self) -> None:
+        if ctypes.sizeof(ctypes.c_void_p) != 8 or ctypes.sizeof(ctypes.c_ulong) != 8:
+            self.skipTest("reviewed Linux sigaction layouts require an LP64 ABI")
+        self.assertEqual(ctypes.sizeof(project_journal._LinuxSigaction), 152)
+        self.assertEqual(project_journal._LinuxSigaction.handler.offset, 0)
+        self.assertEqual(project_journal._LinuxSigaction.mask.offset, 8)
+        self.assertEqual(project_journal._LinuxSigaction.flags.offset, 136)
+        self.assertEqual(project_journal._LinuxSigaction.restorer.offset, 144)
+
+    @unittest.skipUnless(os.name == "posix", "Linux sigaction ABI contract")
+    @mock.patch.object(
+        project_journal,
+        "_require_process_status_observation_support",
+    )
+    def test_unreviewed_linux_multiarch_fails_before_popen_or_libc_call(
+        self,
+        status_support: mock.Mock,
+    ) -> None:
+        uname = mock.Mock(machine="x86_64")
+        implementation = mock.Mock(_multiarch="x86_64-linux-unknown")
+        with mock.patch.object(project_journal.sys, "platform", "linux"):
+            with mock.patch.object(
+                project_journal.sys,
+                "implementation",
+                implementation,
+            ):
+                with mock.patch.object(
+                    project_journal.signal,
+                    "getsignal",
+                    return_value=signal.SIG_DFL,
+                ):
+                    with mock.patch.object(
+                        project_journal.os,
+                        "uname",
+                        return_value=uname,
+                    ):
+                        with mock.patch.object(
+                            project_journal.ctypes,
+                            "CDLL",
+                        ) as cdll:
+                            with mock.patch.object(
+                                project_journal.subprocess,
+                                "Popen",
+                            ) as popen:
+                                with self.assertRaises(
+                                    project_journal._WaitableSigchldUnavailable
+                                ) as raised:
+                                    self.capture_process(
+                                        [
+                                            sys.executable,
+                                            "-c",
+                                            "raise SystemExit(7)",
+                                        ],
+                                        timeout_seconds=5,
+                                        stdout_limit=1024,
+                                    )
+
+        self.assertIn("no reviewed sigaction layout", str(raised.exception))
+        status_support.assert_called_once_with()
+        cdll.assert_not_called()
+        popen.assert_not_called()
+
+    @unittest.skipUnless(os.name == "posix", "Linux SA_NOCLDWAIT contract")
+    def test_linux_no_cldwait_after_spawn_loses_numeric_group_identity(
+        self,
+    ) -> None:
+        process = mock.Mock(spec=["pid"])
+        process.pid = 12345
+        with mock.patch.object(project_journal.sys, "platform", "linux"):
+            with mock.patch.object(
+                project_journal.signal,
+                "getsignal",
+                return_value=signal.SIG_DFL,
+            ):
+                with mock.patch.object(
+                    project_journal,
+                    "_linux_sigchld_action",
+                    side_effect=[
+                        (0, 0),
+                        (0, project_journal.LINUX_SA_NOCLDWAIT),
+                    ],
+                ):
+                    project_journal._require_waitable_sigchld_semantics()
+                    with mock.patch.object(
+                        project_journal.os,
+                        "killpg",
+                    ) as killpg:
+                        with self.assertRaises(
+                            project_journal._ProcessIdentityLost
+                        ) as raised:
+                            project_journal._signal_process_group(
+                                process,
+                                signal.SIGTERM,
+                            )
+
+        self.assertIn(
+            "waitable SIGCHLD semantics changed after process launch",
+            str(raised.exception),
+        )
+        killpg.assert_not_called()
+
+    @unittest.skipUnless(
+        sys.platform.startswith("linux"),
+        "native Linux SA_NOCLDWAIT contract",
+    )
+    def test_linux_native_no_cldwait_never_launches_or_signals(self) -> None:
+        machine = os.uname().machine.lower()
+        multiarch = getattr(sys.implementation, "_multiarch", None)
+        reviewed_multiarch = project_journal.LINUX_SIGACTION_REVIEWED_MULTIARCH.get(
+            machine
+        )
+        if (
+            ctypes.sizeof(ctypes.c_void_p) != 8
+            or ctypes.sizeof(ctypes.c_ulong) != 8
+            or reviewed_multiarch is None
+            or multiarch not in reviewed_multiarch
+        ):
+            self.skipTest(f"unreviewed Linux sigaction ABI: {machine!r}, {multiarch!r}")
+        driver = self.root / "linux-native-no-cldwait.py"
+        driver.write_text(
+            textwrap.dedent(
+                """
+                import ctypes
+                import importlib.util
+                import json
+                import os
+                import signal
+                import sys
+
+                script = sys.argv[1]
+                spec = importlib.util.spec_from_file_location(
+                    "linux_native_no_cldwait_project_journal",
+                    script,
+                )
+                module = importlib.util.module_from_spec(spec)
+                sys.modules[spec.name] = module
+                spec.loader.exec_module(module)
+                library = ctypes.CDLL(None, use_errno=True)
+                sigaction = library.sigaction
+                sigaction.argtypes = (
+                    ctypes.c_int,
+                    ctypes.POINTER(module._LinuxSigaction),
+                    ctypes.POINTER(module._LinuxSigaction),
+                )
+                sigaction.restype = ctypes.c_int
+                original = module._LinuxSigaction()
+                if sigaction(
+                    int(signal.SIGCHLD),
+                    None,
+                    ctypes.byref(original),
+                ) != 0:
+                    raise OSError(
+                        ctypes.get_errno(),
+                        "failed to read original SIGCHLD action",
+                    )
+                modified = module._LinuxSigaction.from_buffer_copy(original)
+                modified.handler = None
+                modified.flags |= module.LINUX_SA_NOCLDWAIT
+                if sigaction(
+                    int(signal.SIGCHLD),
+                    ctypes.byref(modified),
+                    None,
+                ) != 0:
+                    raise OSError(
+                        ctypes.get_errno(),
+                        "failed to set native SA_NOCLDWAIT",
+                    )
+
+                popen_calls = 0
+                killpg_calls = 0
+                auto_reaped = False
+                rejection = None
+                restored = None
+                restore_result = None
+                try:
+                    pid = os.fork()
+                    if pid == 0:
+                        os._exit(0)
+                    try:
+                        os.waitpid(pid, 0)
+                    except ChildProcessError:
+                        auto_reaped = True
+
+                    def forbidden_popen(*args, **kwargs):
+                        global popen_calls
+                        popen_calls += 1
+                        raise AssertionError(
+                            "Popen must not run with native SA_NOCLDWAIT"
+                        )
+
+                    def forbidden_killpg(*args, **kwargs):
+                        global killpg_calls
+                        killpg_calls += 1
+                        raise AssertionError(
+                            "killpg must not run without a PID/PGID fence"
+                        )
+
+                    module.subprocess.Popen = forbidden_popen
+                    module.os.killpg = forbidden_killpg
+                    try:
+                        module._capture_bounded_process(
+                            [sys.executable, "-c", "raise SystemExit(7)"],
+                            env={},
+                            timeout_seconds=1,
+                            stdout_limit=1024,
+                            stderr_limit=1024,
+                            stdout_overflow_error="stdout overflow",
+                            stderr_overflow_error="stderr overflow",
+                            timeout_error="timeout",
+                        )
+                    except module._WaitableSigchldUnavailable as exc:
+                        rejection = str(exc)
+                finally:
+                    restore_result = sigaction(
+                        int(signal.SIGCHLD),
+                        ctypes.byref(original),
+                        None,
+                    )
+                    restored = module._LinuxSigaction()
+                    if restore_result == 0:
+                        restore_result = sigaction(
+                            int(signal.SIGCHLD),
+                            None,
+                            ctypes.byref(restored),
+                        )
+
+                print(
+                    json.dumps(
+                        {
+                            "auto_reaped": auto_reaped,
+                            "killpg_calls": killpg_calls,
+                            "popen_calls": popen_calls,
+                            "rejection": rejection,
+                            "restore_result": restore_result,
+                            "restored_flags": (
+                                restored.flags if restored is not None else None
+                            ),
+                            "restored_handler": (
+                                int(restored.handler or 0)
+                                if restored is not None
+                                else None
+                            ),
+                            "original_flags": original.flags,
+                            "original_handler": int(original.handler or 0),
+                        }
+                    )
+                )
+                """
+            ).lstrip(),
+            encoding="utf-8",
+        )
+
+        result = subprocess.run(
+            [sys.executable, str(driver), str(SCRIPT)],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=15,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertTrue(payload["auto_reaped"])
+        self.assertEqual(payload["popen_calls"], 0)
+        self.assertEqual(payload["killpg_calls"], 0)
+        self.assertEqual(payload["restore_result"], 0)
+        self.assertEqual(payload["restored_handler"], payload["original_handler"])
+        self.assertEqual(payload["restored_flags"], payload["original_flags"])
+        self.assertIn("Linux SIGCHLD has SA_NOCLDWAIT", payload["rejection"])
 
     @unittest.skipUnless(
         sys.platform == "darwin"
@@ -10527,6 +10842,13 @@ class ProjectJournalTests(unittest.TestCase):
                 project_journal.MAX_DISCOVERY_CWD_UTF8_BYTES,
                 project_journal.DiscoveryCwdValidationError,
             ),
+            (
+                "nul-byte",
+                "/repo/\x00",
+                "MAX_DISCOVERY_CWD_UTF8_BYTES",
+                project_journal.MAX_DISCOVERY_CWD_UTF8_BYTES,
+                project_journal.DiscoveryCwdValidationError,
+            ),
         )
         for name, cwd, constant, limit, expected_error in cases:
             with self.subTest(name=name):
@@ -10615,6 +10937,33 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertEqual(rows[0]["coverage_status"], "partial")
         self.assertEqual(coverage["code"], "discovery_cwd_invalid")
         self.assertEqual(coverage["validation_reason"], "invalid_utf8")
+
+    def test_discover_repos_rejects_nul_cwd_before_repo_resolution(self) -> None:
+        repo = self.init_repo().resolve()
+        codex_home = self.root / "codex-home"
+        rollout_dir = codex_home / "sessions/2026/05/05"
+        rollout_dir.mkdir(parents=True)
+        (rollout_dir / "rollout-nul-cwd.jsonl").write_text(
+            json.dumps({"payload": {"cwd": f"{repo}/\x00"}}) + "\n",
+            encoding="utf-8",
+        )
+
+        with mock.patch.object(
+            project_journal,
+            "_repo_root_for_path",
+        ) as resolver:
+            rows = project_journal._discover_repos(codex_home, 9999)
+
+        resolver.assert_not_called()
+        self.assertEqual(len(rows), 1)
+        self.assertIsNone(rows[0]["repo"])
+        self.assertIsNone(rows[0]["candidate_cwd"])
+        self.assertEqual(rows[0]["coverage_status"], "partial")
+        self.assertEqual(rows[0]["discovery_status"], "inconclusive")
+        coverage = rows[0]["discovery_error"]["discovery_coverage"]
+        self.assertEqual(coverage["code"], "discovery_cwd_invalid")
+        self.assertEqual(coverage["validation_reason"], "nul_byte")
+        self.assertEqual(coverage["distinct_cwds_scanned"], 0)
 
     def test_discover_repos_normalizes_cwd_aliases_before_resolution(self) -> None:
         repo = self.init_repo().resolve()
