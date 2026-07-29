@@ -3121,6 +3121,16 @@ class ProjectJournalTests(unittest.TestCase):
         ):
             project_journal._validate_entries(invalid_entries)
 
+        oversized_issue = project_journal._IssueCollector()
+        with self.assertRaisesRegex(
+            project_journal.JournalLimitExceeded,
+            "validation issue bytes exceed .* total",
+        ):
+            oversized_issue.add(
+                "docs/project_journal/oversized-issue.md",
+                "x" * project_journal.MAX_VALIDATION_ISSUES_TOTAL_BYTES,
+            )
+
         with self.assertRaisesRegex(
             project_journal.UserError,
             "entry count exceeds",
@@ -3128,6 +3138,62 @@ class ProjectJournalTests(unittest.TestCase):
             project_journal._validate_entries(
                 [per_entry] * (project_journal.MAX_JOURNAL_ENTRIES + 1)
             )
+
+    def test_issue_collector_bounds_ultralong_index_path_references(self) -> None:
+        prefix = b"docs/project_journal/2026/07/"
+        suffix = b".md"
+        record_overhead = len(b"100644 " + b"a" * 40 + b" 0\t\0")
+        path_budget = project_journal.MAX_TRACKED_JOURNAL_INDEX_BYTES - record_overhead
+        raw_path = prefix + b"x" * (path_budget - len(prefix) - len(suffix)) + suffix
+        rel_path = os.fsdecode(raw_path)
+        detail = f"{rel_path}: invalid tracked index frontmatter"
+        collector = project_journal._IssueCollector()
+
+        self.assertEqual(
+            record_overhead + len(raw_path),
+            project_journal.MAX_TRACKED_JOURNAL_INDEX_BYTES,
+        )
+        for _ in range(project_journal.MAX_VALIDATION_ISSUES_PER_ENTRY):
+            collector.add(rel_path, detail)
+        report = collector.report()
+
+        self.assertEqual(report.invalid_paths, frozenset({rel_path}))
+        self.assertEqual(
+            len(report.issues),
+            project_journal.MAX_VALIDATION_ISSUES_PER_ENTRY,
+        )
+        references = {issue.split(": ", 1)[0] for issue in report.issues}
+        self.assertEqual(len(references), 1)
+        reference = references.pop()
+        self.assertTrue(reference.startswith("path_ref="))
+        metadata = json.loads(reference.removeprefix("path_ref="))
+        self.assertEqual(metadata["bytes"], len(raw_path))
+        self.assertEqual(
+            metadata["sha256"],
+            project_journal.hashlib.sha256(raw_path).hexdigest(),
+        )
+        self.assertTrue(
+            all(
+                issue.endswith(": invalid tracked index frontmatter")
+                for issue in report.issues
+            )
+        )
+        retained_bytes = sum(
+            len(issue.encode("utf-8", errors="backslashreplace")) + 1
+            for issue in report.issues
+        )
+        self.assertLessEqual(
+            retained_bytes,
+            project_journal.MAX_VALIDATION_ISSUES_TOTAL_BYTES,
+        )
+        with self.assertRaises(project_journal.JournalLimitExceeded) as raised:
+            collector.add(rel_path, detail)
+        self.assertNotIn(rel_path, str(raised.exception))
+        self.assertIn(reference, str(raised.exception))
+        self.assertLess(
+            len(str(raised.exception).encode("utf-8")),
+            project_journal.MAX_VALIDATION_ISSUE_PATH_BYTES,
+        )
 
     def test_frontmatter_line_cap_does_not_count_long_body(self) -> None:
         body = "\n".join(
@@ -7158,7 +7224,12 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertIn("one absolute monotonic deadline", skill)
         self.assertIn("frontmatter parsing, semantic validation", skill)
         self.assertIn("frontmatter field/list, validation-issue", skill)
-        self.assertIn("Per-path validation state is structured", skill)
+        self.assertIn(
+            "Keep each exact invalid path once for structured validity decisions",
+            skill,
+        )
+        self.assertIn("stable JSON `path_ref`", skill)
+        self.assertIn("aggregate retained issue text at 1 MiB", skill)
         self.assertIn(
             "invalidates every member of a duplicate-ID group",
             skill,
@@ -7186,6 +7257,10 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertIn("reuses the already claimed ownership object", skill)
         self.assertIn(
             "bounded cleanup exception evidence attaches to the original action exception",
+            skill,
+        )
+        self.assertIn(
+            "attach descriptor-close faults to the current parse, limit, replacement, or access-policy error",
             skill,
         )
         self.assertIn(
@@ -10399,7 +10474,7 @@ class ProjectJournalTests(unittest.TestCase):
             detail="injected preferred ancestor replacement",
         )
         project_journal._record_rollout_cleanup_error(
-            child_failure,
+            child_failure.error,
             context="injected child binding cleanup",
             cleanup_error=OSError(
                 errno.EIO,
@@ -10493,6 +10568,199 @@ class ProjectJournalTests(unittest.TestCase):
         cleanup = coverage["cleanup_errors"][0]
         self.assertEqual(cleanup["errno"], errno.EIO)
         self.assertIn("unframed close failure", cleanup["message"])
+
+    def test_rollout_descriptor_cleanup_is_secondary_to_discovery_errors(
+        self,
+    ) -> None:
+        path = pathlib.Path("/sessions/rollout-error.jsonl")
+        state = project_journal._DiscoveryScanState(
+            deadline=time.monotonic() + 5,
+        )
+        errors = (
+            project_journal.DiscoveryRolloutParseError(
+                parse_reason="invalid_json",
+                record_number=1,
+                byte_offset=0,
+                detail="injected parse failure",
+            ),
+            project_journal.DiscoveryLimitExceeded(
+                "rollout line bytes",
+                10,
+                11,
+            ),
+            project_journal.DiscoveryRolloutInspectionError(
+                inspection_reason="access_policy_changed",
+                path=path,
+                detail="injected policy failure",
+            ),
+        )
+
+        for primary in errors:
+            with self.subTest(primary=type(primary).__name__):
+                original_args = primary.args
+                with mock.patch.object(
+                    project_journal.os,
+                    "close",
+                    side_effect=OSError(
+                        errno.EIO,
+                        "injected rollout descriptor close failure",
+                    ),
+                ):
+                    project_journal._close_rollout_descriptor_preserving_error(
+                        707,
+                        primary,
+                        context="injected rollout descriptor cleanup",
+                    )
+
+                self.assertEqual(primary.args, original_args)
+                coverage = project_journal._discovery_coverage_error(
+                    primary,
+                    state,
+                    source=path,
+                )
+                self.assertEqual(len(coverage["cleanup_errors"]), 1)
+                cleanup = coverage["cleanup_errors"][0]
+                self.assertEqual(cleanup["errno"], errno.EIO)
+                self.assertIn("descriptor close failure", cleanup["message"])
+
+    def test_open_rollout_candidate_preserves_policy_failure_when_close_fails(
+        self,
+    ) -> None:
+        path = self.root / "rollout-policy.jsonl"
+        path.write_text("{}\n", encoding="utf-8")
+        path_stat = path.stat()
+        candidate = project_journal._rollout_candidate_from_stat(
+            path,
+            path_stat,
+            rollout_root=self.root,
+        )
+        descriptor_stat = stat_with_gid(path_stat, path_stat.st_gid + 1)
+        state = project_journal._DiscoveryScanState(
+            deadline=time.monotonic() + 5,
+        )
+
+        with mock.patch.object(project_journal.os, "open", return_value=808):
+            with mock.patch.object(
+                project_journal.os,
+                "fstat",
+                return_value=descriptor_stat,
+            ):
+                with mock.patch.object(
+                    project_journal.os,
+                    "close",
+                    side_effect=OSError(
+                        errno.EIO,
+                        "injected candidate close failure",
+                    ),
+                ):
+                    with self.assertRaises(
+                        project_journal.DiscoveryRolloutInspectionError,
+                    ) as raised:
+                        project_journal._open_rollout_candidate(
+                            candidate,
+                            state,
+                        )
+
+        self.assertEqual(
+            raised.exception.inspection_reason,
+            "access_policy_changed",
+        )
+        self.assertEqual(len(raised.exception.cleanup_errors), 1)
+        cleanup = raised.exception.cleanup_errors[0]
+        self.assertEqual(cleanup["errno"], errno.EIO)
+        self.assertIn("candidate close failure", cleanup["message"])
+
+    def test_rollout_parse_failure_survives_descriptor_close_failure(self) -> None:
+        path = self.root / "rollout-invalid-json.jsonl"
+        path.write_bytes(b"{invalid-json}\n")
+        path_stat = path.stat()
+        candidate = project_journal._rollout_candidate_from_stat(
+            path,
+            path_stat,
+            rollout_root=self.root,
+        )
+        state = project_journal._DiscoveryScanState(
+            deadline=time.monotonic() + 5,
+        )
+        actual_close = project_journal.os.close
+        close_failed = False
+
+        def close_then_fail(fd: int) -> None:
+            nonlocal close_failed
+            actual_close(fd)
+            close_failed = True
+            raise OSError(
+                errno.EIO,
+                "injected extraction close failure",
+            )
+
+        with mock.patch.object(
+            project_journal.os,
+            "close",
+            side_effect=close_then_fail,
+        ):
+            with self.assertRaises(
+                project_journal.DiscoveryRolloutParseError,
+            ) as raised:
+                list(project_journal._extract_cwds(candidate, state))
+
+        self.assertTrue(close_failed)
+        self.assertEqual(raised.exception.parse_reason, "invalid_json")
+        coverage = project_journal._discovery_coverage_error(
+            raised.exception,
+            state,
+            source=path,
+        )
+        self.assertEqual(coverage["parse_reason"], "invalid_json")
+        self.assertEqual(len(coverage["cleanup_errors"]), 1)
+        cleanup = coverage["cleanup_errors"][0]
+        self.assertEqual(cleanup["errno"], errno.EIO)
+        self.assertIn("extraction close failure", cleanup["message"])
+
+    def test_rollout_generator_cleanup_preserves_generator_exit(self) -> None:
+        path = self.root / "rollout-generator-close.jsonl"
+        path.write_text(
+            json.dumps({"payload": {"cwd": str(self.root)}}) + "\n",
+            encoding="utf-8",
+        )
+        candidate = project_journal._rollout_candidate_from_stat(
+            path,
+            path.stat(),
+            rollout_root=self.root,
+        )
+        state = project_journal._DiscoveryScanState(
+            deadline=time.monotonic() + 5,
+        )
+        actual_close = project_journal.os.close
+
+        def close_then_fail(fd: int) -> None:
+            actual_close(fd)
+            raise OSError(
+                errno.EIO,
+                "injected generator cleanup close failure",
+            )
+
+        generator = project_journal._extract_cwds(candidate, state)
+        self.assertEqual(next(generator), str(self.root))
+        with mock.patch.object(
+            project_journal.os,
+            "close",
+            side_effect=close_then_fail,
+        ):
+            with mock.patch.object(
+                project_journal,
+                "_record_rollout_cleanup_error",
+                wraps=project_journal._record_rollout_cleanup_error,
+            ) as recorder:
+                generator.close()
+
+        self.assertEqual(recorder.call_count, 1)
+        primary = recorder.call_args.args[0]
+        self.assertIsInstance(primary, GeneratorExit)
+        self.assertEqual(len(primary.cleanup_errors), 1)
+        cleanup = primary.cleanup_errors[0]
+        self.assertEqual(cleanup["errno"], errno.EIO)
+        self.assertIn("generator cleanup close failure", cleanup["message"])
 
     def test_discover_repos_reads_archive_without_active_sessions(self) -> None:
         repo = self.init_repo()

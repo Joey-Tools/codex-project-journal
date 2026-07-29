@@ -73,6 +73,8 @@ MAX_FRONTMATTER_VALUE_CHARS = 64 * 1024
 MAX_FRONTMATTER_LIST_ITEM_CHARS = 4096
 MAX_VALIDATION_ISSUES_PER_ENTRY = 64
 MAX_VALIDATION_ISSUES_TOTAL = 2048
+MAX_VALIDATION_ISSUE_PATH_BYTES = 4096
+MAX_VALIDATION_ISSUES_TOTAL_BYTES = 1024 * 1024
 MAX_GIT_STDERR_BYTES = 64 * 1024
 MAX_GIT_VERSION_OUTPUT_BYTES = 4096
 MAX_GLOBAL_GIT_CONFIG_OUTPUT_BYTES = 16 * 1024
@@ -1257,23 +1259,58 @@ class _IssueCollector:
         self._issues: list[str] = []
         self._invalid_paths: set[str] = set()
         self._per_path_count: dict[str, int] = {}
+        self._path_labels: dict[str, str] = {}
+        self._total_issue_bytes = 0
+
+    def _path_label(self, rel_path: str) -> str:
+        label = self._path_labels.get(rel_path)
+        if label is not None:
+            return label
+        raw_path = os.fsencode(rel_path)
+        if len(raw_path) <= MAX_VALIDATION_ISSUE_PATH_BYTES:
+            label = rel_path
+        else:
+            reference = {
+                "bytes": len(raw_path),
+                "sha256": hashlib.sha256(raw_path).hexdigest(),
+            }
+            label = "path_ref=" + json.dumps(
+                reference,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        self._path_labels[rel_path] = label
+        return label
 
     def add(self, rel_path: str, detail: str) -> None:
         current = self._per_path_count.get(rel_path, 0)
+        path_label = self._path_label(rel_path)
         if current >= MAX_VALIDATION_ISSUES_PER_ENTRY:
             raise JournalLimitExceeded(
-                f"{rel_path}: validation issues exceed "
+                f"{path_label}: validation issues exceed "
                 f"{MAX_VALIDATION_ISSUES_PER_ENTRY} per entry"
             )
         if len(self._issues) >= MAX_VALIDATION_ISSUES_TOTAL:
             raise JournalLimitExceeded(
                 f"journal validation issues exceed {MAX_VALIDATION_ISSUES_TOTAL} total"
             )
-        prefix = f"{rel_path}:"
+        if detail.startswith(rel_path) and detail[len(rel_path) :].startswith(":"):
+            detail = detail[len(rel_path) + 1 :].lstrip()
+        prefix = f"{path_label}:"
         issue = detail if detail.startswith(prefix) else f"{prefix} {detail}"
+        issue_bytes = len(issue.encode("utf-8", errors="backslashreplace")) + 1
+        observed_total = self._total_issue_bytes + issue_bytes
+        if observed_total > MAX_VALIDATION_ISSUES_TOTAL_BYTES:
+            raise JournalLimitExceeded(
+                "journal validation issue bytes exceed "
+                f"{MAX_VALIDATION_ISSUES_TOTAL_BYTES} total "
+                f"(observed at least {observed_total})"
+            )
         self._issues.append(issue)
         self._invalid_paths.add(rel_path)
         self._per_path_count[rel_path] = current + 1
+        self._total_issue_bytes = observed_total
 
     def report(self) -> _ValidationReport:
         return _ValidationReport(
@@ -7533,7 +7570,7 @@ class _RolloutDirectoryFrame:
 
 
 def _record_rollout_cleanup_error(
-    failure: _RolloutInspectionFailure,
+    error: BaseException,
     *,
     context: str,
     cleanup_error: BaseException,
@@ -7558,10 +7595,20 @@ def _record_rollout_cleanup_error(
     ][:MAX_DEFERRED_SIGNAL_REPORT_DETAILS]
     if cleanup_notes:
         evidence["details"] = cleanup_notes
-    if len(failure.error.cleanup_errors) < MAX_DEFERRED_SIGNAL_REPORT_DETAILS:
-        failure.error.cleanup_errors.append(evidence)
+    cleanup_errors = getattr(error, "cleanup_errors", None)
+    if not isinstance(cleanup_errors, list):
+        cleanup_errors = []
+        try:
+            error.cleanup_errors = cleanup_errors
+        except (AttributeError, TypeError):
+            cleanup_errors = None
+    if (
+        cleanup_errors is not None
+        and len(cleanup_errors) < MAX_DEFERRED_SIGNAL_REPORT_DETAILS
+    ):
+        cleanup_errors.append(evidence)
     _add_exception_details(
-        failure.error,
+        error,
         (
             f"{context}: {message}",
             *(f"{context}: {note}" for note in cleanup_notes),
@@ -7573,18 +7620,41 @@ def _inherit_rollout_cleanup_errors(
     primary: _RolloutInspectionFailure,
     superseded: _RolloutInspectionFailure,
 ) -> None:
-    for cleanup_error in superseded.error.cleanup_errors:
-        if len(primary.error.cleanup_errors) >= MAX_DEFERRED_SIGNAL_REPORT_DETAILS:
+    primary_errors = getattr(primary.error, "cleanup_errors", None)
+    if not isinstance(primary_errors, list):
+        primary_errors = []
+        primary.error.cleanup_errors = primary_errors
+    superseded_errors = getattr(superseded.error, "cleanup_errors", ())
+    if not isinstance(superseded_errors, (list, tuple)):
+        superseded_errors = ()
+    for cleanup_error in superseded_errors:
+        if len(primary_errors) >= MAX_DEFERRED_SIGNAL_REPORT_DETAILS:
             break
         inherited = dict(cleanup_error)
         details = inherited.get("details")
         if isinstance(details, list):
             inherited["details"] = list(details)
-        primary.error.cleanup_errors.append(inherited)
+        primary_errors.append(inherited)
     _add_exception_details(
         primary.error,
         getattr(superseded.error, "__notes__", ()),
     )
+
+
+def _close_rollout_descriptor_preserving_error(
+    fd: int,
+    error: BaseException,
+    *,
+    context: str,
+) -> None:
+    try:
+        os.close(fd)
+    except BaseException as cleanup_error:
+        _record_rollout_cleanup_error(
+            error,
+            context=context,
+            cleanup_error=cleanup_error,
+        )
 
 
 def _close_rollout_directory_fd_preserving_failure(
@@ -7593,14 +7663,11 @@ def _close_rollout_directory_fd_preserving_failure(
     *,
     context: str,
 ) -> None:
-    try:
-        os.close(fd)
-    except BaseException as cleanup_error:
-        _record_rollout_cleanup_error(
-            failure,
-            context=context,
-            cleanup_error=cleanup_error,
-        )
+    _close_rollout_descriptor_preserving_error(
+        fd,
+        failure.error,
+        context=context,
+    )
 
 
 def _rollout_object_identity(value: os.stat_result) -> tuple[int, int]:
@@ -8270,7 +8337,7 @@ def _close_rollout_directory_frame_preserving_failure(
         _close_rollout_directory_frame(frame)
     except BaseException as cleanup_error:
         _record_rollout_cleanup_error(
-            failure,
+            failure.error,
             context=context,
             cleanup_error=cleanup_error,
         )
@@ -8666,8 +8733,12 @@ def _open_rollout_candidate(
                 observed_total,
             )
         return fd
-    except BaseException:
-        os.close(fd)
+    except BaseException as exc:
+        _close_rollout_descriptor_preserving_error(
+            fd,
+            exc,
+            context="rollout descriptor cleanup after candidate binding failure",
+        )
         raise
 
 
@@ -8981,7 +9052,14 @@ def _extract_cwds(
             first_bytes,
             state,
         )
-    finally:
+    except BaseException as exc:
+        _close_rollout_descriptor_preserving_error(
+            fd,
+            exc,
+            context="rollout descriptor cleanup after extraction failure",
+        )
+        raise
+    else:
         os.close(fd)
 
 
@@ -9622,12 +9700,13 @@ def _discovery_coverage_error(
         )
     elif isinstance(exc, DiscoveryRolloutInspectionError):
         error["inspection_reason"] = exc.inspection_reason
-        if exc.cleanup_errors:
-            error["cleanup_errors"] = [
-                dict(cleanup_error) for cleanup_error in exc.cleanup_errors
-            ]
     elif isinstance(exc, DiscoveryCwdValidationError):
         error["validation_reason"] = exc.validation_reason
+    cleanup_errors = getattr(exc, "cleanup_errors", None)
+    if isinstance(cleanup_errors, (list, tuple)) and cleanup_errors:
+        error["cleanup_errors"] = [
+            dict(cleanup_error) for cleanup_error in cleanup_errors
+        ]
     error.update(state.coverage_counters())
     return error
 

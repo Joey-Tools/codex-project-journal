@@ -27,6 +27,7 @@ superseded_by:
 - The remaining rollout-enumeration finding is closed by matching candidate names before no-follow type inspection and reporting stable non-regular or vanished candidates as partial coverage.
 - The final rollout-discovery findings are closed by filtering failures against the requested window only with reliable date/mtime evidence and by replacing path-reopening recursion with descriptor-relative directory traversal that binds object identity and access policy.
 - The latest compatibility and cleanup-priority findings are closed by using a relocatable native Git fixture across supported Python runtimes, reporting the final known child return code, and retaining directory cleanup failures as bounded evidence beneath the already-proved inspection failure.
+- The newest two fresh-review findings are closed by bounding retained validation-path labels and aggregate issue bytes, and by preserving parse, limit, replacement, access-policy, and generator-exit primaries when rollout descriptor cleanup also fails.
 
 ## Current State
 
@@ -46,6 +47,8 @@ superseded_by:
 - Before any child starts, supervision requires `SIGCHLD` to have its default waitable disposition. Darwin and reviewed LP64 Linux x86_64/AArch64 glibc/musl ABIs also verify the native handler and reject `SA_NOCLDWAIT`; unknown Linux machine, libc multiarch, or word-size layouts fail closed before libc or `Popen`. That property is revalidated after launch and before kqueue `NOTE_EXIT`/`ESRCH`, non-reaping observation, final wait, and each numeric PID/PGID operation. Lost evidence prohibits process-group signalling and permits only a nonblocking direct-child reap whose status remains untrusted.
 - Rollout enumeration now records `(st_dev, st_ino)`, `(st_uid, st_gid, permission mode)`, and size as separate protected properties. True descriptor/path replacement reports `object_replaced`, `object_changed`, or `path_replaced`; chmod/chown-style policy drift reports `access_policy_changed`; append, truncation, or digest drift reports `content_changed`.
 - Directory traversal closes bound frames and descriptors before handing off a selected structured inspection failure. Iterator or descriptor cleanup faults are retained in bounded `cleanup_errors` evidence and exception notes without replacing a proved object-identity or access-policy failure; when no primary failure exists, cleanup faults still propagate.
+- Indexed validation retains the exact invalid path for structured validity decisions, but caps formatted path labels at 4 KiB by replacing larger values with a stable JSON `path_ref` containing byte length and SHA-256. Retained issue text also has an independent 1 MiB aggregate cap.
+- Candidate-binding and rollout-extraction descriptor cleanup uses the same close-preserving helper as directory cleanup. A close fault is bounded and attached as `cleanup_errors` to the active parse, limit, replacement, access-policy, or generator-exit error instead of replacing that primary; an unaccompanied close fault still propagates.
 - This is the repository's intentional first journal entry because the finalization task explicitly requires durable repo-owned validation and handoff evidence; no top-level tracker, generated index, or local hook is introduced.
 
 ## Next Steps
@@ -106,3 +109,6 @@ superseded_by:
 - Final serial Python 3.13 full suite after compatibility and cleanup-priority fixes: 269 tests passed with 3 platform skips in 296.234 seconds.
 - Final serial Xcode Python 3.9.6 full suite after compatibility and cleanup-priority fixes: 269 tests passed with 4 platform skips in 332.320 seconds. This supersedes the three failed compatibility results recorded above.
 - Final Ruff check/format, Python 3.13 and Xcode Python 3.9.6 `py_compile`, installed Joey/OpenAI skill validation, project journal validation, and `git diff --check` passed.
+- Validation-output and rollout-descriptor cleanup focused coverage: 12 tests passed in 3.297 seconds with Python 3.13 and in 3.299 seconds with Xcode Python 3.9.6. The regressions cover a near-4 MiB indexed path repeated through the per-entry issue budget, the independent aggregate issue-byte cap, candidate-binding and extraction primary-plus-close failures, all structured discovery error families, and generator cleanup.
+- Final serial Python 3.13 full suite after validation-output and rollout-descriptor cleanup hardening: 274 tests passed with 3 platform skips in 291.058 seconds.
+- Final serial Xcode Python 3.9.6 full suite after the same fixes: 274 tests passed with 4 platform skips in 414.510 seconds.
