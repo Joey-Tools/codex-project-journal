@@ -113,6 +113,7 @@ MAX_DEFERRED_SIGNAL_REPORT_DETAILS = 8
 MAX_DEFERRED_SIGNAL_REPORT_CHARS = 4096
 MAX_LINUX_PROC_GROUP_SCAN_PIDS = 131_072
 MAX_LINUX_PROC_STAT_BYTES = 4096
+DARWIN_SA_NOCLDWAIT = 0x0020
 MINIMUM_GIT_VERSION = (2, 45, 0)
 GIT_VERSION_RE = re.compile(
     rb"\Agit version ([0-9]+)\.([0-9]+)(?:\.([0-9]+))?(?:[ .].*)?\n?\Z"
@@ -344,6 +345,12 @@ class _DiscoveryJsonIntegerLimitExceeded(ValueError):
 
 class _ProcessIdentityLost(UserError):
     """The direct child was reaped before group cleanup could finish."""
+
+
+class _WaitableSigchldUnavailable(UserError):
+    """The process cannot preserve an unreaped direct-child identity fence."""
+
+    code = "waitable_sigchld_unavailable"
 
 
 @dataclasses.dataclass
@@ -2816,12 +2823,41 @@ def _close_selector(selector: selectors.BaseSelector) -> None:
         pass
 
 
+def _settle_direct_child_after_identity_loss(
+    process: subprocess.Popen[bytes],
+) -> str:
+    """Close owned pipes and reap only an already-exited direct child."""
+
+    for name in ("stdin", "stdout", "stderr"):
+        stream = getattr(process, name, None)
+        if stream is None:
+            continue
+        try:
+            stream.close()
+        except (OSError, ValueError):
+            pass
+    try:
+        returncode = process.wait(timeout=0)
+    except subprocess.TimeoutExpired:
+        return (
+            "direct child was still running; no PID/PGID signal or blocking "
+            "wait was attempted after identity loss"
+        )
+    except OSError as exc:
+        return f"direct-child nonblocking reap failed after identity loss: {exc}"
+    return (
+        "direct child was reaped without PID/PGID signalling after identity "
+        f"loss; exit {returncode} is not trusted as reviewable status evidence"
+    )
+
+
 def _signal_process_group(
     process: subprocess.Popen[bytes],
     sig: int,
 ) -> _ProcessSignalResult:
     try:
         if os.name == "posix":
+            _require_waitable_sigchld_semantics(after_spawn=True)
             os.killpg(process.pid, sig)
         elif sig == signal.SIGTERM:
             process.terminate()
@@ -2938,6 +2974,7 @@ def _bound_process_group_exists(
 ) -> tuple[bool, str | None]:
     if os.name != "posix":
         raise RuntimeError("process-group probes require POSIX")
+    _require_waitable_sigchld_semantics(after_spawn=True)
     if sys.platform.startswith("linux") and leader_exited:
         if deadline is None:
             return True, "Linux process-group member proof requires a deadline"
@@ -2985,6 +3022,84 @@ def _waitid_returncode(result: Any) -> int:
     raise UserError(f"unexpected POSIX child status code {result.si_code!r}")
 
 
+class _DarwinSigaction(ctypes.Structure):
+    """Darwin's public struct sigaction layout."""
+
+    _fields_ = (
+        ("handler", ctypes.c_void_p),
+        ("mask", ctypes.c_uint32),
+        ("flags", ctypes.c_int),
+    )
+
+
+def _darwin_sigchld_action() -> tuple[int, int]:
+    try:
+        library = ctypes.CDLL(None, use_errno=True)
+        sigaction = library.sigaction
+    except (AttributeError, OSError) as exc:
+        raise _WaitableSigchldUnavailable(
+            "Darwin SIGCHLD disposition inspection is unavailable"
+        ) from exc
+    sigaction.argtypes = (
+        ctypes.c_int,
+        ctypes.POINTER(_DarwinSigaction),
+        ctypes.POINTER(_DarwinSigaction),
+    )
+    sigaction.restype = ctypes.c_int
+    action = _DarwinSigaction()
+    ctypes.set_errno(0)
+    if sigaction(int(signal.SIGCHLD), None, ctypes.byref(action)) != 0:
+        error_number = ctypes.get_errno() or errno.EINVAL
+        raise _WaitableSigchldUnavailable(
+            f"failed to inspect Darwin SIGCHLD disposition: {os.strerror(error_number)}"
+        )
+    return int(action.handler or 0), int(action.flags)
+
+
+def _waitable_sigchld_failure() -> str | None:
+    if os.name != "posix":
+        return None
+    signum = getattr(signal, "SIGCHLD", None)
+    if not isinstance(signum, int):
+        return "SIGCHLD is unavailable"
+    try:
+        handler = signal.getsignal(signum)
+    except (OSError, ValueError) as exc:
+        return f"SIGCHLD disposition inspection failed: {exc}"
+    if handler == signal.SIG_IGN:
+        return "SIGCHLD is ignored and direct children may be auto-reaped"
+    if handler != signal.SIG_DFL:
+        return "SIGCHLD has a custom handler that may reap direct children"
+    if sys.platform == "darwin":
+        try:
+            raw_handler, flags = _darwin_sigchld_action()
+        except _WaitableSigchldUnavailable as exc:
+            return str(exc)
+        if raw_handler != 0:
+            return (
+                "Darwin SIGCHLD has a non-default native handler that may "
+                "reap direct children"
+            )
+        if flags & DARWIN_SA_NOCLDWAIT:
+            return (
+                "Darwin SIGCHLD has SA_NOCLDWAIT and direct children may be auto-reaped"
+            )
+    return None
+
+
+def _require_waitable_sigchld_semantics(*, after_spawn: bool = False) -> None:
+    failure = _waitable_sigchld_failure()
+    if failure is None:
+        return
+    if after_spawn:
+        raise _ProcessIdentityLost(
+            "waitable SIGCHLD semantics changed after process launch: " + failure
+        )
+    raise _WaitableSigchldUnavailable(
+        "waitable SIGCHLD semantics are required before process launch: " + failure
+    )
+
+
 def _posix_waitid_status_observation_available() -> bool:
     return all(
         callable(getattr(os, name, None)) if name == "waitid" else hasattr(os, name)
@@ -3023,6 +3138,7 @@ def _register_process_status_observer(
 ) -> None:
     if os.name != "posix" or _posix_waitid_status_observation_available():
         return
+    _require_waitable_sigchld_semantics(after_spawn=True)
     if not _darwin_kqueue_status_observation_available():
         raise UserError("POSIX non-reaping child-status observation is unavailable")
     try:
@@ -3042,10 +3158,11 @@ def _register_process_status_observer(
         queue.control([change], 0, 0)
     except ProcessLookupError:
         # Darwin refuses a new EVFILT_PROC registration after the child has
-        # already become an unreaped zombie. This process is the direct child,
-        # and no code has called poll/wait, so ESRCH is itself a non-reaping
-        # terminal observation while the zombie still fences PID/PGID reuse.
+        # already become an unreaped zombie. Re-prove the default disposition
+        # and absence of SA_NOCLDWAIT before treating ESRCH as that waitable
+        # terminal state; otherwise the PID/PGID fence may already be gone.
         queue.close()
+        _require_waitable_sigchld_semantics(after_spawn=True)
         observer.queue = None
         observer.exit_observed = True
         setattr(process, "_project_journal_status_observer", observer)
@@ -3104,6 +3221,7 @@ def _wait_for_darwin_process_exit_without_reaping(
     interruptible: bool,
 ) -> None:
     if observer.exit_observed:
+        _require_waitable_sigchld_semantics(after_spawn=True)
         return
     if observer.queue is None:
         raise _ProcessIdentityLost(
@@ -3144,6 +3262,7 @@ def _wait_for_darwin_process_exit_without_reaping(
             raise _ProcessIdentityLost(
                 "Darwin status observation returned a mismatched child event"
             )
+        _require_waitable_sigchld_semantics(after_spawn=True)
         observer.exit_observed = True
         return
 
@@ -3155,6 +3274,7 @@ def _wait_for_process_status_without_reaping(
     *,
     interruptible: bool = True,
 ) -> int | None:
+    _require_waitable_sigchld_semantics(after_spawn=True)
     if not _posix_waitid_status_observation_available():
         observer = _process_status_observer(process)
         if observer is None:
@@ -3174,6 +3294,7 @@ def _wait_for_process_status_without_reaping(
     while True:
         if interruptible:
             _raise_if_termination_pending()
+        _require_waitable_sigchld_semantics(after_spawn=True)
         try:
             result = os.waitid(os.P_PID, process.pid, options)
         except ChildProcessError as exc:
@@ -3203,6 +3324,8 @@ def _reap_after_final_group_signal(
     expected_returncode: int | None,
     deadline: float,
 ) -> str | None:
+    if os.name == "posix":
+        _require_waitable_sigchld_semantics(after_spawn=True)
     try:
         returncode = process.wait(timeout=max(0.0, deadline - time.monotonic()))
     except subprocess.TimeoutExpired:
@@ -3447,6 +3570,7 @@ def _capture_bounded_process_with_launch(
 ) -> subprocess.CompletedProcess[bytes]:
     try:
         _require_process_status_observation_support()
+        _require_waitable_sigchld_semantics()
     except BaseException:
         if launch is not None:
             launch.mark_cleanup_safe()
@@ -3482,6 +3606,7 @@ def _capture_bounded_process_with_launch(
             child_argv = (
                 [str(launch.source_argv0), *argv[1:]] if launch is not None else argv
             )
+            _require_waitable_sigchld_semantics()
             process = subprocess.Popen(
                 child_argv,
                 executable=(str(launch.executable) if launch is not None else None),
@@ -3493,6 +3618,7 @@ def _capture_bounded_process_with_launch(
                 stderr=subprocess.PIPE,
                 start_new_session=os.name == "posix",
             )
+            _require_waitable_sigchld_semantics(after_spawn=True)
             _register_process_status_observer(process)
         except OSError as exc:
             _close_selector(selector)
@@ -3681,10 +3807,17 @@ def _capture_bounded_process_with_launch(
         if selector_open:
             _close_selector(selector)
             selector_open = False
-        raise UserError(
+        settlement = (
+            _settle_direct_child_after_identity_loss(process)
+            if process is not None
+            else "no direct child was created"
+        )
+        error = UserError(
             f"{exc}; {operation} cleanup-incomplete: process-group cleanup "
             "was skipped after leader identity loss"
-        ) from exc
+        )
+        _add_exception_detail(error, settlement)
+        raise error from exc
     except BaseException as exc:
         if process is None:
             if selector_open:
@@ -4173,9 +4306,12 @@ def _initialize_git_runtime() -> None:
         )
         if not cleanup_completed:
             raise
-        _GIT_RUNTIME_ERROR = UnsupportedGitVersion(
-            f"failed the bounded credential-free Git version gate: {exc}"
-        )
+        if isinstance(exc, _WaitableSigchldUnavailable):
+            _GIT_RUNTIME_ERROR = exc
+        else:
+            _GIT_RUNTIME_ERROR = UnsupportedGitVersion(
+                f"failed the bounded credential-free Git version gate: {exc}"
+            )
         return
     except BaseException as exc:
         _cleanup_git_snapshot_owner(
@@ -7271,8 +7407,18 @@ def command_install_hooks(args: argparse.Namespace) -> int:
 @dataclasses.dataclass(frozen=True)
 class _RolloutCandidate:
     path: pathlib.Path
-    identity: tuple[int, int, int, int, int, int]
+    object_identity: tuple[int, int]
+    access_policy: tuple[int, int, int]
+    size: int
     mtime: float
+
+
+def _rollout_object_identity(value: os.stat_result) -> tuple[int, int]:
+    return value.st_dev, value.st_ino
+
+
+def _rollout_access_policy(value: os.stat_result) -> tuple[int, int, int]:
+    return value.st_uid, value.st_gid, stat.S_IMODE(value.st_mode)
 
 
 @dataclasses.dataclass
@@ -7419,7 +7565,9 @@ def _rollout_candidate_from_stat(
         )
     return _RolloutCandidate(
         path=path,
-        identity=_file_identity(path_stat),
+        object_identity=_rollout_object_identity(path_stat),
+        access_policy=_rollout_access_policy(path_stat),
+        size=path_stat.st_size,
         mtime=path_stat.st_mtime,
     )
 
@@ -7536,11 +7684,23 @@ def _open_rollout_candidate(
                 path=path,
                 detail="opened rollout object is not a regular file",
             )
-        if _file_identity(descriptor_stat) != candidate.identity:
+        if _rollout_object_identity(descriptor_stat) != candidate.object_identity:
             raise DiscoveryRolloutInspectionError(
                 inspection_reason="object_replaced",
                 path=path,
-                detail="rollout object changed after directory enumeration",
+                detail="rollout object identity changed after directory enumeration",
+            )
+        if _rollout_access_policy(descriptor_stat) != candidate.access_policy:
+            raise DiscoveryRolloutInspectionError(
+                inspection_reason="access_policy_changed",
+                path=path,
+                detail="rollout owner, group, or permission mode changed",
+            )
+        if descriptor_stat.st_size != candidate.size:
+            raise DiscoveryRolloutInspectionError(
+                inspection_reason="content_changed",
+                path=path,
+                detail="rollout size changed after directory enumeration",
             )
         try:
             path_stat = os.stat(path, follow_symlinks=False)
@@ -7552,14 +7712,25 @@ def _open_rollout_candidate(
                 error_number=exc.errno,
             ) from exc
         state.check_deadline()
-        if (
-            not stat.S_ISREG(path_stat.st_mode)
-            or _file_identity(path_stat) != candidate.identity
+        if not stat.S_ISREG(path_stat.st_mode) or (
+            _rollout_object_identity(path_stat) != candidate.object_identity
         ):
             raise DiscoveryRolloutInspectionError(
                 inspection_reason="path_replaced",
                 path=path,
                 detail="rollout path no longer names the enumerated object",
+            )
+        if _rollout_access_policy(path_stat) != candidate.access_policy:
+            raise DiscoveryRolloutInspectionError(
+                inspection_reason="access_policy_changed",
+                path=path,
+                detail="rollout path owner, group, or permission mode changed",
+            )
+        if path_stat.st_size != candidate.size:
+            raise DiscoveryRolloutInspectionError(
+                inspection_reason="content_changed",
+                path=path,
+                detail="rollout path size changed after directory enumeration",
             )
         observed_total = state.total_bytes + descriptor_stat.st_size
         if observed_total > MAX_DISCOVERY_TOTAL_BYTES:
@@ -7637,16 +7808,21 @@ def _revalidate_rollout_candidate(
             detail=str(exc),
             error_number=exc.errno,
         ) from exc
-    if (
-        not stat.S_ISREG(descriptor_between.st_mode)
-        or _file_identity(descriptor_between) != candidate.identity
+    if not stat.S_ISREG(descriptor_between.st_mode) or (
+        _rollout_object_identity(descriptor_between) != candidate.object_identity
     ):
         raise DiscoveryRolloutInspectionError(
             inspection_reason="object_changed",
             path=path,
-            detail="rollout descriptor identity or access policy changed",
+            detail="rollout descriptor object identity changed",
         )
-    if first_bytes != descriptor_between.st_size:
+    if _rollout_access_policy(descriptor_between) != candidate.access_policy:
+        raise DiscoveryRolloutInspectionError(
+            inspection_reason="access_policy_changed",
+            path=path,
+            detail="rollout descriptor owner, group, or permission mode changed",
+        )
+    if descriptor_between.st_size != candidate.size or first_bytes != candidate.size:
         raise DiscoveryRolloutInspectionError(
             inspection_reason="content_changed",
             path=path,
@@ -7678,23 +7854,45 @@ def _revalidate_rollout_candidate(
             error_number=exc.errno,
         ) from exc
     state.check_deadline()
-    if (
-        not stat.S_ISREG(descriptor_after.st_mode)
-        or _file_identity(descriptor_after) != candidate.identity
+    if not stat.S_ISREG(descriptor_after.st_mode) or (
+        _rollout_object_identity(descriptor_after) != candidate.object_identity
     ):
         raise DiscoveryRolloutInspectionError(
             inspection_reason="object_changed",
             path=path,
-            detail="rollout descriptor identity or access policy changed",
+            detail="rollout descriptor object identity changed",
         )
-    if (
-        not stat.S_ISREG(path_after.st_mode)
-        or _file_identity(path_after) != candidate.identity
+    if _rollout_access_policy(descriptor_after) != candidate.access_policy:
+        raise DiscoveryRolloutInspectionError(
+            inspection_reason="access_policy_changed",
+            path=path,
+            detail="rollout descriptor owner, group, or permission mode changed",
+        )
+    if descriptor_after.st_size != candidate.size:
+        raise DiscoveryRolloutInspectionError(
+            inspection_reason="content_changed",
+            path=path,
+            detail="rollout descriptor size changed during inspection",
+        )
+    if not stat.S_ISREG(path_after.st_mode) or (
+        _rollout_object_identity(path_after) != candidate.object_identity
     ):
         raise DiscoveryRolloutInspectionError(
             inspection_reason="path_replaced",
             path=path,
             detail="rollout path changed during inspection",
+        )
+    if _rollout_access_policy(path_after) != candidate.access_policy:
+        raise DiscoveryRolloutInspectionError(
+            inspection_reason="access_policy_changed",
+            path=path,
+            detail="rollout path owner, group, or permission mode changed",
+        )
+    if path_after.st_size != candidate.size:
+        raise DiscoveryRolloutInspectionError(
+            inspection_reason="content_changed",
+            path=path,
+            detail="rollout path size changed during inspection",
         )
     if second_bytes != first_bytes or second_digest != first_digest:
         raise DiscoveryRolloutInspectionError(

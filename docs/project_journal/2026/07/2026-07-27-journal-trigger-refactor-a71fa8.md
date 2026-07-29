@@ -22,6 +22,7 @@ superseded_by:
 - The newest fresh-review findings are closed by making every non-empty rollout parse failure explicit, unioning same-name active/archive evidence without double-counting a logical rollout, and validating bounded strict-UTF-8 CWDs before path construction.
 - The latest fresh-review finding is closed by carrying one absolute candidate deadline through every adoption, Git, and auxiliary file probe and by making generated-index, exclude, hook, and index inspections nonblocking, type-safe, and byte-bounded.
 - The final two fresh-review findings are closed by binding rollout reads to no-follow/nonblocking descriptors with post-read identity and content revalidation, and by adding a Darwin `kqueue` child-status fallback for the supported Xcode Python 3.9 runtime.
+- The subsequent fresh-review findings are closed by proving and revalidating waitable `SIGCHLD` semantics around every child/PID-fence operation and by classifying rollout object identity, access policy, and content drift independently.
 
 ## Current State
 
@@ -37,6 +38,8 @@ superseded_by:
 - Worktree generated-index, exclude, and hook reads use no-follow/nonblocking descriptors, require stable regular-file identity, and enforce hard retained-byte ceilings. A truly disappeared entry is an authoritative negative, while a deadline, EACCES, EIO, FIFO, symlink, directory, unstable file, or oversized input produces structured partial/limit evidence and leaves only the affected field unknown.
 - Rollout enumeration now carries the observed object identity into a descriptor-bound `O_NOFOLLOW | O_NONBLOCK` open. The reader verifies a regular file and the original path binding, hashes the bounded first pass, rereads the same descriptor, and revalidates descriptor identity, path identity, size, and digest before accepting evidence. FIFO, symlink/object replacement, unreadable input, and concurrent object or content mutation remain distinct partial-coverage reasons.
 - Child supervision uses `waitid(..., WNOWAIT)` where available and registers a one-shot Darwin `EVFILT_PROC/NOTE_EXIT` observer immediately after launch when Xcode Python 3.9 lacks `os.waitid`. The observer proves exit without reaping; the final bounded `wait()` remains the sole exact return-code source, preserving process-group cleanup and zombie-free normal and timeout paths.
+- Before any child starts, supervision requires `SIGCHLD` to have its default waitable disposition; Darwin additionally verifies the native handler and rejects `SA_NOCLDWAIT`. That property is revalidated after launch and before kqueue `NOTE_EXIT`/`ESRCH`, non-reaping observation, final wait, and each numeric PID/PGID operation. Lost evidence prohibits process-group signalling and permits only a nonblocking direct-child reap whose status remains untrusted.
+- Rollout enumeration now records `(st_dev, st_ino)`, `(st_uid, st_gid, permission mode)`, and size as separate protected properties. True descriptor/path replacement reports `object_replaced`, `object_changed`, or `path_replaced`; chmod/chown-style policy drift reports `access_policy_changed`; append, truncation, or digest drift reports `content_changed`.
 - This is the repository's intentional first journal entry because the finalization task explicitly requires durable repo-owned validation and handoff evidence; no top-level tracker, generated index, or local hook is introduced.
 
 ## Next Steps
@@ -74,3 +77,11 @@ superseded_by:
 - Xcode Python 3.9.6 compatibility coverage: 7 targeted rollout, Darwin observer, and real CLI adoption tests passed in 6.244 seconds. This supersedes the earlier evidence above that treated missing `WNOWAIT` as a runtime gate.
 - Final Python 3.13 full suite after descriptor-bound rollout reads and Darwin child supervision: 238 passed, 2 skipped in 345.143 seconds.
 - Final Ruff check/format, Python 3.13 and Xcode Python 3.9 `py_compile`, project journal validation, and `git diff --check` passed. The installed validator remained dependency-blocked as documented above; its local YAML/frontmatter/interface/resource fallback passed without installing another runtime.
+- New ignored-SIGCHLD, `SA_NOCLDWAIT`, kqueue-`ESRCH`, real Xcode CLI, append/truncation, chmod/chown-style policy, digest, and replacement regressions: 11 passed in 3.158 seconds with Python 3.13.0 and 11 passed in 2.482 seconds with Xcode Python 3.9.6.
+- Combined process coverage: 15 passed in 4.166 seconds. Cleanup coverage: 29 passed with 2 skipped in 12.587 seconds. Discovery coverage: 40 passed in 46.382 seconds.
+- Final Python 3.13 full suite after SIGCHLD fencing and rollout property classification: 245 passed, 2 skipped in 275.279 seconds.
+- Final Ruff check/format, Python 3.13 and Xcode Python 3.9 `py_compile`, project journal validation, and `git diff --check` passed. The installed validator again remained dependency-blocked by unavailable PyYAML/DNS; its equivalent YAML/frontmatter/interface/three-resource fallback passed without installing another runtime.
+- Cleanup-phase identity-loss regression: 1 passed with Python 3.13.0 and proves that a lost PID/PGID fence during cleanup does not trigger a second numeric group probe or signal.
+- Real Xcode Python 3.9.6 CLI/process coverage: 10 targeted SIGCHLD, kqueue, identity-loss, timeout, and descendant-cleanup tests passed in 4.066 seconds.
+- The first final Python 3.13 full-suite attempt had one transient two-second Git version-probe timeout; that test passed alone in 3.029 seconds, and the clean full rerun passed 247 tests with 2 skipped in 250.461 seconds.
+- Final Ruff check/format, Python 3.13 compile, installed Joey/OpenAI skill validation, project journal validation, and `git diff --check` passed.

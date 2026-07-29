@@ -55,6 +55,12 @@ def stat_with_gid(value: os.stat_result, gid: int) -> os.stat_result:
     return os.stat_result(fields)
 
 
+def stat_with_uid(value: os.stat_result, uid: int) -> os.stat_result:
+    fields = list(value)
+    fields[4] = uid
+    return os.stat_result(fields)
+
+
 class LegacyUnsupportedPlatform(project_journal.UnsupportedPlatform):
     add_note = None
 
@@ -630,6 +636,154 @@ class ProjectJournalTests(unittest.TestCase):
         payload = json.loads(result.stdout)
         self.assertTrue(payload["tracked_journal_adopted"])
         self.assertEqual(payload["valid_tracked_journal_count"], 1)
+
+    @unittest.skipUnless(
+        sys.platform == "darwin" and pathlib.Path("/usr/bin/xcrun").is_file(),
+        "Xcode Python 3.9 inherited SIGCHLD compatibility regression",
+    )
+    def test_xcode_python39_rejects_inherited_ignored_sigchld_prelaunch(
+        self,
+    ) -> None:
+        resolved = subprocess.run(
+            ["/usr/bin/xcrun", "--find", "python3"],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=5,
+        )
+        self.assertEqual(resolved.returncode, 0, resolved.stderr)
+        xcode_python = pathlib.Path(resolved.stdout.strip())
+        version = subprocess.run(
+            [str(xcode_python), "--version"],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=5,
+        )
+        if version.returncode != 0 or not version.stdout.startswith("Python 3.9."):
+            self.skipTest(f"Xcode Python 3.9 is unavailable: {version.stdout.strip()}")
+
+        repo = self.init_repo("xcode-python39-ignored-sigchld")
+        launcher = self.root / "inherit-ignored-sigchld.py"
+        driver = self.root / "ignored-sigchld-driver.py"
+        launcher.write_text(
+            textwrap.dedent(
+                """
+                import os
+                import signal
+                import sys
+
+                signal.signal(signal.SIGCHLD, signal.SIG_IGN)
+                os.execv(sys.argv[1], [sys.argv[1], *sys.argv[2:]])
+                """
+            ).lstrip(),
+            encoding="utf-8",
+        )
+        driver.write_text(
+            textwrap.dedent(
+                """
+                import contextlib
+                import importlib.util
+                import io
+                import json
+                import os
+                import pathlib
+                import signal
+                import sys
+
+                script = pathlib.Path(sys.argv[1])
+                repo = pathlib.Path(sys.argv[2])
+                spec = importlib.util.spec_from_file_location(
+                    "ignored_sigchld_project_journal",
+                    script,
+                )
+                module = importlib.util.module_from_spec(spec)
+                sys.modules[spec.name] = module
+                spec.loader.exec_module(module)
+                popen_calls = 0
+                killpg_calls = 0
+
+                def forbidden_popen(*args, **kwargs):
+                    global popen_calls
+                    popen_calls += 1
+                    raise AssertionError("Popen must not run with ignored SIGCHLD")
+
+                def forbidden_killpg(*args, **kwargs):
+                    global killpg_calls
+                    killpg_calls += 1
+                    raise AssertionError("killpg must not run without a PID fence")
+
+                module.subprocess.Popen = forbidden_popen
+                module.os.killpg = forbidden_killpg
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr):
+                    status = module.main(
+                        ["adoption-status", "--repo", str(repo)]
+                    )
+                try:
+                    os.waitpid(-1, os.WNOHANG)
+                except ChildProcessError:
+                    child_state = "none"
+                else:
+                    child_state = "unexpected-waitable-child"
+                print(
+                    json.dumps(
+                        {
+                            "child_state": child_state,
+                            "killpg_calls": killpg_calls,
+                            "popen_calls": popen_calls,
+                            "sigchld_ignored": (
+                                signal.getsignal(signal.SIGCHLD)
+                                == signal.SIG_IGN
+                            ),
+                            "status": status,
+                            "stderr": stderr.getvalue(),
+                        }
+                    )
+                )
+                """
+            ).lstrip(),
+            encoding="utf-8",
+        )
+        env = {
+            "PATH": os.environ.get("PATH", ""),
+            "HOME": str(self.home),
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "PYTHONPYCACHEPREFIX": str(self.root / "xcode-python39-cache"),
+            "TMPDIR": os.environ.get("TMPDIR", str(self.root)),
+        }
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(launcher),
+                str(xcode_python),
+                str(driver),
+                str(SCRIPT),
+                str(repo),
+            ],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            timeout=15,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertTrue(payload["sigchld_ignored"])
+        self.assertEqual(payload["status"], 1)
+        self.assertEqual(payload["popen_calls"], 0)
+        self.assertEqual(payload["killpg_calls"], 0)
+        self.assertEqual(payload["child_state"], "none")
+        self.assertIn(
+            "waitable SIGCHLD semantics are required before process launch: "
+            "SIGCHLD is ignored",
+            payload["stderr"],
+        )
 
     def test_git_policy_removes_ambient_git_control_environment(self) -> None:
         repo = self.init_repo()
@@ -3462,6 +3616,99 @@ class ProjectJournalTests(unittest.TestCase):
         process.poll.assert_not_called()
         process.wait.assert_not_called()
 
+    @unittest.skipUnless(os.name == "posix", "POSIX SIGCHLD waitability contract")
+    def test_process_launch_rejects_ignored_sigchld_before_popen_or_killpg(
+        self,
+    ) -> None:
+        with mock.patch.object(
+            project_journal.signal,
+            "getsignal",
+            return_value=signal.SIG_IGN,
+        ):
+            with mock.patch.object(project_journal.subprocess, "Popen") as popen:
+                with mock.patch.object(project_journal.os, "killpg") as killpg:
+                    with self.assertRaises(
+                        project_journal._WaitableSigchldUnavailable
+                    ) as raised:
+                        self.capture_process(
+                            [sys.executable, "-c", "raise SystemExit(7)"],
+                            timeout_seconds=5,
+                            stdout_limit=1024,
+                        )
+
+        self.assertEqual(
+            raised.exception.code,
+            "waitable_sigchld_unavailable",
+        )
+        self.assertIn("SIGCHLD is ignored", str(raised.exception))
+        popen.assert_not_called()
+        killpg.assert_not_called()
+
+    @unittest.skipUnless(sys.platform == "darwin", "Darwin SA_NOCLDWAIT contract")
+    def test_process_launch_rejects_darwin_no_cldwait_before_popen(
+        self,
+    ) -> None:
+        with mock.patch.object(
+            project_journal,
+            "_darwin_sigchld_action",
+            return_value=(0, project_journal.DARWIN_SA_NOCLDWAIT),
+        ):
+            with mock.patch.object(project_journal.subprocess, "Popen") as popen:
+                with self.assertRaises(
+                    project_journal._WaitableSigchldUnavailable
+                ) as raised:
+                    self.capture_process(
+                        [sys.executable, "-c", "raise SystemExit(7)"],
+                        timeout_seconds=5,
+                        stdout_limit=1024,
+                    )
+
+        self.assertIn("SA_NOCLDWAIT", str(raised.exception))
+        popen.assert_not_called()
+
+    @unittest.skipUnless(
+        sys.platform == "darwin"
+        and project_journal._darwin_kqueue_status_observation_available(),
+        "Darwin kqueue ESRCH waitability contract",
+    )
+    def test_darwin_kqueue_esrch_rejects_lost_sigchld_waitability(
+        self,
+    ) -> None:
+        process = mock.Mock(spec=["pid"])
+        process.pid = 12345
+        queue = mock.Mock()
+        queue.control.side_effect = ProcessLookupError(errno.ESRCH, "gone")
+
+        with mock.patch.object(
+            project_journal,
+            "_posix_waitid_status_observation_available",
+            return_value=False,
+        ):
+            with mock.patch.object(
+                project_journal.select,
+                "kqueue",
+                return_value=queue,
+            ):
+                with mock.patch.object(
+                    project_journal,
+                    "_waitable_sigchld_failure",
+                    side_effect=[
+                        None,
+                        "SIGCHLD became ignored and the child may be auto-reaped",
+                    ],
+                ):
+                    with self.assertRaises(
+                        project_journal._ProcessIdentityLost
+                    ) as raised:
+                        project_journal._register_process_status_observer(process)
+
+        self.assertIn(
+            "waitable SIGCHLD semantics changed after process launch",
+            str(raised.exception),
+        )
+        queue.close.assert_called_once()
+        self.assertFalse(hasattr(process, "_project_journal_status_observer"))
+
     @unittest.skipUnless(
         sys.platform == "darwin"
         and project_journal._darwin_kqueue_status_observation_available(),
@@ -5679,6 +5926,52 @@ class ProjectJournalTests(unittest.TestCase):
         cleanup.assert_not_called()
         signal_group.assert_not_called()
 
+    @unittest.skipUnless(os.name == "posix", "POSIX process-group contract")
+    def test_identity_loss_during_cleanup_never_retries_numeric_group_probe(
+        self,
+    ) -> None:
+        spawned: list[subprocess.Popen[bytes]] = []
+        original_popen = subprocess.Popen
+
+        def capture_popen(
+            *args: object,
+            **kwargs: object,
+        ) -> subprocess.Popen[bytes]:
+            process = original_popen(*args, **kwargs)
+            spawned.append(process)
+            return process
+
+        with mock.patch.object(
+            project_journal.subprocess,
+            "Popen",
+            side_effect=capture_popen,
+        ):
+            with mock.patch.object(
+                project_journal,
+                "_bound_process_group_exists",
+                side_effect=project_journal._ProcessIdentityLost(
+                    "simulated SIGCHLD waitability loss during cleanup"
+                ),
+            ) as group_probe:
+                with mock.patch.object(
+                    project_journal,
+                    "_signal_process_group",
+                ) as signal_group:
+                    with self.assertRaisesRegex(
+                        project_journal.UserError,
+                        "cleanup was skipped after leader identity loss",
+                    ):
+                        self.capture_process(
+                            [sys.executable, "-c", "pass"],
+                            timeout_seconds=5,
+                            stdout_limit=1024,
+                        )
+
+        self.assertEqual(len(spawned), 1)
+        self.assertIsNotNone(spawned[0].returncode)
+        group_probe.assert_called_once()
+        signal_group.assert_not_called()
+
     def test_bounded_capture_surfaces_cleanup_incomplete(self) -> None:
         parser = project_journal._IndexStageStreamParser()
         original_cleanup = project_journal._terminate_process_group_and_reap
@@ -6558,6 +6851,12 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertIn("status is observed with `WNOWAIT`", skill)
         self.assertIn("Xcode Python 3.9.6", skill)
         self.assertIn("kqueue `NOTE_EXIT`", skill)
+        self.assertIn("default waitable `SIGCHLD` semantics", skill)
+        self.assertIn("reject `SA_NOCLDWAIT`", skill)
+        self.assertIn(
+            "before every numeric PID/PGID probe or signal",
+            skill,
+        )
         self.assertIn("Explicit ownership states", skill)
         self.assertIn("reuses the already claimed ownership object", skill)
         self.assertIn(
@@ -6654,6 +6953,11 @@ class ProjectJournalTests(unittest.TestCase):
         )
         self.assertIn("`O_NOFOLLOW|O_NONBLOCK` descriptor", skill)
         self.assertIn("distinct `inspection_reason` values", skill)
+        self.assertIn(
+            "object identity (`st_dev`, `st_ino`), access policy",
+            skill,
+        )
+        self.assertIn("append/truncation", skill)
         self.assertIn("Require `coverage_status: complete`", skill)
         self.assertIn("bounded three-line marker prefix", skill)
         self.assertIn(
@@ -6765,6 +7069,12 @@ class ProjectJournalTests(unittest.TestCase):
         )
         self.assertIn("Xcode Python 3.9.6", readme)
         self.assertIn("kqueue `NOTE_EXIT`", readme)
+        self.assertIn("default waitable `SIGCHLD` semantics", readme)
+        self.assertIn("rejects `SA_NOCLDWAIT`", readme)
+        self.assertIn(
+            "before every numeric PID/PGID probe or signal",
+            readme,
+        )
         self.assertIn("Explicit cleanup ownership states", readme)
         self.assertIn("never signals a numeric PGID after the final reap", readme)
         self.assertIn("reports `cleanup-incomplete`", readme)
@@ -6797,6 +7107,11 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertIn("one shared 60-second monotonic deadline", readme)
         self.assertIn("required `O_NOFOLLOW|O_NONBLOCK`", readme)
         self.assertIn("distinct `inspection_reason`", readme)
+        self.assertIn(
+            "object identity (`st_dev`, `st_ino`), access policy",
+            readme,
+        )
+        self.assertIn("append/truncation", readme)
         self.assertIn("`coverage_status: complete`", readme)
         self.assertIn("three-line marker prefix", readme)
         self.assertIn(
@@ -9806,6 +10121,58 @@ class ProjectJournalTests(unittest.TestCase):
                 )
                 self.assertEqual(pathlib.Path(coverage["source"]), rollout)
 
+    def test_discover_repos_classifies_same_object_drift_after_enumeration(
+        self,
+    ) -> None:
+        original_iterator = project_journal._iter_rollout_paths
+        for mutation, expected_reason in (
+            ("append", "content_changed"),
+            ("truncate", "content_changed"),
+            ("chmod", "access_policy_changed"),
+        ):
+            with self.subTest(mutation=mutation):
+                codex_home = self.root / f"codex-home-enumerated-{mutation}"
+                rollout_dir = codex_home / "sessions/2026/05/05"
+                rollout_dir.mkdir(parents=True)
+                rollout = rollout_dir / f"rollout-{mutation}.jsonl"
+                payload = b'{"event":"stable"}\n'
+                rollout.write_bytes(payload)
+
+                def mutate_after_enumeration(
+                    root: pathlib.Path,
+                    state: project_journal._DiscoveryScanState,
+                ) -> object:
+                    for candidate in original_iterator(root, state):
+                        if candidate.path == rollout:
+                            if mutation == "append":
+                                with rollout.open("ab") as handle:
+                                    handle.write(b'{"event":"appended"}\n')
+                            elif mutation == "truncate":
+                                os.truncate(rollout, len(payload) - 1)
+                            else:
+                                current_mode = stat.S_IMODE(rollout.stat().st_mode)
+                                os.chmod(rollout, current_mode ^ stat.S_IXUSR)
+                        yield candidate
+
+                with mock.patch.object(
+                    project_journal,
+                    "_iter_rollout_paths",
+                    side_effect=mutate_after_enumeration,
+                ):
+                    rows = project_journal._discover_repos(codex_home, 9999)
+
+                self.assertEqual(rows[0]["coverage_status"], "partial")
+                self.assertEqual(rows[0]["discovery_status"], "inconclusive")
+                coverage = rows[0]["discovery_error"]["discovery_coverage"]
+                self.assertEqual(
+                    coverage["code"],
+                    "discovery_rollout_inspection_failed",
+                )
+                self.assertEqual(
+                    coverage["inspection_reason"],
+                    expected_reason,
+                )
+
     def test_discover_repos_reports_unreadable_rollout_distinctly(self) -> None:
         codex_home = self.root / "codex-home-unreadable-rollout"
         rollout_dir = codex_home / "sessions/2026/05/05"
@@ -9880,6 +10247,8 @@ class ProjectJournalTests(unittest.TestCase):
             rows = project_journal._discover_repos(codex_home, 9999)
 
         self.assertTrue(changed)
+        self.assertEqual(rows[0]["coverage_status"], "partial")
+        self.assertEqual(rows[0]["discovery_status"], "inconclusive")
         coverage = rows[0]["discovery_error"]["discovery_coverage"]
         self.assertEqual(
             coverage["code"],
@@ -9887,6 +10256,179 @@ class ProjectJournalTests(unittest.TestCase):
         )
         self.assertEqual(coverage["inspection_reason"], "content_changed")
         self.assertEqual(coverage["rollout_bytes_scanned"], rollout.stat().st_size)
+
+    def test_discover_repos_classifies_append_and_truncation_as_content_change(
+        self,
+    ) -> None:
+        original_verifier = project_journal._read_rollout_verification_digest
+        for mutation in ("append", "truncate"):
+            with self.subTest(mutation=mutation):
+                codex_home = self.root / f"codex-home-{mutation}"
+                rollout_dir = codex_home / "sessions/2026/05/05"
+                rollout_dir.mkdir(parents=True)
+                rollout = rollout_dir / f"rollout-{mutation}.jsonl"
+                payload = b'{"event":"stable"}\n'
+                rollout.write_bytes(payload)
+                changed = False
+
+                def mutate_before_verification(
+                    fd: int,
+                    candidate: project_journal._RolloutCandidate,
+                    expected_bytes: int,
+                    state: project_journal._DiscoveryScanState,
+                ) -> tuple[bytes, int]:
+                    nonlocal changed
+                    if not changed:
+                        changed = True
+                        if mutation == "append":
+                            with candidate.path.open("ab") as handle:
+                                handle.write(b'{"event":"appended"}\n')
+                        else:
+                            os.truncate(candidate.path, len(payload) - 1)
+                    return original_verifier(
+                        fd,
+                        candidate,
+                        expected_bytes,
+                        state,
+                    )
+
+                with mock.patch.object(
+                    project_journal,
+                    "_read_rollout_verification_digest",
+                    side_effect=mutate_before_verification,
+                ):
+                    rows = project_journal._discover_repos(codex_home, 9999)
+
+                self.assertTrue(changed)
+                self.assertEqual(rows[0]["coverage_status"], "partial")
+                self.assertEqual(rows[0]["discovery_status"], "inconclusive")
+                coverage = rows[0]["discovery_error"]["discovery_coverage"]
+                self.assertEqual(
+                    coverage["code"],
+                    "discovery_rollout_inspection_failed",
+                )
+                self.assertEqual(
+                    coverage["inspection_reason"],
+                    "content_changed",
+                )
+
+    def test_discover_repos_classifies_chmod_as_access_policy_change(
+        self,
+    ) -> None:
+        codex_home = self.root / "codex-home-chmod"
+        rollout_dir = codex_home / "sessions/2026/05/05"
+        rollout_dir.mkdir(parents=True)
+        rollout = rollout_dir / "rollout-chmod.jsonl"
+        rollout.write_bytes(b'{"event":"stable"}\n')
+        original_verifier = project_journal._read_rollout_verification_digest
+        changed = False
+
+        def chmod_before_verification(
+            fd: int,
+            candidate: project_journal._RolloutCandidate,
+            expected_bytes: int,
+            state: project_journal._DiscoveryScanState,
+        ) -> tuple[bytes, int]:
+            nonlocal changed
+            if not changed:
+                changed = True
+                current_mode = stat.S_IMODE(candidate.path.stat().st_mode)
+                os.chmod(candidate.path, current_mode ^ stat.S_IXUSR)
+            return original_verifier(
+                fd,
+                candidate,
+                expected_bytes,
+                state,
+            )
+
+        with mock.patch.object(
+            project_journal,
+            "_read_rollout_verification_digest",
+            side_effect=chmod_before_verification,
+        ):
+            rows = project_journal._discover_repos(codex_home, 9999)
+
+        self.assertTrue(changed)
+        self.assertEqual(rows[0]["coverage_status"], "partial")
+        self.assertEqual(rows[0]["discovery_status"], "inconclusive")
+        coverage = rows[0]["discovery_error"]["discovery_coverage"]
+        self.assertEqual(
+            coverage["code"],
+            "discovery_rollout_inspection_failed",
+        )
+        self.assertEqual(
+            coverage["inspection_reason"],
+            "access_policy_changed",
+        )
+
+    def test_discover_repos_classifies_owner_and_group_as_access_policy_change(
+        self,
+    ) -> None:
+        original_verifier = project_journal._read_rollout_verification_digest
+        original_fstat = project_journal.os.fstat
+        for policy_field in ("owner", "group"):
+            with self.subTest(policy_field=policy_field):
+                codex_home = self.root / f"codex-home-{policy_field}"
+                rollout_dir = codex_home / "sessions/2026/05/05"
+                rollout_dir.mkdir(parents=True)
+                rollout = rollout_dir / f"rollout-{policy_field}.jsonl"
+                rollout.write_bytes(b'{"event":"stable"}\n')
+                rollout_object = project_journal._rollout_object_identity(
+                    rollout.stat()
+                )
+                changed = False
+
+                def mutate_before_verification(
+                    fd: int,
+                    candidate: project_journal._RolloutCandidate,
+                    expected_bytes: int,
+                    state: project_journal._DiscoveryScanState,
+                ) -> tuple[bytes, int]:
+                    nonlocal changed
+                    changed = True
+                    return original_verifier(
+                        fd,
+                        candidate,
+                        expected_bytes,
+                        state,
+                    )
+
+                def changed_fstat(fd: int) -> os.stat_result:
+                    value = original_fstat(fd)
+                    if (
+                        changed
+                        and project_journal._rollout_object_identity(value)
+                        == rollout_object
+                    ):
+                        if policy_field == "owner":
+                            return stat_with_uid(value, value.st_uid + 1)
+                        return stat_with_gid(value, value.st_gid + 1)
+                    return value
+
+                with mock.patch.object(
+                    project_journal,
+                    "_read_rollout_verification_digest",
+                    side_effect=mutate_before_verification,
+                ):
+                    with mock.patch.object(
+                        project_journal.os,
+                        "fstat",
+                        side_effect=changed_fstat,
+                    ):
+                        rows = project_journal._discover_repos(codex_home, 9999)
+
+                self.assertTrue(changed)
+                self.assertEqual(rows[0]["coverage_status"], "partial")
+                self.assertEqual(rows[0]["discovery_status"], "inconclusive")
+                coverage = rows[0]["discovery_error"]["discovery_coverage"]
+                self.assertEqual(
+                    coverage["code"],
+                    "discovery_rollout_inspection_failed",
+                )
+                self.assertEqual(
+                    coverage["inspection_reason"],
+                    "access_policy_changed",
+                )
 
     def test_discover_repos_detects_concurrent_rollout_object_replacement(
         self,
@@ -9927,6 +10469,8 @@ class ProjectJournalTests(unittest.TestCase):
             rows = project_journal._discover_repos(codex_home, 9999)
 
         self.assertTrue(replaced)
+        self.assertEqual(rows[0]["coverage_status"], "partial")
+        self.assertEqual(rows[0]["discovery_status"], "inconclusive")
         coverage = rows[0]["discovery_error"]["discovery_coverage"]
         self.assertEqual(
             coverage["code"],
