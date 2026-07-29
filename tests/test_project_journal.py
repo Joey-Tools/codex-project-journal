@@ -4697,6 +4697,30 @@ class ProjectJournalTests(unittest.TestCase):
                     ctypes.POINTER(module._LinuxSigaction),
                 )
                 sigaction.restype = ctypes.c_int
+                sigismember = library.sigismember
+                sigismember.argtypes = (
+                    ctypes.POINTER(module._LinuxSigset),
+                    ctypes.c_int,
+                )
+                sigismember.restype = ctypes.c_int
+
+                def sigset_members(action):
+                    # Compare semantic members, not libc sigset_t padding.
+                    members = []
+                    for signum in range(1, signal.NSIG):
+                        membership = sigismember(
+                            ctypes.byref(action.mask),
+                            signum,
+                        )
+                        if membership < 0:
+                            raise OSError(
+                                ctypes.get_errno(),
+                                f"failed to inspect signal-mask member {signum}",
+                            )
+                        if membership:
+                            members.append(signum)
+                    return members
+
                 original = module._LinuxSigaction()
                 if sigaction(
                     int(signal.SIGCHLD),
@@ -4726,6 +4750,8 @@ class ProjectJournalTests(unittest.TestCase):
                 rejection = None
                 restored = None
                 restore_result = None
+                restored_waitable = False
+                restored_wait_status = None
                 try:
                     pid = os.fork()
                     if pid == 0:
@@ -4777,6 +4803,16 @@ class ProjectJournalTests(unittest.TestCase):
                             None,
                             ctypes.byref(restored),
                         )
+                    if restore_result == 0:
+                        pid = os.fork()
+                        if pid == 0:
+                            os._exit(0)
+                        try:
+                            _, restored_wait_status = os.waitpid(pid, 0)
+                        except ChildProcessError:
+                            restored_waitable = False
+                        else:
+                            restored_waitable = True
 
                 print(
                     json.dumps(
@@ -4794,8 +4830,16 @@ class ProjectJournalTests(unittest.TestCase):
                                 if restored is not None
                                 else None
                             ),
+                            "restored_mask": (
+                                sigset_members(restored)
+                                if restored is not None
+                                else None
+                            ),
+                            "restored_wait_status": restored_wait_status,
+                            "restored_waitable": restored_waitable,
                             "original_flags": original.flags,
                             "original_handler": int(original.handler or 0),
+                            "original_mask": sigset_members(original),
                         }
                     )
                 )
@@ -4820,7 +4864,17 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertEqual(payload["killpg_calls"], 0)
         self.assertEqual(payload["restore_result"], 0)
         self.assertEqual(payload["restored_handler"], payload["original_handler"])
-        self.assertEqual(payload["restored_flags"], payload["original_flags"])
+        self.assertEqual(payload["restored_mask"], payload["original_mask"])
+        restored_flags = payload["restored_flags"] & 0xFFFFFFFF
+        original_flags = payload["original_flags"] & 0xFFFFFFFF
+        flag_delta = restored_flags ^ original_flags
+        self.assertIn(flag_delta, (0, project_journal.LINUX_SA_RESTORER))
+        self.assertEqual(
+            restored_flags & project_journal.LINUX_SA_NOCLDWAIT,
+            original_flags & project_journal.LINUX_SA_NOCLDWAIT,
+        )
+        self.assertTrue(payload["restored_waitable"])
+        self.assertEqual(payload["restored_wait_status"], 0)
         self.assertIn("Linux SIGCHLD has SA_NOCLDWAIT", payload["rejection"])
 
     @unittest.skipUnless(
@@ -8031,6 +8085,7 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertIn("kqueue `NOTE_EXIT`", skill)
         self.assertIn("default waitable `SIGCHLD` semantics", skill)
         self.assertIn("reject `SA_NOCLDWAIT`", skill)
+        self.assertIn("libc-injected `SA_RESTORER`", skill)
         self.assertIn(
             "before every numeric PID/PGID probe or signal",
             skill,
@@ -8271,6 +8326,7 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertIn("kqueue `NOTE_EXIT`", readme)
         self.assertIn("default waitable `SIGCHLD` semantics", readme)
         self.assertIn("rejects `SA_NOCLDWAIT`", readme)
+        self.assertIn("libc-injected `SA_RESTORER`", readme)
         self.assertIn(
             "before every numeric PID/PGID probe or signal",
             readme,

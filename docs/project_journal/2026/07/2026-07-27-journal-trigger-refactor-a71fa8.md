@@ -3,7 +3,7 @@ id: 20260727-a71fa8
 title: Project Journal Trigger Refactor
 status: completed
 created: 2026-07-23
-updated: 2026-07-29
+updated: 2026-07-30
 branch: codex/journal-trigger-refactor
 pr: https://github.com/Joey-Tools/codex-project-journal/pull/5
 supersedes: []
@@ -30,6 +30,7 @@ superseded_by:
 - The newest two fresh-review findings are closed by bounding retained validation-path labels and aggregate issue bytes, and by preserving parse, limit, replacement, access-policy, and generator-exit primaries when rollout descriptor cleanup also fails.
 - The final three fresh-review findings are closed by bounding retained rollout associations across resolved and unresolved candidates, enforcing direct-child-only archive discovery, and integrating the Git source-descriptor close into launch preparation cleanup and exception precedence.
 - The two post-head fresh-review findings are closed by preserving snapshot-creation failures across every descriptor close and by replacing the fixed two-second Git version probe with the shared initialization deadline plus non-cacheable transient classification.
+- The hosted Linux Python 3.14 follow-up is closed by excluding only libc-injected `SA_RESTORER` trampoline metadata from restoration equivalence while retaining exact handler, mask, user-visible flag, `SA_NOCLDWAIT`, and real child-waitability checks.
 
 ## Current State
 
@@ -47,6 +48,7 @@ superseded_by:
 - Session/archive dates are derived only relative to the explicit rollout root, so a similarly named dated outer ancestor cannot suppress an uncertain failure. Every directory scan/open/stat error handoff first revalidates the retained ancestor chain and prefers a proved ancestor replacement or access-policy change.
 - Child supervision uses `waitid(..., WNOWAIT)` where available and registers a one-shot Darwin `EVFILT_PROC/NOTE_EXIT` observer immediately after launch when Xcode Python 3.9 lacks `os.waitid`. The observer proves exit without reaping; the final bounded `wait()` remains the sole exact return-code source, preserving process-group cleanup and zombie-free normal and timeout paths.
 - Before any child starts, supervision requires `SIGCHLD` to have its default waitable disposition. Darwin and reviewed LP64 Linux x86_64/AArch64 glibc/musl ABIs also verify the native handler and reject `SA_NOCLDWAIT`; unknown Linux machine, libc multiarch, or word-size layouts fail closed before libc or `Popen`. That property is revalidated after launch and before kqueue `NOTE_EXIT`/`ESRCH`, non-reaping observation, final wait, and each numeric PID/PGID operation. Lost evidence prohibits process-group signalling and permits only a nonblocking direct-child reap whose status remains untrusted.
+- Linux restoration coverage treats `SA_RESTORER` and its restorer pointer as libc-private signal-trampoline metadata, because glibc may add that bit while reinstalling an otherwise identical action. The protected property remains the handler, complete signal mask, every other flag bit, exact `SA_NOCLDWAIT` state, and observable ability to reap a newly forked child.
 - Rollout enumeration now records `(st_dev, st_ino)`, `(st_uid, st_gid, permission mode)`, and size as separate protected properties. True descriptor/path replacement reports `object_replaced`, `object_changed`, or `path_replaced`; chmod/chown-style policy drift reports `access_policy_changed`; append, truncation, or digest drift reports `content_changed`.
 - Directory traversal closes bound frames and descriptors before handing off a selected structured inspection failure. Iterator or descriptor cleanup faults are retained in bounded `cleanup_errors` evidence and exception notes without replacing a proved object-identity or access-policy failure; when no primary failure exists, cleanup faults still propagate.
 - Indexed validation retains the exact invalid path for structured validity decisions, but caps formatted path labels at 4 KiB by replacing larger values with a stable JSON `path_ref` containing byte length and SHA-256. Retained issue text also has an independent 1 MiB aggregate cap.
@@ -127,3 +129,10 @@ superseded_by:
 - Final serial Python 3.13 full suite after snapshot-close and version-probe hardening: all 288 tests passed with 3 platform skips in 283.184 seconds; the former fixed two-second version timeout did not recur.
 - Final serial Xcode Python 3.9.6 full suite after the same fixes: all 288 tests passed with 4 platform skips in 313.683 seconds.
 - Final Ruff check/format, Python 3.13 and Xcode Python 3.9.6 `py_compile`, installed Joey/OpenAI skill validation, project journal validation, and `git diff --check` passed.
+- Hosted CI run `30472452365` used Ubuntu Python 3.14.6 and ran all 288 tests; its sole failure compared restored flags `0x04000000` with original flags `0`. Linux defines that bit as `SA_RESTORER`, and glibc may inject it with its private signal trampoline whenever an action is installed, so it is not disposition, mask, `SA_NOCLDWAIT`, or other user-visible flag drift.
+- SIGCHLD restoration-focused coverage passed 9 tests with 1 Linux-only skip under Python 3.13.0 and 9 tests with 2 platform skips under Xcode Python 3.9.6. The native Linux test now compares handler, the complete signal mask, every flag except `SA_RESTORER`, the exact `SA_NOCLDWAIT` bit, and an actual post-restore fork/wait.
+- Final serial Python 3.13 full suite after the Linux restoration assertion fix: all 288 tests passed with 3 platform skips in 287.028 seconds.
+- Final serial Xcode Python 3.9.6 full suite after the same fix: all 288 tests passed with 4 platform skips in 307.130 seconds.
+- A local Linux Python 3.14.6 rerun was unavailable because Apple Container had no configured Linux arm64 kernel and the installed Podman client had no running VM; no host VM or kernel configuration was initialized. The prior hosted failure remains the authoritative native-Linux evidence until the unpushed fix runs in CI.
+- Final Ruff check/format, Python 3.13 and Xcode Python 3.9.6 `py_compile`, installed Joey/OpenAI skill validation, project journal validation, and `git diff --check` passed. The system `quick_validate.py` fallback entrypoint could not import PyYAML, while the installed validator wrapper completed successfully without changing the runtime.
+- A fresh read-only narrow audit of the final SIGCHLD patch returned `No findings.`; it was an informal implementation audit, not a formal named-review lane.
