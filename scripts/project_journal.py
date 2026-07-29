@@ -97,6 +97,7 @@ MAX_DISCOVERY_JSON_DEPTH = 64
 MAX_DISCOVERY_JSON_INTEGER_DIGITS = 4096
 MAX_DISCOVERY_CWD_UTF8_BYTES = 16 * 1024
 MAX_DISCOVERY_CWD_COMPONENTS = 256
+MAX_DISCOVERY_DIRECTORY_DEPTH = 256
 MAX_DISCOVERY_ERRORS = 32
 MAX_DISCOVERY_ERROR_DETAIL_CHARS = 512
 DISCOVERY_ENRICHMENT_MAX_ATTEMPTS_PER_ROOT = 2
@@ -7495,12 +7496,32 @@ class _RolloutCandidate:
     access_policy: tuple[int, int, int]
     size: int
     mtime: float
+    observed_date: dt.date | None
 
 
 @dataclasses.dataclass(frozen=True)
 class _RolloutInspectionFailure:
     path: pathlib.Path
     error: DiscoveryRolloutInspectionError
+    observed_date: dt.date | None
+    observed_mtime: float | None
+
+
+@dataclasses.dataclass(frozen=True)
+class _RolloutDirectoryBinding:
+    rollout_root: pathlib.Path
+    path: pathlib.Path
+    fd: int
+    object_identity: tuple[int, int]
+    access_policy: tuple[int, int, int]
+    parent_fd: int | None
+    name: str | None
+
+
+@dataclasses.dataclass
+class _RolloutDirectoryFrame:
+    binding: _RolloutDirectoryBinding
+    entries: Any
 
 
 def _rollout_object_identity(value: os.stat_result) -> tuple[int, int]:
@@ -7602,19 +7623,20 @@ class _DiscoveryScanState:
         }
 
 
-def _path_date(path: pathlib.Path) -> dt.date | None:
-    parts = path.parts
-    for index, part in enumerate(parts):
-        if part in {"sessions", "archived_sessions"} and index + 3 < len(parts):
-            try:
-                return dt.date(
-                    int(parts[index + 1]),
-                    int(parts[index + 2]),
-                    int(parts[index + 3]),
-                )
-            except ValueError:
-                continue
-    if "archived_sessions" in parts:
+def _path_date(
+    path: pathlib.Path,
+    rollout_root: pathlib.Path,
+) -> dt.date | None:
+    try:
+        relative = path.relative_to(rollout_root)
+    except ValueError:
+        return None
+    if rollout_root.name == "sessions" and len(relative.parts) >= 3:
+        try:
+            return dt.date(*(int(value) for value in relative.parts[:3]))
+        except ValueError:
+            return None
+    if rollout_root.name == "archived_sessions":
         match = ARCHIVED_ROLLOUT_DATE_RE.match(path.name)
         if match is not None:
             try:
@@ -7624,10 +7646,54 @@ def _path_date(path: pathlib.Path) -> dt.date | None:
     return None
 
 
+def _rollout_inspection_failure(
+    path: pathlib.Path,
+    *,
+    rollout_root: pathlib.Path,
+    inspection_reason: str,
+    detail: str,
+    path_stat: os.stat_result | None = None,
+    error_number: int | None = None,
+    use_mtime_for_window: bool = False,
+) -> _RolloutInspectionFailure:
+    return _RolloutInspectionFailure(
+        path=path,
+        error=DiscoveryRolloutInspectionError(
+            inspection_reason=inspection_reason,
+            path=path,
+            detail=detail,
+            error_number=error_number,
+        ),
+        observed_date=_path_date(path, rollout_root),
+        observed_mtime=(
+            path_stat.st_mtime
+            if path_stat is not None and use_mtime_for_window
+            else None
+        ),
+    )
+
+
+def _rollout_failure_proven_outside_window(
+    failure: _RolloutInspectionFailure,
+    cutoff: dt.date,
+) -> bool:
+    if failure.observed_date is not None:
+        return failure.observed_date < cutoff
+    if failure.observed_mtime is None:
+        return False
+    try:
+        observed = dt.datetime.fromtimestamp(
+            failure.observed_mtime,
+            tz=dt.timezone.utc,
+        ).date()
+    except (OSError, OverflowError, ValueError):
+        return False
+    return observed < cutoff
+
+
 def _rollout_last_seen(candidate: _RolloutCandidate) -> str:
-    dated = _path_date(candidate.path)
-    if dated is not None:
-        return dated.isoformat()
+    if candidate.observed_date is not None:
+        return candidate.observed_date.isoformat()
     mtime = dt.datetime.fromtimestamp(candidate.mtime, tz=dt.timezone.utc)
     return mtime.date().isoformat()
 
@@ -7636,9 +7702,8 @@ def _rollout_in_window(
     candidate: _RolloutCandidate,
     cutoff: dt.date,
 ) -> bool:
-    dated = _path_date(candidate.path)
-    if dated is not None:
-        return dated >= cutoff
+    if candidate.observed_date is not None:
+        return candidate.observed_date >= cutoff
     mtime = dt.datetime.fromtimestamp(candidate.mtime, tz=dt.timezone.utc)
     return mtime.date() >= cutoff
 
@@ -7646,6 +7711,8 @@ def _rollout_in_window(
 def _rollout_candidate_from_stat(
     path: pathlib.Path,
     path_stat: os.stat_result,
+    *,
+    rollout_root: pathlib.Path,
 ) -> _RolloutCandidate:
     if not stat.S_ISREG(path_stat.st_mode):
         raise DiscoveryRolloutInspectionError(
@@ -7659,12 +7726,15 @@ def _rollout_candidate_from_stat(
         access_policy=_rollout_access_policy(path_stat),
         size=path_stat.st_size,
         mtime=path_stat.st_mtime,
+        observed_date=_path_date(path, rollout_root),
     )
 
 
 def _coerce_rollout_candidate(
     value: _RolloutCandidate | pathlib.Path,
     state: _DiscoveryScanState,
+    *,
+    rollout_root: pathlib.Path,
 ) -> _RolloutCandidate:
     if isinstance(value, _RolloutCandidate):
         return value
@@ -7680,71 +7750,612 @@ def _coerce_rollout_candidate(
             error_number=exc.errno,
         ) from exc
     state.check_deadline()
-    return _rollout_candidate_from_stat(path, path_stat)
+    return _rollout_candidate_from_stat(
+        path,
+        path_stat,
+        rollout_root=rollout_root,
+    )
+
+
+def _rollout_directory_error_reason(
+    exc: OSError,
+    default: str,
+) -> str:
+    if exc.errno == errno.ENOENT:
+        return "directory_missing"
+    if exc.errno in {errno.EACCES, errno.EPERM}:
+        return "directory_unreadable"
+    if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+        return "directory_replaced"
+    return default
+
+
+def _rollout_directory_open_flags() -> int:
+    return (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | _required_open_flag("O_DIRECTORY")
+        | _required_open_flag("O_NOFOLLOW")
+        | _required_open_flag("O_NONBLOCK")
+    )
+
+
+def _validate_opened_rollout_directory(
+    path: pathlib.Path,
+    fd: int,
+    expected_stat: os.stat_result,
+    state: _DiscoveryScanState,
+    *,
+    rollout_root: pathlib.Path,
+    parent_fd: int | None,
+    name: str | None,
+) -> _RolloutDirectoryBinding | _RolloutInspectionFailure:
+    state.check_deadline()
+    try:
+        descriptor_stat = os.fstat(fd)
+    except OSError as exc:
+        return _rollout_inspection_failure(
+            path,
+            rollout_root=rollout_root,
+            inspection_reason="directory_descriptor_binding_failed",
+            detail=str(exc),
+            path_stat=expected_stat,
+            error_number=exc.errno,
+        )
+    state.check_deadline()
+    if not stat.S_ISDIR(descriptor_stat.st_mode) or (
+        _rollout_object_identity(descriptor_stat)
+        != _rollout_object_identity(expected_stat)
+    ):
+        return _rollout_inspection_failure(
+            path,
+            rollout_root=rollout_root,
+            inspection_reason="directory_replaced",
+            detail="opened directory is not the object observed during enumeration",
+            path_stat=expected_stat,
+        )
+    if _rollout_access_policy(descriptor_stat) != _rollout_access_policy(expected_stat):
+        return _rollout_inspection_failure(
+            path,
+            rollout_root=rollout_root,
+            inspection_reason="directory_access_policy_changed",
+            detail="directory owner, group, or permission mode changed during binding",
+            path_stat=expected_stat,
+        )
+    try:
+        if parent_fd is None:
+            linked_stat = os.stat(path, follow_symlinks=False)
+        else:
+            assert name is not None
+            linked_stat = os.stat(
+                name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+    except OSError as exc:
+        return _rollout_inspection_failure(
+            path,
+            rollout_root=rollout_root,
+            inspection_reason=_rollout_directory_error_reason(
+                exc,
+                "directory_path_revalidation_failed",
+            ),
+            detail=str(exc),
+            path_stat=expected_stat,
+            error_number=exc.errno,
+        )
+    state.check_deadline()
+    if not stat.S_ISDIR(linked_stat.st_mode) or (
+        _rollout_object_identity(linked_stat)
+        != _rollout_object_identity(descriptor_stat)
+    ):
+        return _rollout_inspection_failure(
+            path,
+            rollout_root=rollout_root,
+            inspection_reason="directory_replaced",
+            detail="directory path no longer names the opened object",
+            path_stat=expected_stat,
+        )
+    if _rollout_access_policy(linked_stat) != _rollout_access_policy(descriptor_stat):
+        return _rollout_inspection_failure(
+            path,
+            rollout_root=rollout_root,
+            inspection_reason="directory_access_policy_changed",
+            detail="directory path owner, group, or permission mode changed",
+            path_stat=expected_stat,
+        )
+    return _RolloutDirectoryBinding(
+        rollout_root=rollout_root,
+        path=path,
+        fd=fd,
+        object_identity=_rollout_object_identity(descriptor_stat),
+        access_policy=_rollout_access_policy(descriptor_stat),
+        parent_fd=parent_fd,
+        name=name,
+    )
+
+
+def _bind_rollout_root_directory(
+    root: pathlib.Path,
+    state: _DiscoveryScanState,
+) -> _RolloutDirectoryBinding | _RolloutInspectionFailure | None:
+    state.check_deadline()
+    try:
+        root_stat = os.stat(root, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        return _rollout_inspection_failure(
+            root,
+            rollout_root=root,
+            inspection_reason=_rollout_directory_error_reason(
+                exc,
+                "directory_initial_inspection_failed",
+            ),
+            detail=str(exc),
+            error_number=exc.errno,
+        )
+    state.check_deadline()
+    if not stat.S_ISDIR(root_stat.st_mode):
+        return _rollout_inspection_failure(
+            root,
+            rollout_root=root,
+            inspection_reason="directory_type_mismatch",
+            detail="Codex rollout root is not a directory",
+            path_stat=root_stat,
+        )
+    try:
+        fd = os.open(root, _rollout_directory_open_flags())
+    except OSError as exc:
+        return _rollout_inspection_failure(
+            root,
+            rollout_root=root,
+            inspection_reason=_rollout_directory_error_reason(
+                exc,
+                "directory_open_failed",
+            ),
+            detail=str(exc),
+            path_stat=root_stat,
+            error_number=exc.errno,
+        )
+    try:
+        result = _validate_opened_rollout_directory(
+            root,
+            fd,
+            root_stat,
+            state,
+            rollout_root=root,
+            parent_fd=None,
+            name=None,
+        )
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+    if isinstance(result, _RolloutInspectionFailure):
+        os.close(fd)
+    return result
+
+
+def _bind_rollout_child_directory(
+    parent: _RolloutDirectoryBinding,
+    name: str,
+    path: pathlib.Path,
+    expected_stat: os.stat_result,
+    state: _DiscoveryScanState,
+) -> _RolloutDirectoryBinding | _RolloutInspectionFailure:
+    state.check_deadline()
+    try:
+        fd = os.open(
+            name,
+            _rollout_directory_open_flags(),
+            dir_fd=parent.fd,
+        )
+    except OSError as exc:
+        return _rollout_inspection_failure(
+            path,
+            rollout_root=parent.rollout_root,
+            inspection_reason=_rollout_directory_error_reason(
+                exc,
+                "directory_open_failed",
+            ),
+            detail=str(exc),
+            path_stat=expected_stat,
+            error_number=exc.errno,
+        )
+    try:
+        result = _validate_opened_rollout_directory(
+            path,
+            fd,
+            expected_stat,
+            state,
+            rollout_root=parent.rollout_root,
+            parent_fd=parent.fd,
+            name=name,
+        )
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+    if isinstance(result, _RolloutInspectionFailure):
+        os.close(fd)
+    return result
+
+
+def _revalidate_rollout_directory(
+    binding: _RolloutDirectoryBinding,
+    state: _DiscoveryScanState,
+) -> _RolloutInspectionFailure | None:
+    state.check_deadline()
+    try:
+        descriptor_stat = os.fstat(binding.fd)
+    except OSError as exc:
+        return _rollout_inspection_failure(
+            binding.path,
+            rollout_root=binding.rollout_root,
+            inspection_reason="directory_descriptor_revalidation_failed",
+            detail=str(exc),
+            error_number=exc.errno,
+        )
+    state.check_deadline()
+    if not stat.S_ISDIR(descriptor_stat.st_mode) or (
+        _rollout_object_identity(descriptor_stat) != binding.object_identity
+    ):
+        return _rollout_inspection_failure(
+            binding.path,
+            rollout_root=binding.rollout_root,
+            inspection_reason="directory_object_changed",
+            detail="held directory descriptor no longer names the bound object",
+            path_stat=descriptor_stat,
+        )
+    if _rollout_access_policy(descriptor_stat) != binding.access_policy:
+        return _rollout_inspection_failure(
+            binding.path,
+            rollout_root=binding.rollout_root,
+            inspection_reason="directory_access_policy_changed",
+            detail="held directory owner, group, or permission mode changed",
+            path_stat=descriptor_stat,
+        )
+    try:
+        if binding.parent_fd is None:
+            linked_stat = os.stat(binding.path, follow_symlinks=False)
+        else:
+            assert binding.name is not None
+            linked_stat = os.stat(
+                binding.name,
+                dir_fd=binding.parent_fd,
+                follow_symlinks=False,
+            )
+    except OSError as exc:
+        return _rollout_inspection_failure(
+            binding.path,
+            rollout_root=binding.rollout_root,
+            inspection_reason=_rollout_directory_error_reason(
+                exc,
+                "directory_path_revalidation_failed",
+            ),
+            detail=str(exc),
+            path_stat=descriptor_stat,
+            error_number=exc.errno,
+        )
+    state.check_deadline()
+    if not stat.S_ISDIR(linked_stat.st_mode) or (
+        _rollout_object_identity(linked_stat) != binding.object_identity
+    ):
+        return _rollout_inspection_failure(
+            binding.path,
+            rollout_root=binding.rollout_root,
+            inspection_reason="directory_replaced",
+            detail="directory path no longer names the bound object",
+            path_stat=descriptor_stat,
+        )
+    if _rollout_access_policy(linked_stat) != binding.access_policy:
+        return _rollout_inspection_failure(
+            binding.path,
+            rollout_root=binding.rollout_root,
+            inspection_reason="directory_access_policy_changed",
+            detail="directory path owner, group, or permission mode changed",
+            path_stat=descriptor_stat,
+        )
+    return None
+
+
+def _revalidate_rollout_directory_chain(
+    frames: list[_RolloutDirectoryFrame],
+    state: _DiscoveryScanState,
+) -> _RolloutInspectionFailure | None:
+    for frame in frames:
+        failure = _revalidate_rollout_directory(frame.binding, state)
+        if failure is not None:
+            return failure
+    return None
+
+
+def _open_rollout_directory_frame(
+    binding: _RolloutDirectoryBinding,
+    state: _DiscoveryScanState,
+) -> _RolloutDirectoryFrame | _RolloutInspectionFailure:
+    state.check_deadline()
+    try:
+        entries = os.scandir(binding.fd)
+    except OSError as exc:
+        return _rollout_inspection_failure(
+            binding.path,
+            rollout_root=binding.rollout_root,
+            inspection_reason=_rollout_directory_error_reason(
+                exc,
+                "directory_scan_failed",
+            ),
+            detail=str(exc),
+            error_number=exc.errno,
+        )
+    except BaseException as exc:
+        try:
+            os.close(binding.fd)
+        except BaseException as cleanup_error:
+            _add_exception_detail(
+                exc,
+                "rollout directory descriptor cleanup failed after "
+                f"scandir interruption: {cleanup_error}",
+            )
+        raise
+    frame = _RolloutDirectoryFrame(binding=binding, entries=entries)
+    try:
+        state.check_deadline()
+    except BaseException as exc:
+        try:
+            _close_rollout_directory_frame(frame)
+        except BaseException as cleanup_error:
+            _add_exception_detail(
+                exc,
+                "rollout directory frame cleanup failed after "
+                f"deadline interruption: {cleanup_error}",
+            )
+        raise
+    return frame
+
+
+def _close_rollout_directory_frame(frame: _RolloutDirectoryFrame) -> None:
+    cleanup_error: BaseException | None = None
+    try:
+        frame.entries.close()
+    except BaseException as exc:
+        cleanup_error = exc
+    try:
+        os.close(frame.binding.fd)
+    except BaseException as exc:
+        if cleanup_error is None:
+            cleanup_error = exc
+        else:
+            _add_exception_detail(
+                cleanup_error,
+                f"rollout directory descriptor cleanup also failed: {exc}",
+            )
+    if cleanup_error is not None:
+        raise cleanup_error
+
+
+def _close_rollout_directory_frames(
+    frames: list[_RolloutDirectoryFrame],
+) -> None:
+    active_error = sys.exc_info()[1]
+    cleanup_error: BaseException | None = None
+    while frames:
+        try:
+            _close_rollout_directory_frame(frames.pop())
+        except BaseException as exc:
+            if cleanup_error is None:
+                cleanup_error = exc
+            else:
+                _add_exception_detail(
+                    cleanup_error,
+                    f"another rollout directory frame cleanup failed: {exc}",
+                )
+    if cleanup_error is None:
+        return
+    if active_error is None:
+        raise cleanup_error
+    _add_exception_detail(
+        active_error,
+        f"rollout directory frame cleanup failed: {cleanup_error}",
+    )
+
+
+def _revalidate_and_close_unframed_rollout_directory(
+    frames: list[_RolloutDirectoryFrame],
+    binding: _RolloutDirectoryBinding,
+    state: _DiscoveryScanState,
+) -> _RolloutInspectionFailure | None:
+    try:
+        failure = _revalidate_rollout_directory_chain(frames, state)
+        if failure is None:
+            failure = _revalidate_rollout_directory(binding, state)
+    except BaseException as exc:
+        try:
+            os.close(binding.fd)
+        except BaseException as cleanup_error:
+            _add_exception_detail(
+                exc,
+                "unframed rollout directory descriptor cleanup failed: "
+                f"{cleanup_error}",
+            )
+        raise
+    os.close(binding.fd)
+    return failure
 
 
 def _iter_rollout_paths(
     root: pathlib.Path,
     state: _DiscoveryScanState,
 ) -> Iterable[_RolloutCandidate | _RolloutInspectionFailure]:
-    state.check_deadline()
-    try:
-        root_stat = os.stat(root)
-    except FileNotFoundError:
-        try:
-            os.lstat(root)
-        except FileNotFoundError:
-            return
-        raise
-    if not stat.S_ISDIR(root_stat.st_mode):
-        raise NotADirectoryError(
-            errno.ENOTDIR,
-            "Codex rollout root is not a directory",
-            str(root),
+    root_result = _bind_rollout_root_directory(root, state)
+    if root_result is None:
+        return
+    if isinstance(root_result, _RolloutInspectionFailure):
+        yield root_result
+        return
+    root_frame = _open_rollout_directory_frame(root_result, state)
+    if isinstance(root_frame, _RolloutInspectionFailure):
+        revalidation_failure = _revalidate_and_close_unframed_rollout_directory(
+            [],
+            root_result,
+            state,
         )
+        yield revalidation_failure or root_frame
+        return
 
-    pending = [root]
-    while pending:
-        state.check_deadline()
-        directory = pending.pop()
-        with os.scandir(directory) as entries:
-            for entry in entries:
-                state.add_scan_entry()
-                is_rollout = entry.name.startswith("rollout-") and entry.name.endswith(
-                    ".jsonl"
+    frames = [root_frame]
+    try:
+        while frames:
+            state.check_deadline()
+            chain_failure = _revalidate_rollout_directory_chain(frames, state)
+            if chain_failure is not None:
+                yield chain_failure
+                return
+            frame = frames[-1]
+            try:
+                entry = next(frame.entries)
+            except StopIteration:
+                final_failure = _revalidate_rollout_directory_chain(frames, state)
+                _close_rollout_directory_frame(frames.pop())
+                if final_failure is not None:
+                    yield final_failure
+                    return
+                continue
+            except OSError as exc:
+                failure = _rollout_inspection_failure(
+                    frame.binding.path,
+                    rollout_root=root,
+                    inspection_reason=_rollout_directory_error_reason(
+                        exc,
+                        "directory_scan_failed",
+                    ),
+                    detail=str(exc),
+                    error_number=exc.errno,
                 )
-                try:
-                    entry_stat = entry.stat(follow_symlinks=False)
-                except OSError as exc:
-                    if is_rollout:
-                        path = pathlib.Path(entry.path)
-                        yield _RolloutInspectionFailure(
-                            path=path,
-                            error=DiscoveryRolloutInspectionError(
-                                inspection_reason="enumeration_revalidation_failed",
-                                path=path,
-                                detail=str(exc),
-                                error_number=exc.errno,
-                            ),
-                        )
-                        continue
-                    if isinstance(exc, FileNotFoundError):
-                        continue
-                    raise
+                chain_failure = _revalidate_rollout_directory_chain(
+                    frames,
+                    state,
+                )
+                _close_rollout_directory_frame(frames.pop())
+                if chain_failure is not None:
+                    yield chain_failure
+                    return
+                yield failure
+                continue
+
+            state.add_scan_entry()
+            path = frame.binding.path / entry.name
+            is_rollout = entry.name.startswith("rollout-") and entry.name.endswith(
+                ".jsonl"
+            )
+            try:
+                entry_stat = entry.stat(follow_symlinks=False)
+            except OSError as exc:
+                chain_failure = _revalidate_rollout_directory_chain(
+                    frames,
+                    state,
+                )
+                if chain_failure is not None:
+                    yield chain_failure
+                    return
                 if is_rollout:
-                    path = pathlib.Path(entry.path)
-                    try:
-                        candidate = _rollout_candidate_from_stat(
-                            path,
-                            entry_stat,
-                        )
-                    except DiscoveryRolloutInspectionError as exc:
-                        yield _RolloutInspectionFailure(path=path, error=exc)
-                    else:
-                        yield candidate
+                    failure = _rollout_inspection_failure(
+                        path,
+                        rollout_root=root,
+                        inspection_reason="enumeration_revalidation_failed",
+                        detail=str(exc),
+                        error_number=exc.errno,
+                    )
+                    yield failure
                     continue
-                if stat.S_ISDIR(entry_stat.st_mode):
-                    pending.append(pathlib.Path(entry.path))
+                if isinstance(exc, FileNotFoundError):
+                    continue
+                yield _rollout_inspection_failure(
+                    path,
+                    rollout_root=root,
+                    inspection_reason="directory_entry_inspection_failed",
+                    detail=str(exc),
+                    error_number=exc.errno,
+                )
+                continue
+
+            if is_rollout:
+                try:
+                    candidate = _rollout_candidate_from_stat(
+                        path,
+                        entry_stat,
+                        rollout_root=root,
+                    )
+                except DiscoveryRolloutInspectionError as exc:
+                    value: _RolloutCandidate | _RolloutInspectionFailure = (
+                        _RolloutInspectionFailure(
+                            path=path,
+                            error=exc,
+                            observed_date=_path_date(path, root),
+                            observed_mtime=entry_stat.st_mtime,
+                        )
+                    )
+                else:
+                    value = candidate
+                chain_failure = _revalidate_rollout_directory_chain(
+                    frames,
+                    state,
+                )
+                if chain_failure is not None:
+                    yield chain_failure
+                    return
+                yield value
+                continue
+
+            if not stat.S_ISDIR(entry_stat.st_mode):
+                continue
+            if len(frames) >= MAX_DISCOVERY_DIRECTORY_DEPTH:
+                raise DiscoveryLimitExceeded(
+                    "rollout directory depth",
+                    MAX_DISCOVERY_DIRECTORY_DEPTH,
+                    len(frames) + 1,
+                )
+            chain_failure = _revalidate_rollout_directory_chain(frames, state)
+            if chain_failure is not None:
+                yield chain_failure
+                return
+            child_result = _bind_rollout_child_directory(
+                frame.binding,
+                entry.name,
+                path,
+                entry_stat,
+                state,
+            )
+            if isinstance(child_result, _RolloutInspectionFailure):
+                chain_failure = _revalidate_rollout_directory_chain(
+                    frames,
+                    state,
+                )
+                if chain_failure is not None:
+                    yield chain_failure
+                    return
+                yield child_result
+                continue
+            child_frame = _open_rollout_directory_frame(child_result, state)
+            if isinstance(child_frame, _RolloutInspectionFailure):
+                revalidation_failure = _revalidate_and_close_unframed_rollout_directory(
+                    frames,
+                    child_result,
+                    state,
+                )
+                if revalidation_failure is not None:
+                    yield revalidation_failure
+                    return
+                yield child_frame
+                continue
+            frames.append(child_frame)
+    finally:
+        _close_rollout_directory_frames(frames)
 
 
 def _open_rollout_candidate(
@@ -8929,10 +9540,16 @@ def _discover_repos(codex_home: pathlib.Path, since_days: int) -> list[dict[str,
                 try:
                     state.check_deadline()
                     if isinstance(rollout_value, _RolloutInspectionFailure):
+                        if _rollout_failure_proven_outside_window(
+                            rollout_value,
+                            cutoff,
+                        ):
+                            continue
                         raise rollout_value.error
                     rollout = _coerce_rollout_candidate(
                         rollout_value,
                         state,
+                        rollout_root=rollout_root,
                     )
                     if not _rollout_in_window(rollout, cutoff):
                         continue

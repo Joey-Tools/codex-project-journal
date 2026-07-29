@@ -10170,12 +10170,13 @@ class ProjectJournalTests(unittest.TestCase):
                 self.assertFalse((self.root / "shared-hooks/post-merge").exists())
                 self.assertFalse((repo / ".git/hooks/post-merge").exists())
 
-    def test_path_date_skips_earlier_non_date_sessions_component(self) -> None:
+    def test_path_date_uses_explicit_sessions_root(self) -> None:
         path = pathlib.Path(
             "/tmp/sessions/.codex/sessions/2026/05/05/rollout-test.jsonl"
         )
+        rollout_root = pathlib.Path("/tmp/sessions/.codex/sessions")
 
-        dated = project_journal._path_date(path)
+        dated = project_journal._path_date(path, rollout_root)
 
         self.assertIsNotNone(dated)
         self.assertEqual(dated.isoformat(), "2026-05-05")
@@ -10184,11 +10185,58 @@ class ProjectJournalTests(unittest.TestCase):
         path = pathlib.Path(
             "/tmp/.codex/archived_sessions/rollout-2026-05-06T12-34-56-abcdef.jsonl"
         )
+        rollout_root = pathlib.Path("/tmp/.codex/archived_sessions")
 
-        dated = project_journal._path_date(path)
+        dated = project_journal._path_date(path, rollout_root)
 
         self.assertIsNotNone(dated)
         self.assertEqual(dated.isoformat(), "2026-05-06")
+
+    def test_rollout_directory_cleanup_attempts_every_bound_resource(self) -> None:
+        first_entries = mock.Mock()
+        second_entries = mock.Mock()
+        second_entries.close.side_effect = OSError(
+            errno.EIO,
+            "injected iterator close failure",
+        )
+        frames = [
+            project_journal._RolloutDirectoryFrame(
+                binding=project_journal._RolloutDirectoryBinding(
+                    rollout_root=pathlib.Path("/sessions"),
+                    path=pathlib.Path("/sessions/first"),
+                    fd=101,
+                    object_identity=(1, 1),
+                    access_policy=(1, 1, 0o700),
+                    parent_fd=None,
+                    name=None,
+                ),
+                entries=first_entries,
+            ),
+            project_journal._RolloutDirectoryFrame(
+                binding=project_journal._RolloutDirectoryBinding(
+                    rollout_root=pathlib.Path("/sessions"),
+                    path=pathlib.Path("/sessions/second"),
+                    fd=202,
+                    object_identity=(2, 2),
+                    access_policy=(2, 2, 0o700),
+                    parent_fd=101,
+                    name="second",
+                ),
+                entries=second_entries,
+            ),
+        ]
+
+        with mock.patch.object(project_journal.os, "close") as close:
+            with self.assertRaisesRegex(OSError, "iterator close failure"):
+                project_journal._close_rollout_directory_frames(frames)
+
+        self.assertEqual(frames, [])
+        first_entries.close.assert_called_once_with()
+        second_entries.close.assert_called_once_with()
+        self.assertEqual(
+            close.call_args_list,
+            [mock.call(202), mock.call(101)],
+        )
 
     def test_discover_repos_reads_archive_without_active_sessions(self) -> None:
         repo = self.init_repo()
@@ -10451,15 +10499,23 @@ class ProjectJournalTests(unittest.TestCase):
             str(disappearing),
         )
         target_scandir = mock.MagicMock()
-        target_scandir.__enter__.return_value = iter([healthy_entry, vanishing_entry])
-        target_scandir.__exit__.return_value = False
+        target_scandir.__next__.side_effect = [
+            healthy_entry,
+            vanishing_entry,
+            StopIteration,
+        ]
+        rollout_dir_identity = project_journal._rollout_object_identity(
+            rollout_dir.stat()
+        )
 
         def inject_enumeration_race(
             path: int | os.PathLike[str] | str,
         ) -> object:
-            if not isinstance(path, int) and pathlib.Path(path) == rollout_dir:
-                disappearing.unlink()
-                return target_scandir
+            if isinstance(path, int):
+                identity = project_journal._rollout_object_identity(os.fstat(path))
+                if identity == rollout_dir_identity:
+                    disappearing.unlink()
+                    return target_scandir
             return actual_scandir(path)
 
         with mock.patch.object(
@@ -10488,6 +10544,453 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertEqual(coverage["errno"], errno.ENOENT)
         self.assertEqual(pathlib.Path(coverage["source"]), disappearing)
         vanishing_entry.stat.assert_called_once_with(follow_symlinks=False)
+
+    def test_discover_repos_skips_proven_old_non_regular_rollout_candidates(
+        self,
+    ) -> None:
+        repo = self.init_repo("healthy-repo-after-old-candidates")
+        codex_home = self.root / "codex-home-old-candidates"
+        old_dir = codex_home / "sessions/2000/01/01"
+        old_dir.mkdir(parents=True)
+        symlink_target = old_dir / "target"
+        symlink_target.write_bytes(b'{"event":"target"}\n')
+        (old_dir / "rollout-old-symlink.jsonl").symlink_to(symlink_target)
+        os.mkfifo(old_dir / "rollout-old-fifo.jsonl")
+        (old_dir / "rollout-old-directory.jsonl").mkdir()
+
+        undated_dir = codex_home / "sessions/undated"
+        undated_dir.mkdir(parents=True)
+        old_mtime_fifo = undated_dir / "rollout-old-mtime.jsonl"
+        os.mkfifo(old_mtime_fifo)
+        os.utime(old_mtime_fifo, (0, 0))
+
+        archive = codex_home / "archived_sessions"
+        archive.mkdir(parents=True)
+        (archive / "rollout-2099-01-01T00-00-00-healthy.jsonl").write_text(
+            json.dumps({"payload": {"cwd": str(repo)}}) + "\n",
+            encoding="utf-8",
+        )
+
+        rows = project_journal._discover_repos(codex_home, 30)
+
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertTrue(os.path.samefile(row["repo"], repo))
+        self.assertEqual(row["rollout_count"], 1)
+        self.assertEqual(row["coverage_status"], "complete")
+
+    def test_discover_repos_old_failures_do_not_exhaust_error_budget(
+        self,
+    ) -> None:
+        repo = self.init_repo("healthy-repo-after-old-error-budget")
+        codex_home = self.root / "codex-home-old-error-budget"
+        archive = codex_home / "archived_sessions"
+        archive.mkdir(parents=True)
+        (archive / "rollout-2099-01-01T00-00-00-healthy.jsonl").write_text(
+            json.dumps({"payload": {"cwd": str(repo)}}) + "\n",
+            encoding="utf-8",
+        )
+        original_iterator = project_journal._iter_rollout_paths
+
+        def inject_old_failures(
+            root: pathlib.Path,
+            state: project_journal._DiscoveryScanState,
+        ) -> object:
+            if root == codex_home / "sessions":
+                for index in range(project_journal.MAX_DISCOVERY_ERRORS + 1):
+                    path = root / "2000/01/01" / f"rollout-missing-{index:02d}.jsonl"
+                    yield project_journal._rollout_inspection_failure(
+                        path,
+                        rollout_root=root,
+                        inspection_reason="enumeration_revalidation_failed",
+                        detail="injected old missing rollout",
+                        error_number=errno.ENOENT,
+                    )
+            yield from original_iterator(root, state)
+
+        with mock.patch.object(
+            project_journal,
+            "_iter_rollout_paths",
+            side_effect=inject_old_failures,
+        ):
+            rows = project_journal._discover_repos(codex_home, 30)
+
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertTrue(os.path.samefile(row["repo"], repo))
+        self.assertEqual(row["rollout_count"], 1)
+        self.assertEqual(row["coverage_status"], "complete")
+
+    def test_discover_repos_keeps_window_uncertain_failure_partial(self) -> None:
+        repo = self.init_repo("healthy-repo-with-uncertain-failure")
+        codex_home = self.root / "codex-home-window-uncertain"
+        archive = codex_home / "archived_sessions"
+        archive.mkdir(parents=True)
+        (archive / "rollout-2099-01-01T00-00-00-healthy.jsonl").write_text(
+            json.dumps({"payload": {"cwd": str(repo)}}) + "\n",
+            encoding="utf-8",
+        )
+        original_iterator = project_journal._iter_rollout_paths
+
+        def inject_uncertain_failure(
+            root: pathlib.Path,
+            state: project_journal._DiscoveryScanState,
+        ) -> object:
+            if root == codex_home / "sessions":
+                yield project_journal._rollout_inspection_failure(
+                    root / "unknown/rollout-missing.jsonl",
+                    rollout_root=root,
+                    inspection_reason="enumeration_revalidation_failed",
+                    detail="injected window-uncertain rollout",
+                    error_number=errno.ENOENT,
+                )
+            yield from original_iterator(root, state)
+
+        with mock.patch.object(
+            project_journal,
+            "_iter_rollout_paths",
+            side_effect=inject_uncertain_failure,
+        ):
+            rows = project_journal._discover_repos(codex_home, 30)
+
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertTrue(os.path.samefile(row["repo"], repo))
+        self.assertEqual(row["coverage_status"], "partial")
+        coverage = row["discovery_error"]["discovery_coverage"]
+        self.assertEqual(
+            coverage["inspection_reason"],
+            "enumeration_revalidation_failed",
+        )
+        self.assertEqual(
+            pathlib.Path(coverage["source"]).name,
+            "rollout-missing.jsonl",
+        )
+
+    def test_discover_repos_does_not_trust_dated_ancestor_outside_rollout_root(
+        self,
+    ) -> None:
+        repo = self.init_repo("healthy-repo-with-dated-ancestor")
+        codex_home = self.root / "sessions/2000/01/01/nested-codex-home"
+        archive = codex_home / "archived_sessions"
+        archive.mkdir(parents=True)
+        (archive / "rollout-2099-01-01T00-00-00-healthy.jsonl").write_text(
+            json.dumps({"payload": {"cwd": str(repo)}}) + "\n",
+            encoding="utf-8",
+        )
+        original_iterator = project_journal._iter_rollout_paths
+
+        def inject_uncertain_failure(
+            root: pathlib.Path,
+            state: project_journal._DiscoveryScanState,
+        ) -> object:
+            if root == codex_home / "sessions":
+                yield project_journal._rollout_inspection_failure(
+                    root / "unknown/rollout-missing.jsonl",
+                    rollout_root=root,
+                    inspection_reason="enumeration_revalidation_failed",
+                    detail="injected failure below a dated external ancestor",
+                    error_number=errno.ENOENT,
+                )
+            yield from original_iterator(root, state)
+
+        with mock.patch.object(
+            project_journal,
+            "_iter_rollout_paths",
+            side_effect=inject_uncertain_failure,
+        ):
+            rows = project_journal._discover_repos(codex_home, 30)
+
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertTrue(os.path.samefile(row["repo"], repo))
+        self.assertEqual(row["coverage_status"], "partial")
+        coverage = row["discovery_error"]["discovery_coverage"]
+        self.assertEqual(
+            coverage["inspection_reason"],
+            "enumeration_revalidation_failed",
+        )
+        self.assertEqual(
+            pathlib.Path(coverage["source"]).name,
+            "rollout-missing.jsonl",
+        )
+
+    def test_discover_repos_detects_bound_directory_replacement(self) -> None:
+        healthy_repo = self.init_repo("healthy-repo-after-directory-replacement")
+        replacement_repo = self.init_repo("replacement-tree-repo")
+        codex_home = self.root / "codex-home-directory-replacement"
+        target = codex_home / "sessions/2099/01/01"
+        target.mkdir(parents=True)
+        (target / "rollout-original.jsonl").write_text(
+            json.dumps({"payload": {"cwd": str(replacement_repo)}}) + "\n",
+            encoding="utf-8",
+        )
+        archive = codex_home / "archived_sessions"
+        archive.mkdir(parents=True)
+        (archive / "rollout-2099-01-02T00-00-00-healthy.jsonl").write_text(
+            json.dumps({"payload": {"cwd": str(healthy_repo)}}) + "\n",
+            encoding="utf-8",
+        )
+        actual_open_frame = project_journal._open_rollout_directory_frame
+        replaced = False
+
+        def replace_after_binding(
+            binding: project_journal._RolloutDirectoryBinding,
+            state: project_journal._DiscoveryScanState,
+        ) -> object:
+            nonlocal replaced
+            if binding.path == target and not replaced:
+                replaced = True
+                detached = codex_home / "detached-day"
+                target.rename(detached)
+                target.mkdir()
+                (target / "rollout-substituted.jsonl").write_text(
+                    json.dumps({"payload": {"cwd": str(replacement_repo)}}) + "\n",
+                    encoding="utf-8",
+                )
+            return actual_open_frame(binding, state)
+
+        with mock.patch.object(
+            project_journal,
+            "_open_rollout_directory_frame",
+            side_effect=replace_after_binding,
+        ):
+            rows = project_journal._discover_repos(codex_home, 30)
+
+        self.assertTrue(replaced)
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertTrue(os.path.samefile(row["repo"], healthy_repo))
+        self.assertEqual(row["coverage_status"], "partial")
+        coverage = row["discovery_error"]["discovery_coverage"]
+        self.assertEqual(coverage["inspection_reason"], "directory_replaced")
+        self.assertEqual(pathlib.Path(coverage["source"]), target)
+
+    def test_discover_repos_revalidates_ancestors_before_scan_error_handoff(
+        self,
+    ) -> None:
+        healthy_repo = self.init_repo("healthy-repo-after-ancestor-race")
+        untrusted_repo = self.init_repo("untrusted-repo-after-ancestor-race")
+        codex_home = self.root / "codex-home-ancestor-scan-race"
+        year = codex_home / "sessions/2099"
+        target = year / "01/01"
+        target.mkdir(parents=True)
+        (target / "rollout-untrusted.jsonl").write_text(
+            json.dumps({"payload": {"cwd": str(untrusted_repo)}}) + "\n",
+            encoding="utf-8",
+        )
+        archive = codex_home / "archived_sessions"
+        archive.mkdir(parents=True)
+        (archive / "rollout-2099-01-02T00-00-00-healthy.jsonl").write_text(
+            json.dumps({"payload": {"cwd": str(healthy_repo)}}) + "\n",
+            encoding="utf-8",
+        )
+        target_identity = project_journal._rollout_object_identity(target.stat())
+        actual_scandir = project_journal.os.scandir
+        target_scandir = mock.MagicMock()
+        mutated = False
+
+        def replace_ancestor_and_fail() -> object:
+            nonlocal mutated
+            mutated = True
+            detached = codex_home / "detached-year"
+            year.rename(detached)
+            year.mkdir()
+            raise OSError(errno.EIO, "injected directory scan failure")
+
+        target_scandir.__next__.side_effect = replace_ancestor_and_fail
+
+        def inject_scan_failure(
+            path: int | os.PathLike[str] | str,
+        ) -> object:
+            if isinstance(path, int):
+                identity = project_journal._rollout_object_identity(os.fstat(path))
+                if identity == target_identity:
+                    return target_scandir
+            return actual_scandir(path)
+
+        with mock.patch.object(
+            project_journal.os,
+            "scandir",
+            side_effect=inject_scan_failure,
+        ):
+            rows = project_journal._discover_repos(codex_home, 30)
+
+        self.assertTrue(mutated)
+        target_scandir.close.assert_called_once_with()
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertTrue(os.path.samefile(row["repo"], healthy_repo))
+        self.assertEqual(row["coverage_status"], "partial")
+        coverage = row["discovery_error"]["discovery_coverage"]
+        self.assertEqual(coverage["inspection_reason"], "directory_replaced")
+        self.assertEqual(pathlib.Path(coverage["source"]), year)
+
+    def test_discover_repos_detects_bound_directory_access_policy_change(
+        self,
+    ) -> None:
+        healthy_repo = self.init_repo("healthy-repo-after-directory-chmod")
+        codex_home = self.root / "codex-home-directory-chmod"
+        target = codex_home / "sessions/2099/01/01"
+        target.mkdir(parents=True)
+        (target / "rollout-untrusted.jsonl").write_text(
+            json.dumps({"payload": {"cwd": str(healthy_repo)}}) + "\n",
+            encoding="utf-8",
+        )
+        archive = codex_home / "archived_sessions"
+        archive.mkdir(parents=True)
+        (archive / "rollout-2099-01-02T00-00-00-healthy.jsonl").write_text(
+            json.dumps({"payload": {"cwd": str(healthy_repo)}}) + "\n",
+            encoding="utf-8",
+        )
+        actual_open_frame = project_journal._open_rollout_directory_frame
+        changed = False
+
+        def chmod_after_binding(
+            binding: project_journal._RolloutDirectoryBinding,
+            state: project_journal._DiscoveryScanState,
+        ) -> object:
+            nonlocal changed
+            if binding.path == target and not changed:
+                changed = True
+                target.chmod(0o700)
+            return actual_open_frame(binding, state)
+
+        with mock.patch.object(
+            project_journal,
+            "_open_rollout_directory_frame",
+            side_effect=chmod_after_binding,
+        ):
+            rows = project_journal._discover_repos(codex_home, 30)
+
+        self.assertTrue(changed)
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertTrue(os.path.samefile(row["repo"], healthy_repo))
+        self.assertEqual(row["coverage_status"], "partial")
+        coverage = row["discovery_error"]["discovery_coverage"]
+        self.assertEqual(
+            coverage["inspection_reason"],
+            "directory_access_policy_changed",
+        )
+        self.assertEqual(pathlib.Path(coverage["source"]), target)
+
+    def test_discover_repos_distinguishes_missing_and_symlink_directory_races(
+        self,
+    ) -> None:
+        actual_open = project_journal.os.open
+        for mutation, expected_reason in (
+            ("missing", "directory_missing"),
+            ("symlink", "directory_replaced"),
+        ):
+            with self.subTest(mutation=mutation):
+                healthy_repo = self.init_repo(f"healthy-repo-{mutation}")
+                replacement_repo = self.init_repo(f"replacement-repo-{mutation}")
+                codex_home = self.root / f"codex-home-directory-{mutation}"
+                sessions = codex_home / "sessions"
+                year = sessions / "2099"
+                rollout_dir = year / "01/01"
+                rollout_dir.mkdir(parents=True)
+                (rollout_dir / "rollout-untrusted.jsonl").write_text(
+                    json.dumps({"payload": {"cwd": str(replacement_repo)}}) + "\n",
+                    encoding="utf-8",
+                )
+                archive = codex_home / "archived_sessions"
+                archive.mkdir(parents=True)
+                (archive / "rollout-2099-01-02T00-00-00-healthy.jsonl").write_text(
+                    json.dumps({"payload": {"cwd": str(healthy_repo)}}) + "\n",
+                    encoding="utf-8",
+                )
+                sessions_identity = project_journal._rollout_object_identity(
+                    sessions.stat()
+                )
+                mutated = False
+
+                def replace_before_directory_open(
+                    path: os.PathLike[str] | str,
+                    flags: int,
+                    mode: int = 0o777,
+                    *,
+                    dir_fd: int | None = None,
+                ) -> int:
+                    nonlocal mutated
+                    if (
+                        not mutated
+                        and dir_fd is not None
+                        and os.fspath(path) == year.name
+                        and project_journal._rollout_object_identity(os.fstat(dir_fd))
+                        == sessions_identity
+                    ):
+                        mutated = True
+                        detached = codex_home / f"detached-year-{mutation}"
+                        year.rename(detached)
+                        if mutation == "symlink":
+                            year.symlink_to(detached, target_is_directory=True)
+                    return actual_open(
+                        path,
+                        flags,
+                        mode,
+                        dir_fd=dir_fd,
+                    )
+
+                with mock.patch.object(
+                    project_journal.os,
+                    "open",
+                    side_effect=replace_before_directory_open,
+                ):
+                    rows = project_journal._discover_repos(codex_home, 30)
+
+                self.assertTrue(mutated)
+                self.assertEqual(len(rows), 1)
+                row = rows[0]
+                self.assertTrue(os.path.samefile(row["repo"], healthy_repo))
+                self.assertEqual(row["coverage_status"], "partial")
+                coverage = row["discovery_error"]["discovery_coverage"]
+                self.assertEqual(
+                    coverage["inspection_reason"],
+                    expected_reason,
+                )
+                self.assertEqual(pathlib.Path(coverage["source"]), year)
+
+    def test_discover_repos_allows_directory_timestamp_and_child_churn(
+        self,
+    ) -> None:
+        repo = self.init_repo("healthy-repo-directory-churn")
+        codex_home = self.root / "codex-home-directory-churn"
+        target = codex_home / "sessions/2099/01/01"
+        target.mkdir(parents=True)
+        (target / "rollout-healthy.jsonl").write_text(
+            json.dumps({"payload": {"cwd": str(repo)}}) + "\n",
+            encoding="utf-8",
+        )
+        actual_revalidate = project_journal._revalidate_rollout_directory
+        churned = False
+
+        def add_benign_churn(
+            binding: project_journal._RolloutDirectoryBinding,
+            state: project_journal._DiscoveryScanState,
+        ) -> object:
+            nonlocal churned
+            if binding.path == target and not churned:
+                churned = True
+                os.utime(target, None)
+                transient = target / "transient-entry"
+                transient.write_bytes(b"transient")
+                transient.unlink()
+            return actual_revalidate(binding, state)
+
+        with mock.patch.object(
+            project_journal,
+            "_revalidate_rollout_directory",
+            side_effect=add_benign_churn,
+        ):
+            rows = project_journal._discover_repos(codex_home, 30)
+
+        self.assertTrue(churned)
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertTrue(os.path.samefile(row["repo"], repo))
+        self.assertEqual(row["coverage_status"], "complete")
 
     def test_discover_repos_rejects_fifo_and_symlink_rollout_replacement(
         self,
