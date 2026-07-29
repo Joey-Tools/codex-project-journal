@@ -323,6 +323,7 @@ class DiscoveryRolloutInspectionError(UserError):
     ) -> None:
         self.inspection_reason = inspection_reason
         self.detail = detail[:MAX_DISCOVERY_ERROR_DETAIL_CHARS]
+        self.cleanup_errors: list[dict[str, Any]] = []
         if error_number is not None:
             self.errno = error_number
         super().__init__(
@@ -3859,9 +3860,16 @@ def _capture_bounded_process_with_launch(
                 detail_suffix = (
                     f"; bounded child stderr: {child_detail}" if child_detail else ""
                 )
+                reported_returncode: int | str
+                if isinstance(process.returncode, int):
+                    reported_returncode = process.returncode
+                elif isinstance(observed_returncode, int):
+                    reported_returncode = observed_returncode
+                else:
+                    reported_returncode = "unknown"
                 raise UserError(
                     f"{operation} cleanup-incomplete after exit "
-                    f"{observed_returncode}: {cleanup_error}{detail_suffix}"
+                    f"{reported_returncode}: {cleanup_error}{detail_suffix}"
                 )
             ownership.release()
             if not isinstance(process.returncode, int):
@@ -7524,6 +7532,77 @@ class _RolloutDirectoryFrame:
     entries: Any
 
 
+def _record_rollout_cleanup_error(
+    failure: _RolloutInspectionFailure,
+    *,
+    context: str,
+    cleanup_error: BaseException,
+) -> None:
+    message = str(cleanup_error).replace("\0", "\\0")
+    if len(message) > MAX_DISCOVERY_ERROR_DETAIL_CHARS:
+        message = message[:MAX_DISCOVERY_ERROR_DETAIL_CHARS] + "…[truncated]"
+    evidence: dict[str, Any] = {
+        "context": context,
+        "message": message,
+    }
+    error_number = getattr(cleanup_error, "errno", None)
+    if isinstance(error_number, int):
+        evidence["errno"] = error_number
+        error_name = errno.errorcode.get(error_number)
+        if error_name is not None:
+            evidence["error_name"] = error_name
+    cleanup_notes = [
+        _bounded_signal_report_detail(note)
+        for note in getattr(cleanup_error, "__notes__", ())
+        if isinstance(note, str)
+    ][:MAX_DEFERRED_SIGNAL_REPORT_DETAILS]
+    if cleanup_notes:
+        evidence["details"] = cleanup_notes
+    if len(failure.error.cleanup_errors) < MAX_DEFERRED_SIGNAL_REPORT_DETAILS:
+        failure.error.cleanup_errors.append(evidence)
+    _add_exception_details(
+        failure.error,
+        (
+            f"{context}: {message}",
+            *(f"{context}: {note}" for note in cleanup_notes),
+        ),
+    )
+
+
+def _inherit_rollout_cleanup_errors(
+    primary: _RolloutInspectionFailure,
+    superseded: _RolloutInspectionFailure,
+) -> None:
+    for cleanup_error in superseded.error.cleanup_errors:
+        if len(primary.error.cleanup_errors) >= MAX_DEFERRED_SIGNAL_REPORT_DETAILS:
+            break
+        inherited = dict(cleanup_error)
+        details = inherited.get("details")
+        if isinstance(details, list):
+            inherited["details"] = list(details)
+        primary.error.cleanup_errors.append(inherited)
+    _add_exception_details(
+        primary.error,
+        getattr(superseded.error, "__notes__", ()),
+    )
+
+
+def _close_rollout_directory_fd_preserving_failure(
+    fd: int,
+    failure: _RolloutInspectionFailure,
+    *,
+    context: str,
+) -> None:
+    try:
+        os.close(fd)
+    except BaseException as cleanup_error:
+        _record_rollout_cleanup_error(
+            failure,
+            context=context,
+            cleanup_error=cleanup_error,
+        )
+
+
 def _rollout_object_identity(value: os.stat_result) -> tuple[int, int]:
     return value.st_dev, value.st_ino
 
@@ -7928,14 +8007,22 @@ def _bind_rollout_root_directory(
             parent_fd=None,
             name=None,
         )
-    except BaseException:
+    except BaseException as exc:
         try:
             os.close(fd)
-        except OSError:
-            pass
+        except BaseException as cleanup_error:
+            _add_exception_detail(
+                exc,
+                "rollout root directory descriptor cleanup failed after "
+                f"binding interruption: {cleanup_error}",
+            )
         raise
     if isinstance(result, _RolloutInspectionFailure):
-        os.close(fd)
+        _close_rollout_directory_fd_preserving_failure(
+            fd,
+            result,
+            context="rollout root directory descriptor cleanup after binding failure",
+        )
     return result
 
 
@@ -7975,14 +8062,22 @@ def _bind_rollout_child_directory(
             parent_fd=parent.fd,
             name=name,
         )
-    except BaseException:
+    except BaseException as exc:
         try:
             os.close(fd)
-        except OSError:
-            pass
+        except BaseException as cleanup_error:
+            _add_exception_detail(
+                exc,
+                "rollout child directory descriptor cleanup failed after "
+                f"binding interruption: {cleanup_error}",
+            )
         raise
     if isinstance(result, _RolloutInspectionFailure):
-        os.close(fd)
+        _close_rollout_directory_fd_preserving_failure(
+            fd,
+            result,
+            context="rollout child directory descriptor cleanup after binding failure",
+        )
     return result
 
 
@@ -8165,11 +8260,44 @@ def _close_rollout_directory_frames(
     )
 
 
+def _close_rollout_directory_frame_preserving_failure(
+    frame: _RolloutDirectoryFrame,
+    failure: _RolloutInspectionFailure,
+    *,
+    context: str,
+) -> None:
+    try:
+        _close_rollout_directory_frame(frame)
+    except BaseException as cleanup_error:
+        _record_rollout_cleanup_error(
+            failure,
+            context=context,
+            cleanup_error=cleanup_error,
+        )
+
+
+def _close_rollout_directory_frames_preserving_failure(
+    frames: list[_RolloutDirectoryFrame],
+    failure: _RolloutInspectionFailure,
+    *,
+    context: str,
+) -> None:
+    while frames:
+        frame = frames.pop()
+        _close_rollout_directory_frame_preserving_failure(
+            frame,
+            failure,
+            context=f"{context}: {frame.binding.path}",
+        )
+
+
 def _revalidate_and_close_unframed_rollout_directory(
     frames: list[_RolloutDirectoryFrame],
     binding: _RolloutDirectoryBinding,
     state: _DiscoveryScanState,
-) -> _RolloutInspectionFailure | None:
+    *,
+    fallback_failure: _RolloutInspectionFailure,
+) -> _RolloutInspectionFailure:
     try:
         failure = _revalidate_rollout_directory_chain(frames, state)
         if failure is None:
@@ -8184,8 +8312,16 @@ def _revalidate_and_close_unframed_rollout_directory(
                 f"{cleanup_error}",
             )
         raise
-    os.close(binding.fd)
-    return failure
+    primary_failure = failure or fallback_failure
+    _close_rollout_directory_fd_preserving_failure(
+        binding.fd,
+        primary_failure,
+        context=(
+            "unframed rollout directory descriptor cleanup after "
+            f"{primary_failure.error.inspection_reason}"
+        ),
+    )
+    return primary_failure
 
 
 def _iter_rollout_paths(
@@ -8200,12 +8336,13 @@ def _iter_rollout_paths(
         return
     root_frame = _open_rollout_directory_frame(root_result, state)
     if isinstance(root_frame, _RolloutInspectionFailure):
-        revalidation_failure = _revalidate_and_close_unframed_rollout_directory(
+        failure = _revalidate_and_close_unframed_rollout_directory(
             [],
             root_result,
             state,
+            fallback_failure=root_frame,
         )
-        yield revalidation_failure or root_frame
+        yield failure
         return
 
     frames = [root_frame]
@@ -8214,6 +8351,11 @@ def _iter_rollout_paths(
             state.check_deadline()
             chain_failure = _revalidate_rollout_directory_chain(frames, state)
             if chain_failure is not None:
+                _close_rollout_directory_frames_preserving_failure(
+                    frames,
+                    chain_failure,
+                    context="rollout directory cleanup after chain revalidation failure",
+                )
                 yield chain_failure
                 return
             frame = frames[-1]
@@ -8221,10 +8363,18 @@ def _iter_rollout_paths(
                 entry = next(frame.entries)
             except StopIteration:
                 final_failure = _revalidate_rollout_directory_chain(frames, state)
-                _close_rollout_directory_frame(frames.pop())
                 if final_failure is not None:
+                    _close_rollout_directory_frames_preserving_failure(
+                        frames,
+                        final_failure,
+                        context=(
+                            "rollout directory cleanup after final "
+                            "chain revalidation failure"
+                        ),
+                    )
                     yield final_failure
                     return
+                _close_rollout_directory_frame(frames.pop())
                 continue
             except OSError as exc:
                 failure = _rollout_inspection_failure(
@@ -8241,10 +8391,22 @@ def _iter_rollout_paths(
                     frames,
                     state,
                 )
-                _close_rollout_directory_frame(frames.pop())
                 if chain_failure is not None:
+                    _close_rollout_directory_frames_preserving_failure(
+                        frames,
+                        chain_failure,
+                        context=(
+                            "rollout directory cleanup after scan and "
+                            "chain revalidation failure"
+                        ),
+                    )
                     yield chain_failure
                     return
+                _close_rollout_directory_frame_preserving_failure(
+                    frames.pop(),
+                    failure,
+                    context="rollout directory frame cleanup after scan failure",
+                )
                 yield failure
                 continue
 
@@ -8261,6 +8423,14 @@ def _iter_rollout_paths(
                     state,
                 )
                 if chain_failure is not None:
+                    _close_rollout_directory_frames_preserving_failure(
+                        frames,
+                        chain_failure,
+                        context=(
+                            "rollout directory cleanup after entry-stat "
+                            "chain revalidation failure"
+                        ),
+                    )
                     yield chain_failure
                     return
                 if is_rollout:
@@ -8307,6 +8477,14 @@ def _iter_rollout_paths(
                     state,
                 )
                 if chain_failure is not None:
+                    _close_rollout_directory_frames_preserving_failure(
+                        frames,
+                        chain_failure,
+                        context=(
+                            "rollout directory cleanup after candidate "
+                            "chain revalidation failure"
+                        ),
+                    )
                     yield chain_failure
                     return
                 yield value
@@ -8322,6 +8500,13 @@ def _iter_rollout_paths(
                 )
             chain_failure = _revalidate_rollout_directory_chain(frames, state)
             if chain_failure is not None:
+                _close_rollout_directory_frames_preserving_failure(
+                    frames,
+                    chain_failure,
+                    context=(
+                        "rollout directory cleanup before child-directory binding"
+                    ),
+                )
                 yield chain_failure
                 return
             child_result = _bind_rollout_child_directory(
@@ -8337,21 +8522,42 @@ def _iter_rollout_paths(
                     state,
                 )
                 if chain_failure is not None:
+                    _inherit_rollout_cleanup_errors(
+                        chain_failure,
+                        child_result,
+                    )
+                    _close_rollout_directory_frames_preserving_failure(
+                        frames,
+                        chain_failure,
+                        context=(
+                            "rollout directory cleanup after child-binding "
+                            "chain revalidation failure"
+                        ),
+                    )
                     yield chain_failure
                     return
                 yield child_result
                 continue
             child_frame = _open_rollout_directory_frame(child_result, state)
             if isinstance(child_frame, _RolloutInspectionFailure):
-                revalidation_failure = _revalidate_and_close_unframed_rollout_directory(
+                failure = _revalidate_and_close_unframed_rollout_directory(
                     frames,
                     child_result,
                     state,
+                    fallback_failure=child_frame,
                 )
-                if revalidation_failure is not None:
-                    yield revalidation_failure
+                if failure is not child_frame:
+                    _close_rollout_directory_frames_preserving_failure(
+                        frames,
+                        failure,
+                        context=(
+                            "rollout directory cleanup after unframed-child "
+                            "revalidation failure"
+                        ),
+                    )
+                    yield failure
                     return
-                yield child_frame
+                yield failure
                 continue
             frames.append(child_frame)
     finally:
@@ -9416,6 +9622,10 @@ def _discovery_coverage_error(
         )
     elif isinstance(exc, DiscoveryRolloutInspectionError):
         error["inspection_reason"] = exc.inspection_reason
+        if exc.cleanup_errors:
+            error["cleanup_errors"] = [
+                dict(cleanup_error) for cleanup_error in exc.cleanup_errors
+            ]
     elif isinstance(exc, DiscoveryCwdValidationError):
         error["validation_reason"] = exc.validation_reason
     error.update(state.coverage_counters())

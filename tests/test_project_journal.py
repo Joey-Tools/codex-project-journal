@@ -903,7 +903,19 @@ class ProjectJournalTests(unittest.TestCase):
     def test_native_git_launch_preserves_source_argv0_for_runtime_prefix(
         self,
     ) -> None:
-        source = pathlib.Path(sys.executable).resolve()
+        installed_runtime = project_journal._require_git_runtime()
+        source = installed_runtime.source_executable
+        git_env = project_journal._git_environment()
+        expected = subprocess.run(
+            [str(source), "--exec-path"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=git_env,
+            timeout=2,
+        )
+        self.assertEqual(expected.returncode, 0, expected.stderr)
+        self.assertTrue(expected.stdout.strip())
         (
             snapshot,
             digest,
@@ -923,7 +935,7 @@ class ProjectJournalTests(unittest.TestCase):
             executable=snapshot,
             source_executable=source,
             launcher_kind=launcher_kind,
-            version=(2, 45, 1),
+            version=installed_runtime.version,
             digest=digest,
             file_identity=snapshot_identity,
             directory_identity=directory_identity,
@@ -934,15 +946,9 @@ class ProjectJournalTests(unittest.TestCase):
             result = project_journal._capture_bounded_process(
                 [
                     str(runtime.executable),
-                    "-I",
-                    "-S",
-                    "-c",
-                    "import sys; print(sys.executable)",
+                    "--exec-path",
                 ],
-                env={
-                    "PATH": os.environ.get("PATH", ""),
-                    "PYTHONDONTWRITEBYTECODE": "1",
-                },
+                env=git_env,
                 verified_runtime=runtime,
                 timeout_seconds=2,
                 stdout_limit=4096,
@@ -958,8 +964,8 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.args[0], str(source))
         self.assertEqual(
-            result.stdout.decode("utf-8").strip(),
-            str(source),
+            result.stdout.strip(),
+            expected.stdout.strip(),
         )
 
     def test_git_gate_executes_bound_snapshot_after_source_replacement_and_rewrite(
@@ -4833,7 +4839,12 @@ class ProjectJournalTests(unittest.TestCase):
         parser.parse_args.return_value = mock.Mock(func=fail_command)
         stderr = io.StringIO()
         try:
-            with mock.patch.object(project_journal.UserError, "add_note", None):
+            with mock.patch.object(
+                project_journal.UserError,
+                "add_note",
+                None,
+                create=True,
+            ):
                 with mock.patch.object(
                     project_journal,
                     "_load_posix_signal_runtime",
@@ -6320,8 +6331,7 @@ class ProjectJournalTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(
                 project_journal.UserError,
-                "cleanup-incomplete(?: after exit 0)?: "
-                ".*simulated unreaped process group",
+                "cleanup-incomplete after exit 0: .*simulated unreaped process group",
             ):
                 self.capture_process(
                     [sys.executable, "-c", "import os; os.write(1, b'incomplete')"],
@@ -10238,6 +10248,252 @@ class ProjectJournalTests(unittest.TestCase):
             [mock.call(202), mock.call(101)],
         )
 
+    def test_rollout_directory_frame_cleanup_is_secondary_to_inspection_failure(
+        self,
+    ) -> None:
+        entries = mock.Mock()
+        entries.close.side_effect = OSError(
+            errno.EIO,
+            "injected iterator close failure",
+        )
+        frame = project_journal._RolloutDirectoryFrame(
+            binding=project_journal._RolloutDirectoryBinding(
+                rollout_root=pathlib.Path("/sessions"),
+                path=pathlib.Path("/sessions/2099"),
+                fd=303,
+                object_identity=(3, 3),
+                access_policy=(3, 3, 0o700),
+                parent_fd=None,
+                name=None,
+            ),
+            entries=entries,
+        )
+        failure = project_journal._rollout_inspection_failure(
+            frame.binding.path,
+            rollout_root=frame.binding.rollout_root,
+            inspection_reason="directory_replaced",
+            detail="injected primary replacement",
+        )
+
+        with mock.patch.object(
+            project_journal.os,
+            "close",
+            side_effect=OSError(
+                errno.EBADF,
+                "injected descriptor close failure",
+            ),
+        ):
+            project_journal._close_rollout_directory_frame_preserving_failure(
+                frame,
+                failure,
+                context="injected frame cleanup",
+            )
+
+        self.assertEqual(failure.error.inspection_reason, "directory_replaced")
+        self.assertEqual(len(failure.error.cleanup_errors), 1)
+        cleanup = failure.error.cleanup_errors[0]
+        self.assertEqual(cleanup["context"], "injected frame cleanup")
+        self.assertEqual(cleanup["errno"], errno.EIO)
+        self.assertIn("iterator close failure", cleanup["message"])
+        self.assertIn("descriptor cleanup also failed", cleanup["details"][0])
+        self.assertTrue(
+            any(
+                "injected frame cleanup" in note
+                for note in getattr(failure.error, "__notes__", ())
+            )
+        )
+
+    def test_rollout_directory_binding_cleanup_preserves_structured_failure(
+        self,
+    ) -> None:
+        root = self.root / "sessions"
+        expected_stat = self.root.stat()
+        state = project_journal._DiscoveryScanState(
+            deadline=time.monotonic() + 5,
+        )
+        parent = project_journal._RolloutDirectoryBinding(
+            rollout_root=root,
+            path=root,
+            fd=404,
+            object_identity=(4, 4),
+            access_policy=(4, 4, 0o700),
+            parent_fd=None,
+            name=None,
+        )
+
+        for binding_kind in ("root", "child"):
+            with self.subTest(binding_kind=binding_kind):
+                path = root if binding_kind == "root" else root / "2099"
+                failure = project_journal._rollout_inspection_failure(
+                    path,
+                    rollout_root=root,
+                    inspection_reason="directory_access_policy_changed",
+                    detail="injected primary policy change",
+                )
+                with mock.patch.object(
+                    project_journal.os,
+                    "stat",
+                    return_value=expected_stat,
+                ):
+                    with mock.patch.object(
+                        project_journal.os,
+                        "open",
+                        return_value=505,
+                    ):
+                        with mock.patch.object(
+                            project_journal,
+                            "_validate_opened_rollout_directory",
+                            return_value=failure,
+                        ):
+                            with mock.patch.object(
+                                project_journal.os,
+                                "close",
+                                side_effect=OSError(
+                                    errno.EIO,
+                                    "injected binding close failure",
+                                ),
+                            ):
+                                if binding_kind == "root":
+                                    result = (
+                                        project_journal._bind_rollout_root_directory(
+                                            root,
+                                            state,
+                                        )
+                                    )
+                                else:
+                                    result = (
+                                        project_journal._bind_rollout_child_directory(
+                                            parent,
+                                            "2099",
+                                            path,
+                                            expected_stat,
+                                            state,
+                                        )
+                                    )
+
+                self.assertIs(result, failure)
+                self.assertEqual(
+                    result.error.inspection_reason,
+                    "directory_access_policy_changed",
+                )
+                self.assertEqual(len(result.error.cleanup_errors), 1)
+                cleanup = result.error.cleanup_errors[0]
+                self.assertIn(binding_kind, cleanup["context"])
+                self.assertEqual(cleanup["errno"], errno.EIO)
+                self.assertIn("binding close failure", cleanup["message"])
+
+    def test_preferred_ancestor_inherits_superseded_binding_cleanup_error(
+        self,
+    ) -> None:
+        root = pathlib.Path("/sessions")
+        child_failure = project_journal._rollout_inspection_failure(
+            root / "2099",
+            rollout_root=root,
+            inspection_reason="directory_scan_failed",
+            detail="injected child scan failure",
+        )
+        ancestor_failure = project_journal._rollout_inspection_failure(
+            root,
+            rollout_root=root,
+            inspection_reason="directory_replaced",
+            detail="injected preferred ancestor replacement",
+        )
+        project_journal._record_rollout_cleanup_error(
+            child_failure,
+            context="injected child binding cleanup",
+            cleanup_error=OSError(
+                errno.EIO,
+                "injected child binding close failure",
+            ),
+        )
+
+        project_journal._inherit_rollout_cleanup_errors(
+            ancestor_failure,
+            child_failure,
+        )
+
+        self.assertEqual(
+            ancestor_failure.error.inspection_reason,
+            "directory_replaced",
+        )
+        self.assertEqual(len(ancestor_failure.error.cleanup_errors), 1)
+        cleanup = ancestor_failure.error.cleanup_errors[0]
+        self.assertEqual(cleanup["errno"], errno.EIO)
+        self.assertIn("child binding close failure", cleanup["message"])
+        self.assertTrue(
+            any(
+                "child binding cleanup" in note
+                for note in getattr(ancestor_failure.error, "__notes__", ())
+            )
+        )
+
+    def test_unframed_rollout_cleanup_preserves_revalidation_failure(
+        self,
+    ) -> None:
+        root = pathlib.Path("/sessions")
+        binding = project_journal._RolloutDirectoryBinding(
+            rollout_root=root,
+            path=root / "2099",
+            fd=606,
+            object_identity=(6, 6),
+            access_policy=(6, 6, 0o700),
+            parent_fd=None,
+            name=None,
+        )
+        state = project_journal._DiscoveryScanState(
+            deadline=time.monotonic() + 5,
+        )
+        scan_failure = project_journal._rollout_inspection_failure(
+            binding.path,
+            rollout_root=root,
+            inspection_reason="directory_scan_failed",
+            detail="injected scan failure",
+        )
+        policy_failure = project_journal._rollout_inspection_failure(
+            root,
+            rollout_root=root,
+            inspection_reason="directory_access_policy_changed",
+            detail="injected primary policy change",
+        )
+
+        with mock.patch.object(
+            project_journal,
+            "_revalidate_rollout_directory_chain",
+            return_value=policy_failure,
+        ):
+            with mock.patch.object(
+                project_journal.os,
+                "close",
+                side_effect=OSError(
+                    errno.EIO,
+                    "injected unframed close failure",
+                ),
+            ):
+                result = (
+                    project_journal._revalidate_and_close_unframed_rollout_directory(
+                        [],
+                        binding,
+                        state,
+                        fallback_failure=scan_failure,
+                    )
+                )
+
+        self.assertIs(result, policy_failure)
+        self.assertEqual(scan_failure.error.cleanup_errors, [])
+        coverage = project_journal._discovery_coverage_error(
+            result.error,
+            state,
+            source=result.path,
+        )
+        self.assertEqual(
+            coverage["inspection_reason"],
+            "directory_access_policy_changed",
+        )
+        self.assertEqual(len(coverage["cleanup_errors"]), 1)
+        cleanup = coverage["cleanup_errors"][0]
+        self.assertEqual(cleanup["errno"], errno.EIO)
+        self.assertIn("unframed close failure", cleanup["message"])
+
     def test_discover_repos_reads_archive_without_active_sessions(self) -> None:
         repo = self.init_repo()
         codex_home = self.root / "codex-home"
@@ -10787,8 +11043,10 @@ class ProjectJournalTests(unittest.TestCase):
         )
         target_identity = project_journal._rollout_object_identity(target.stat())
         actual_scandir = project_journal.os.scandir
+        actual_close = project_journal.os.close
         target_scandir = mock.MagicMock()
         mutated = False
+        close_failed = False
 
         def replace_ancestor_and_fail() -> object:
             nonlocal mutated
@@ -10809,14 +11067,32 @@ class ProjectJournalTests(unittest.TestCase):
                     return target_scandir
             return actual_scandir(path)
 
+        def close_target_then_fail(fd: int) -> None:
+            nonlocal close_failed
+            identity = project_journal._rollout_object_identity(os.fstat(fd))
+            if identity == target_identity and not close_failed:
+                actual_close(fd)
+                close_failed = True
+                raise OSError(
+                    errno.EIO,
+                    "injected directory descriptor close failure",
+                )
+            actual_close(fd)
+
         with mock.patch.object(
             project_journal.os,
             "scandir",
             side_effect=inject_scan_failure,
         ):
-            rows = project_journal._discover_repos(codex_home, 30)
+            with mock.patch.object(
+                project_journal.os,
+                "close",
+                side_effect=close_target_then_fail,
+            ):
+                rows = project_journal._discover_repos(codex_home, 30)
 
         self.assertTrue(mutated)
+        self.assertTrue(close_failed)
         target_scandir.close.assert_called_once_with()
         self.assertEqual(len(rows), 1)
         row = rows[0]
@@ -10825,6 +11101,11 @@ class ProjectJournalTests(unittest.TestCase):
         coverage = row["discovery_error"]["discovery_coverage"]
         self.assertEqual(coverage["inspection_reason"], "directory_replaced")
         self.assertEqual(pathlib.Path(coverage["source"]), year)
+        self.assertEqual(len(coverage["cleanup_errors"]), 1)
+        cleanup = coverage["cleanup_errors"][0]
+        self.assertEqual(cleanup["errno"], errno.EIO)
+        self.assertIn("descriptor close failure", cleanup["message"])
+        self.assertIn(str(target), cleanup["context"])
 
     def test_discover_repos_detects_bound_directory_access_policy_change(
         self,
