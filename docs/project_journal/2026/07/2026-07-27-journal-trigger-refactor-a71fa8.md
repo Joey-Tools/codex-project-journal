@@ -21,6 +21,7 @@ superseded_by:
 - The final fresh-review findings are closed by adding bounded active/archive session coverage, one aggregate discovery deadline and cap ledger, and explicit generated-index marker outcomes.
 - The newest fresh-review findings are closed by making every non-empty rollout parse failure explicit, unioning same-name active/archive evidence without double-counting a logical rollout, and validating bounded strict-UTF-8 CWDs before path construction.
 - The latest fresh-review finding is closed by carrying one absolute candidate deadline through every adoption, Git, and auxiliary file probe and by making generated-index, exclude, hook, and index inspections nonblocking, type-safe, and byte-bounded.
+- The final two fresh-review findings are closed by binding rollout reads to no-follow/nonblocking descriptors with post-read identity and content revalidation, and by adding a Darwin `kqueue` child-status fallback for the supported Xcode Python 3.9 runtime.
 
 ## Current State
 
@@ -34,6 +35,8 @@ superseded_by:
 - Missing auxiliary paths remain authoritative negatives, while EACCES, EIO, and other inspection failures independently null `has_journal_dir`, `journal_count`, `has_index`, `index_ignored`, or `hooks_installed` and attach structured errno evidence.
 - Repository resolution establishes one candidate deadline capped by the aggregate scan deadline. Adoption, journal enumeration, generated-index classification, exclude-path Git lookup and read, hook configuration lookup and reads, and index presence inspection all consume that same absolute deadline.
 - Worktree generated-index, exclude, and hook reads use no-follow/nonblocking descriptors, require stable regular-file identity, and enforce hard retained-byte ceilings. A truly disappeared entry is an authoritative negative, while a deadline, EACCES, EIO, FIFO, symlink, directory, unstable file, or oversized input produces structured partial/limit evidence and leaves only the affected field unknown.
+- Rollout enumeration now carries the observed object identity into a descriptor-bound `O_NOFOLLOW | O_NONBLOCK` open. The reader verifies a regular file and the original path binding, hashes the bounded first pass, rereads the same descriptor, and revalidates descriptor identity, path identity, size, and digest before accepting evidence. FIFO, symlink/object replacement, unreadable input, and concurrent object or content mutation remain distinct partial-coverage reasons.
+- Child supervision uses `waitid(..., WNOWAIT)` where available and registers a one-shot Darwin `EVFILT_PROC/NOTE_EXIT` observer immediately after launch when Xcode Python 3.9 lacks `os.waitid`. The observer proves exit without reaping; the final bounded `wait()` remains the sole exact return-code source, preserving process-group cleanup and zombie-free normal and timeout paths.
 - This is the repository's intentional first journal entry because the finalization task explicitly requires durable repo-owned validation and handoff evidence; no top-level tracker, generated index, or local hook is introduced.
 
 ## Next Steps
@@ -66,3 +69,8 @@ superseded_by:
 - Python 3.13.0 and Xcode Python 3.9.6 `py_compile` checks passed for the helper and tests.
 - Final Python 3.13 full suite after README, skill, and journal synchronization: 232 passed, 2 skipped in 233.502 seconds.
 - The installed OpenAI validator wrapper could not acquire PyYAML because sandbox DNS was unavailable and the local Python runtime did not provide the module. Its documented fallback passed by parsing `SKILL.md` frontmatter and `agents/openai.yaml`, enforcing the validator's frontmatter constraints, and verifying referenced resources; no external runtime was installed.
+- Descriptor-bound rollout focused coverage: 37 discovery tests passed in 67.952 seconds with Python 3.13.0.
+- Child-status focused coverage: 13 process tests passed in 4.194 seconds; 29 cleanup tests passed with 2 skipped in 15.559 seconds.
+- Xcode Python 3.9.6 compatibility coverage: 7 targeted rollout, Darwin observer, and real CLI adoption tests passed in 6.244 seconds. This supersedes the earlier evidence above that treated missing `WNOWAIT` as a runtime gate.
+- Final Python 3.13 full suite after descriptor-bound rollout reads and Darwin child supervision: 238 passed, 2 skipped in 345.143 seconds.
+- Final Ruff check/format, Python 3.13 and Xcode Python 3.9 `py_compile`, project journal validation, and `git diff --check` passed. The installed validator remained dependency-blocked as documented above; its local YAML/frontmatter/interface/resource fallback passed without installing another runtime.

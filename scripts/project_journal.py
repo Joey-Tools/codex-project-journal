@@ -14,6 +14,7 @@ import os
 import pathlib
 import re
 import secrets
+import select
 import selectors
 import shlex
 import shutil
@@ -299,6 +300,28 @@ class DiscoveryRolloutParseError(UserError):
         )
 
 
+class DiscoveryRolloutInspectionError(UserError):
+    """A rollout file could not be bound and read as one stable object."""
+
+    code = "discovery_rollout_inspection_failed"
+
+    def __init__(
+        self,
+        *,
+        inspection_reason: str,
+        path: pathlib.Path,
+        detail: str,
+        error_number: int | None = None,
+    ) -> None:
+        self.inspection_reason = inspection_reason
+        self.detail = detail[:MAX_DISCOVERY_ERROR_DETAIL_CHARS]
+        if error_number is not None:
+            self.errno = error_number
+        super().__init__(
+            f"rollout inspection failed ({inspection_reason}) for {path}: {self.detail}"
+        )
+
+
 class DiscoveryCwdValidationError(UserError):
     """A discovered CWD could not be represented as strict UTF-8."""
 
@@ -321,6 +344,14 @@ class _DiscoveryJsonIntegerLimitExceeded(ValueError):
 
 class _ProcessIdentityLost(UserError):
     """The direct child was reaped before group cleanup could finish."""
+
+
+@dataclasses.dataclass
+class _DarwinProcessStatusObserver:
+    """Observe NOTE_EXIT without reaping the process-group leader."""
+
+    queue: Any | None
+    exit_observed: bool = False
 
 
 class _DeferredTermination(BaseException):
@@ -2954,18 +2985,191 @@ def _waitid_returncode(result: Any) -> int:
     raise UserError(f"unexpected POSIX child status code {result.si_code!r}")
 
 
+def _posix_waitid_status_observation_available() -> bool:
+    return all(
+        callable(getattr(os, name, None)) if name == "waitid" else hasattr(os, name)
+        for name in ("waitid", "WNOWAIT", "WEXITED", "WNOHANG", "P_PID")
+    )
+
+
+def _darwin_kqueue_status_observation_available() -> bool:
+    return sys.platform == "darwin" and all(
+        hasattr(select, name)
+        for name in (
+            "kqueue",
+            "kevent",
+            "KQ_FILTER_PROC",
+            "KQ_EV_ADD",
+            "KQ_EV_ENABLE",
+            "KQ_EV_ONESHOT",
+            "KQ_EV_ERROR",
+            "KQ_NOTE_EXIT",
+        )
+    )
+
+
+def _require_process_status_observation_support() -> None:
+    if os.name != "posix":
+        return
+    if _posix_waitid_status_observation_available():
+        return
+    if _darwin_kqueue_status_observation_available():
+        return
+    raise UserError("POSIX non-reaping child-status observation is unavailable")
+
+
+def _register_process_status_observer(
+    process: subprocess.Popen[bytes],
+) -> None:
+    if os.name != "posix" or _posix_waitid_status_observation_available():
+        return
+    if not _darwin_kqueue_status_observation_available():
+        raise UserError("POSIX non-reaping child-status observation is unavailable")
+    try:
+        queue = select.kqueue()
+    except OSError as exc:
+        raise UserError(
+            f"failed to create Darwin child-status observer: {exc}"
+        ) from exc
+    observer = _DarwinProcessStatusObserver(queue=queue)
+    try:
+        change = select.kevent(
+            process.pid,
+            filter=select.KQ_FILTER_PROC,
+            flags=(select.KQ_EV_ADD | select.KQ_EV_ENABLE | select.KQ_EV_ONESHOT),
+            fflags=select.KQ_NOTE_EXIT,
+        )
+        queue.control([change], 0, 0)
+    except ProcessLookupError:
+        # Darwin refuses a new EVFILT_PROC registration after the child has
+        # already become an unreaped zombie. This process is the direct child,
+        # and no code has called poll/wait, so ESRCH is itself a non-reaping
+        # terminal observation while the zombie still fences PID/PGID reuse.
+        queue.close()
+        observer.queue = None
+        observer.exit_observed = True
+        setattr(process, "_project_journal_status_observer", observer)
+        return
+    except (OSError, ValueError) as exc:
+        queue.close()
+        raise UserError(
+            f"failed to register Darwin child-status observer: {exc}"
+        ) from exc
+    setattr(process, "_project_journal_status_observer", observer)
+
+
+def _process_status_observer(
+    process: subprocess.Popen[bytes],
+) -> _DarwinProcessStatusObserver | None:
+    observer = getattr(
+        process,
+        "_project_journal_status_observer",
+        None,
+    )
+    return observer if isinstance(observer, _DarwinProcessStatusObserver) else None
+
+
+def _close_process_status_observer(
+    process: subprocess.Popen[bytes] | None,
+) -> str | None:
+    if process is None:
+        return None
+    observer = _process_status_observer(process)
+    if observer is None:
+        return None
+    if observer.queue is None:
+        try:
+            delattr(process, "_project_journal_status_observer")
+        except AttributeError:
+            pass
+        return None
+    try:
+        observer.queue.close()
+    except OSError as exc:
+        return f"failed to close Darwin child-status observer: {exc}"
+    finally:
+        try:
+            delattr(process, "_project_journal_status_observer")
+        except AttributeError:
+            pass
+    return None
+
+
+def _wait_for_darwin_process_exit_without_reaping(
+    process: subprocess.Popen[bytes],
+    observer: _DarwinProcessStatusObserver,
+    deadline: float,
+    timeout_error: str,
+    *,
+    interruptible: bool,
+) -> None:
+    if observer.exit_observed:
+        return
+    if observer.queue is None:
+        raise _ProcessIdentityLost(
+            "Darwin child-status observer lost its registered queue"
+        )
+    while True:
+        if interruptible:
+            _raise_if_termination_pending()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise UserError(timeout_error)
+        try:
+            events = observer.queue.control(
+                None,
+                1,
+                min(remaining, DEFERRED_SIGNAL_POLL_SECONDS),
+            )
+        except InterruptedError:
+            continue
+        except OSError as exc:
+            raise UserError(
+                f"failed to observe Darwin direct-child status: {exc}"
+            ) from exc
+        if not events:
+            continue
+        event = events[0]
+        if int(event.flags) & int(select.KQ_EV_ERROR):
+            error_number = int(event.data) or errno.EIO
+            raise UserError(
+                "Darwin child-status observer reported an error: "
+                f"{os.strerror(error_number)}"
+            )
+        if (
+            int(event.ident) != process.pid
+            or int(event.filter) != int(select.KQ_FILTER_PROC)
+            or not (int(event.fflags) & int(select.KQ_NOTE_EXIT))
+        ):
+            raise _ProcessIdentityLost(
+                "Darwin status observation returned a mismatched child event"
+            )
+        observer.exit_observed = True
+        return
+
+
 def _wait_for_process_status_without_reaping(
     process: subprocess.Popen[bytes],
     deadline: float,
     timeout_error: str,
     *,
     interruptible: bool = True,
-) -> int:
-    if not all(
-        hasattr(os, name)
-        for name in ("waitid", "WNOWAIT", "WEXITED", "WNOHANG", "P_PID")
-    ):
-        raise UserError("POSIX WNOWAIT status observation is unavailable")
+) -> int | None:
+    if not _posix_waitid_status_observation_available():
+        observer = _process_status_observer(process)
+        if observer is None:
+            raise _ProcessIdentityLost(
+                "Darwin child-status observer was not registered before launch"
+            )
+        _wait_for_darwin_process_exit_without_reaping(
+            process,
+            observer,
+            deadline,
+            timeout_error,
+            interruptible=interruptible,
+        )
+        return None
+
     options = os.WEXITED | os.WNOHANG | os.WNOWAIT
     while True:
         if interruptible:
@@ -3039,7 +3243,10 @@ def _terminate_process_group_and_reap(
 
     issues: list[str] = []
     observed_returncode = known_returncode
-    leader_exited = known_returncode is not None
+    observer = _process_status_observer(process)
+    leader_exited = known_returncode is not None or (
+        observer is not None and observer.exit_observed
+    )
     kill_deadline = time.monotonic() + GIT_PROCESS_KILL_DRAIN_SECONDS
 
     if isinstance(process.returncode, int):
@@ -3086,18 +3293,19 @@ def _terminate_process_group_and_reap(
                 )
         kill_deadline = time.monotonic() + GIT_PROCESS_KILL_DRAIN_SECONDS
         _discard_selector_output(selector, kill_deadline)
-        try:
-            observed_returncode = _wait_for_process_status_without_reaping(
-                process,
-                kill_deadline,
-                "direct child did not exit after final process-group signal",
-                interruptible=False,
-            )
-            leader_exited = True
-        except _ProcessIdentityLost as exc:
-            issues.append(str(exc))
-        except UserError as exc:
-            issues.append(str(exc))
+        if not leader_exited:
+            try:
+                observed_returncode = _wait_for_process_status_without_reaping(
+                    process,
+                    kill_deadline,
+                    "direct child did not exit after final process-group signal",
+                    interruptible=False,
+                )
+                leader_exited = True
+            except _ProcessIdentityLost as exc:
+                issues.append(str(exc))
+            except UserError as exc:
+                issues.append(str(exc))
         if final_group_signal_sent:
             # The unreaped leader still fences this numeric PID/PGID. Prove the
             # group is absent before transferring ownership to reap-only; after
@@ -3238,6 +3446,12 @@ def _capture_bounded_process_with_launch(
     operation: str,
 ) -> subprocess.CompletedProcess[bytes]:
     try:
+        _require_process_status_observation_support()
+    except BaseException:
+        if launch is not None:
+            launch.mark_cleanup_safe()
+        raise
+    try:
         selector = selectors.DefaultSelector()
     except OSError as exc:
         error = UserError(f"failed to create {operation} selector: {exc}")
@@ -3279,6 +3493,7 @@ def _capture_bounded_process_with_launch(
                 stderr=subprocess.PIPE,
                 start_new_session=os.name == "posix",
             )
+            _register_process_status_observer(process)
         except OSError as exc:
             _close_selector(selector)
             selector_open = False
@@ -3393,7 +3608,7 @@ def _capture_bounded_process_with_launch(
 
         if os.name == "posix":
             _raise_if_termination_pending()
-            returncode = _wait_for_process_status_without_reaping(
+            observed_returncode = _wait_for_process_status_without_reaping(
                 process,
                 operation_deadline,
                 timeout_error,
@@ -3404,7 +3619,7 @@ def _capture_bounded_process_with_launch(
                     process,
                     selector,
                     ownership,
-                    known_returncode=returncode,
+                    known_returncode=observed_returncode,
                 )
             except BaseException as cleanup_exc:
                 _close_selector(selector)
@@ -3435,9 +3650,15 @@ def _capture_bounded_process_with_launch(
                 )
                 raise UserError(
                     f"{operation} cleanup-incomplete after exit "
-                    f"{returncode}: {cleanup_error}{detail_suffix}"
+                    f"{observed_returncode}: {cleanup_error}{detail_suffix}"
                 )
             ownership.release()
+            if not isinstance(process.returncode, int):
+                raise UserError(
+                    f"{operation} cleanup-incomplete: final direct-child "
+                    "return code is unavailable after reap"
+                )
+            returncode = process.returncode
             _raise_if_termination_pending()
             if returncode == 0 and stdout_finish is not None:
                 stdout_finish()
@@ -3581,6 +3802,12 @@ def _capture_bounded_process_with_launch(
     finally:
         if launch is not None and ownership.state == "released":
             launch.mark_cleanup_safe()
+        observer_close_error = _close_process_status_observer(process)
+        if observer_close_error is not None:
+            active_error = sys.exc_info()[1]
+            if active_error is None:
+                raise UserError(observer_close_error)
+            _add_exception_detail(active_error, observer_close_error)
 
     return subprocess.CompletedProcess(
         child_argv,
@@ -7041,12 +7268,20 @@ def command_install_hooks(args: argparse.Namespace) -> int:
     return 0
 
 
+@dataclasses.dataclass(frozen=True)
+class _RolloutCandidate:
+    path: pathlib.Path
+    identity: tuple[int, int, int, int, int, int]
+    mtime: float
+
+
 @dataclasses.dataclass
 class _DiscoveryScanState:
     deadline: float
     scan_entries: int = 0
     rollouts_scanned: int = 0
     total_bytes: int = 0
+    verification_bytes: int = 0
     records_scanned: int = 0
     distinct_cwds: set[str] = dataclasses.field(default_factory=set)
 
@@ -7100,6 +7335,15 @@ class _DiscoveryScanState:
             MAX_DISCOVERY_RECORDS,
         )
 
+    def add_verification_bytes(self, byte_count: int) -> None:
+        self.check_deadline()
+        self.verification_bytes += byte_count
+        self._check_limit(
+            "rollout verification bytes",
+            self.verification_bytes,
+            MAX_DISCOVERY_TOTAL_BYTES,
+        )
+
     def add_cwd(self, cwd: str) -> None:
         if cwd in self.distinct_cwds:
             return
@@ -7116,6 +7360,7 @@ class _DiscoveryScanState:
             "filesystem_entries_scanned": self.scan_entries,
             "rollouts_scanned": self.rollouts_scanned,
             "rollout_bytes_scanned": self.total_bytes,
+            "rollout_verification_bytes_read": self.verification_bytes,
             "rollout_records_scanned": self.records_scanned,
             "distinct_cwds_scanned": len(self.distinct_cwds),
         }
@@ -7143,26 +7388,67 @@ def _path_date(path: pathlib.Path) -> dt.date | None:
     return None
 
 
-def _rollout_last_seen(path: pathlib.Path) -> str:
-    dated = _path_date(path)
+def _rollout_last_seen(candidate: _RolloutCandidate) -> str:
+    dated = _path_date(candidate.path)
     if dated is not None:
         return dated.isoformat()
-    mtime = dt.datetime.fromtimestamp(path.stat().st_mtime, tz=dt.timezone.utc)
+    mtime = dt.datetime.fromtimestamp(candidate.mtime, tz=dt.timezone.utc)
     return mtime.date().isoformat()
 
 
-def _rollout_in_window(path: pathlib.Path, cutoff: dt.date) -> bool:
-    dated = _path_date(path)
+def _rollout_in_window(
+    candidate: _RolloutCandidate,
+    cutoff: dt.date,
+) -> bool:
+    dated = _path_date(candidate.path)
     if dated is not None:
         return dated >= cutoff
-    mtime = dt.datetime.fromtimestamp(path.stat().st_mtime, tz=dt.timezone.utc)
+    mtime = dt.datetime.fromtimestamp(candidate.mtime, tz=dt.timezone.utc)
     return mtime.date() >= cutoff
+
+
+def _rollout_candidate_from_stat(
+    path: pathlib.Path,
+    path_stat: os.stat_result,
+) -> _RolloutCandidate:
+    if not stat.S_ISREG(path_stat.st_mode):
+        raise DiscoveryRolloutInspectionError(
+            inspection_reason="non_regular_replacement",
+            path=path,
+            detail="rollout path is not a regular file",
+        )
+    return _RolloutCandidate(
+        path=path,
+        identity=_file_identity(path_stat),
+        mtime=path_stat.st_mtime,
+    )
+
+
+def _coerce_rollout_candidate(
+    value: _RolloutCandidate | pathlib.Path,
+    state: _DiscoveryScanState,
+) -> _RolloutCandidate:
+    if isinstance(value, _RolloutCandidate):
+        return value
+    path = pathlib.Path(value)
+    state.check_deadline()
+    try:
+        path_stat = os.stat(path, follow_symlinks=False)
+    except OSError as exc:
+        raise DiscoveryRolloutInspectionError(
+            inspection_reason="enumeration_revalidation_failed",
+            path=path,
+            detail=str(exc),
+            error_number=exc.errno,
+        ) from exc
+    state.check_deadline()
+    return _rollout_candidate_from_stat(path, path_stat)
 
 
 def _iter_rollout_paths(
     root: pathlib.Path,
     state: _DiscoveryScanState,
-) -> Iterable[pathlib.Path]:
+) -> Iterable[_RolloutCandidate]:
     state.check_deadline()
     try:
         root_stat = os.stat(root)
@@ -7198,7 +7484,224 @@ def _iter_rollout_paths(
                     and entry.name.startswith("rollout-")
                     and entry.name.endswith(".jsonl")
                 ):
-                    yield pathlib.Path(entry.path)
+                    yield _rollout_candidate_from_stat(
+                        pathlib.Path(entry.path),
+                        entry_stat,
+                    )
+
+
+def _open_rollout_candidate(
+    candidate: _RolloutCandidate,
+    state: _DiscoveryScanState,
+) -> int:
+    path = candidate.path
+    state.check_deadline()
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | _required_open_flag("O_NOFOLLOW")
+        | _required_open_flag("O_NONBLOCK")
+    )
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        reason = (
+            "symlink_replacement"
+            if exc.errno in {errno.ELOOP, errno.EMLINK}
+            else "unreadable"
+            if exc.errno in {errno.EACCES, errno.EPERM}
+            else "open_failed"
+        )
+        raise DiscoveryRolloutInspectionError(
+            inspection_reason=reason,
+            path=path,
+            detail=str(exc),
+            error_number=exc.errno,
+        ) from exc
+
+    try:
+        state.check_deadline()
+        try:
+            descriptor_stat = os.fstat(fd)
+        except OSError as exc:
+            raise DiscoveryRolloutInspectionError(
+                inspection_reason="descriptor_binding_failed",
+                path=path,
+                detail=str(exc),
+                error_number=exc.errno,
+            ) from exc
+        if not stat.S_ISREG(descriptor_stat.st_mode):
+            raise DiscoveryRolloutInspectionError(
+                inspection_reason="non_regular_replacement",
+                path=path,
+                detail="opened rollout object is not a regular file",
+            )
+        if _file_identity(descriptor_stat) != candidate.identity:
+            raise DiscoveryRolloutInspectionError(
+                inspection_reason="object_replaced",
+                path=path,
+                detail="rollout object changed after directory enumeration",
+            )
+        try:
+            path_stat = os.stat(path, follow_symlinks=False)
+        except OSError as exc:
+            raise DiscoveryRolloutInspectionError(
+                inspection_reason="path_revalidation_failed",
+                path=path,
+                detail=str(exc),
+                error_number=exc.errno,
+            ) from exc
+        state.check_deadline()
+        if (
+            not stat.S_ISREG(path_stat.st_mode)
+            or _file_identity(path_stat) != candidate.identity
+        ):
+            raise DiscoveryRolloutInspectionError(
+                inspection_reason="path_replaced",
+                path=path,
+                detail="rollout path no longer names the enumerated object",
+            )
+        observed_total = state.total_bytes + descriptor_stat.st_size
+        if observed_total > MAX_DISCOVERY_TOTAL_BYTES:
+            raise DiscoveryLimitExceeded(
+                "total rollout bytes",
+                MAX_DISCOVERY_TOTAL_BYTES,
+                observed_total,
+            )
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _read_rollout_verification_digest(
+    fd: int,
+    candidate: _RolloutCandidate,
+    expected_bytes: int,
+    state: _DiscoveryScanState,
+) -> tuple[bytes, int]:
+    path = candidate.path
+    state.check_deadline()
+    try:
+        os.lseek(fd, 0, os.SEEK_SET)
+    except OSError as exc:
+        raise DiscoveryRolloutInspectionError(
+            inspection_reason="verification_seek_failed",
+            path=path,
+            detail=str(exc),
+            error_number=exc.errno,
+        ) from exc
+    digest = hashlib.sha256()
+    total = 0
+    while total <= expected_bytes:
+        state.check_deadline()
+        try:
+            chunk = os.read(
+                fd,
+                min(
+                    PROCESS_READ_CHUNK_BYTES,
+                    expected_bytes + 1 - total,
+                ),
+            )
+        except OSError as exc:
+            raise DiscoveryRolloutInspectionError(
+                inspection_reason="verification_read_failed",
+                path=path,
+                detail=str(exc),
+                error_number=exc.errno,
+            ) from exc
+        state.check_deadline()
+        if not chunk:
+            break
+        digest.update(chunk)
+        total += len(chunk)
+        state.add_verification_bytes(len(chunk))
+    return digest.digest(), total
+
+
+def _revalidate_rollout_candidate(
+    fd: int,
+    candidate: _RolloutCandidate,
+    first_digest: bytes,
+    first_bytes: int,
+    state: _DiscoveryScanState,
+) -> None:
+    path = candidate.path
+    state.check_deadline()
+    try:
+        descriptor_between = os.fstat(fd)
+    except OSError as exc:
+        raise DiscoveryRolloutInspectionError(
+            inspection_reason="descriptor_revalidation_failed",
+            path=path,
+            detail=str(exc),
+            error_number=exc.errno,
+        ) from exc
+    if (
+        not stat.S_ISREG(descriptor_between.st_mode)
+        or _file_identity(descriptor_between) != candidate.identity
+    ):
+        raise DiscoveryRolloutInspectionError(
+            inspection_reason="object_changed",
+            path=path,
+            detail="rollout descriptor identity or access policy changed",
+        )
+    if first_bytes != descriptor_between.st_size:
+        raise DiscoveryRolloutInspectionError(
+            inspection_reason="content_changed",
+            path=path,
+            detail=("rollout read length does not match the bound regular-file size"),
+        )
+    second_digest, second_bytes = _read_rollout_verification_digest(
+        fd,
+        candidate,
+        first_bytes,
+        state,
+    )
+    state.check_deadline()
+    try:
+        descriptor_after = os.fstat(fd)
+    except OSError as exc:
+        raise DiscoveryRolloutInspectionError(
+            inspection_reason="descriptor_revalidation_failed",
+            path=path,
+            detail=str(exc),
+            error_number=exc.errno,
+        ) from exc
+    try:
+        path_after = os.stat(path, follow_symlinks=False)
+    except OSError as exc:
+        raise DiscoveryRolloutInspectionError(
+            inspection_reason="path_revalidation_failed",
+            path=path,
+            detail=str(exc),
+            error_number=exc.errno,
+        ) from exc
+    state.check_deadline()
+    if (
+        not stat.S_ISREG(descriptor_after.st_mode)
+        or _file_identity(descriptor_after) != candidate.identity
+    ):
+        raise DiscoveryRolloutInspectionError(
+            inspection_reason="object_changed",
+            path=path,
+            detail="rollout descriptor identity or access policy changed",
+        )
+    if (
+        not stat.S_ISREG(path_after.st_mode)
+        or _file_identity(path_after) != candidate.identity
+    ):
+        raise DiscoveryRolloutInspectionError(
+            inspection_reason="path_replaced",
+            path=path,
+            detail="rollout path changed during inspection",
+        )
+    if second_bytes != first_bytes or second_digest != first_digest:
+        raise DiscoveryRolloutInspectionError(
+            inspection_reason="content_changed",
+            path=path,
+            detail="rollout content changed between bounded reads",
+        )
 
 
 def _check_json_depth(raw_record: bytes) -> None:
@@ -7256,73 +7759,106 @@ def _parse_discovery_json_integer(value: str) -> int:
 
 
 def _extract_cwds(
-    rollout: pathlib.Path,
+    rollout: _RolloutCandidate,
     state: _DiscoveryScanState,
 ) -> Iterable[str]:
     record_number = 0
     byte_offset = 0
-    with rollout.open("rb") as handle:
-        while True:
-            state.check_deadline()
-            line = handle.readline(MAX_DISCOVERY_LINE_BYTES + 1)
-            if not line:
-                return
-            record_number += 1
-            record_byte_offset = byte_offset
-            byte_offset += len(line)
-            if len(line) > MAX_DISCOVERY_LINE_BYTES:
-                raise DiscoveryLimitExceeded(
-                    "rollout line bytes",
-                    MAX_DISCOVERY_LINE_BYTES,
-                    len(line),
-                )
-            state.add_record(len(line))
-            stripped = line.strip()
-            if not stripped:
-                continue
-            _check_json_depth(stripped)
-            try:
-                decoded = stripped.decode("utf-8")
-            except UnicodeDecodeError as exc:
-                raise DiscoveryRolloutParseError(
-                    parse_reason="invalid_utf8",
-                    record_number=record_number,
-                    byte_offset=record_byte_offset,
-                    detail=str(exc),
-                ) from exc
-            try:
-                payload = json.loads(
-                    decoded,
-                    parse_int=_parse_discovery_json_integer,
-                )
-            except _DiscoveryJsonIntegerLimitExceeded as exc:
-                raise DiscoveryRolloutParseError(
-                    parse_reason="integer_digit_limit",
-                    record_number=record_number,
-                    byte_offset=record_byte_offset,
-                    detail=str(exc),
-                ) from exc
-            except json.JSONDecodeError as exc:
-                raise DiscoveryRolloutParseError(
-                    parse_reason="invalid_json",
-                    record_number=record_number,
-                    byte_offset=record_byte_offset,
-                    detail=str(exc),
-                ) from exc
-            except ValueError as exc:
-                raise DiscoveryRolloutParseError(
-                    parse_reason="json_value_limit",
-                    record_number=record_number,
-                    byte_offset=record_byte_offset,
-                    detail=str(exc),
-                ) from exc
-            except RecursionError as exc:
-                raise DiscoveryLimitExceeded(
-                    "JSON nesting depth",
-                    MAX_DISCOVERY_JSON_DEPTH,
-                    MAX_DISCOVERY_JSON_DEPTH + 1,
-                ) from exc
-            yield from _walk_for_cwds(payload)
+    first_digest = hashlib.sha256()
+    first_bytes = 0
+    fd = _open_rollout_candidate(rollout, state)
+    try:
+        try:
+            handle = os.fdopen(fd, "rb", closefd=False)
+        except (OSError, ValueError) as exc:
+            raise DiscoveryRolloutInspectionError(
+                inspection_reason="descriptor_stream_failed",
+                path=rollout.path,
+                detail=str(exc),
+                error_number=getattr(exc, "errno", None),
+            ) from exc
+        with handle:
+            while True:
+                state.check_deadline()
+                try:
+                    line = handle.readline(MAX_DISCOVERY_LINE_BYTES + 1)
+                except OSError as exc:
+                    raise DiscoveryRolloutInspectionError(
+                        inspection_reason="read_failed",
+                        path=rollout.path,
+                        detail=str(exc),
+                        error_number=exc.errno,
+                    ) from exc
+                state.check_deadline()
+                if not line:
+                    break
+                record_number += 1
+                record_byte_offset = byte_offset
+                byte_offset += len(line)
+                if len(line) > MAX_DISCOVERY_LINE_BYTES:
+                    raise DiscoveryLimitExceeded(
+                        "rollout line bytes",
+                        MAX_DISCOVERY_LINE_BYTES,
+                        len(line),
+                    )
+                state.add_record(len(line))
+                first_digest.update(line)
+                first_bytes += len(line)
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                _check_json_depth(stripped)
+                try:
+                    decoded = stripped.decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    raise DiscoveryRolloutParseError(
+                        parse_reason="invalid_utf8",
+                        record_number=record_number,
+                        byte_offset=record_byte_offset,
+                        detail=str(exc),
+                    ) from exc
+                try:
+                    payload = json.loads(
+                        decoded,
+                        parse_int=_parse_discovery_json_integer,
+                    )
+                except _DiscoveryJsonIntegerLimitExceeded as exc:
+                    raise DiscoveryRolloutParseError(
+                        parse_reason="integer_digit_limit",
+                        record_number=record_number,
+                        byte_offset=record_byte_offset,
+                        detail=str(exc),
+                    ) from exc
+                except json.JSONDecodeError as exc:
+                    raise DiscoveryRolloutParseError(
+                        parse_reason="invalid_json",
+                        record_number=record_number,
+                        byte_offset=record_byte_offset,
+                        detail=str(exc),
+                    ) from exc
+                except ValueError as exc:
+                    raise DiscoveryRolloutParseError(
+                        parse_reason="json_value_limit",
+                        record_number=record_number,
+                        byte_offset=record_byte_offset,
+                        detail=str(exc),
+                    ) from exc
+                except RecursionError as exc:
+                    raise DiscoveryLimitExceeded(
+                        "JSON nesting depth",
+                        MAX_DISCOVERY_JSON_DEPTH,
+                        MAX_DISCOVERY_JSON_DEPTH + 1,
+                    ) from exc
+                yield from _walk_for_cwds(payload)
+        _revalidate_rollout_candidate(
+            fd,
+            rollout,
+            first_digest.digest(),
+            first_bytes,
+            state,
+        )
+    finally:
+        os.close(fd)
 
 
 def _normalize_discovery_cwd(cwd: str) -> str:
@@ -7955,6 +8491,8 @@ def _discovery_coverage_error(
                 "byte_offset": exc.byte_offset,
             }
         )
+    elif isinstance(exc, DiscoveryRolloutInspectionError):
+        error["inspection_reason"] = exc.inspection_reason
     elif isinstance(exc, DiscoveryCwdValidationError):
         error["validation_reason"] = exc.validation_reason
     error.update(state.coverage_counters())
@@ -8065,14 +8603,23 @@ def _discover_repos(codex_home: pathlib.Path, since_days: int) -> list[dict[str,
             break
         try:
             rollouts = _iter_rollout_paths(rollout_root, state)
-            for rollout in rollouts:
+            for rollout_value in rollouts:
                 if stop_all_sources:
                     break
+                rollout_path = (
+                    rollout_value.path
+                    if isinstance(rollout_value, _RolloutCandidate)
+                    else pathlib.Path(rollout_value)
+                )
                 try:
                     state.check_deadline()
+                    rollout = _coerce_rollout_candidate(
+                        rollout_value,
+                        state,
+                    )
                     if not _rollout_in_window(rollout, cutoff):
                         continue
-                    rollout_identity = rollout.name
+                    rollout_identity = rollout.path.name
                     if rollout_identity not in known_rollouts:
                         known_rollouts.add(rollout_identity)
                         state.add_rollout()
@@ -8190,14 +8737,15 @@ def _discover_repos(codex_home: pathlib.Path, since_days: int) -> list[dict[str,
                                 row["rollout_count"] = int(row["rollout_count"]) + 1
                     state.check_deadline()
                 except (DiscoveryDeadlineExceeded, DiscoveryLimitExceeded) as exc:
-                    record_coverage_error(exc, rollout)
+                    record_coverage_error(exc, rollout_path)
                     stop_all_sources = True
                 except (
                     DiscoveryCwdValidationError,
+                    DiscoveryRolloutInspectionError,
                     DiscoveryRolloutParseError,
                     OSError,
                 ) as exc:
-                    record_coverage_error(exc, rollout)
+                    record_coverage_error(exc, rollout_path)
         except (DiscoveryDeadlineExceeded, DiscoveryLimitExceeded) as exc:
             record_coverage_error(exc, rollout_root)
             stop_all_sources = True

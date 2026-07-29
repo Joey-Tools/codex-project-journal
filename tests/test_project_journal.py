@@ -573,6 +573,64 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertEqual(tracked["tracked_non_generated_journal_count"], 1)
         self.assertEqual(tracked["valid_tracked_journal_count"], 1)
 
+    @unittest.skipUnless(
+        sys.platform == "darwin" and pathlib.Path("/usr/bin/xcrun").is_file(),
+        "Xcode Python 3.9 compatibility regression",
+    )
+    def test_xcode_python39_runs_real_adoption_status_cli(self) -> None:
+        version = subprocess.run(
+            ["/usr/bin/xcrun", "python3", "--version"],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=5,
+        )
+        if version.returncode != 0 or not version.stdout.startswith("Python 3.9."):
+            self.skipTest(f"Xcode Python 3.9 is unavailable: {version.stdout.strip()}")
+
+        repo = self.init_repo("xcode-python39-adoption")
+        journal = self.write_journal(
+            repo,
+            "docs/project_journal/2026/05/2026-05-05-alpha-a1b2c3.md",
+            entry_id="20260505-a1b2c3",
+            title="Alpha Work",
+            status="active",
+            updated="2026-05-05",
+        )
+        staged = run_git(repo, "add", "--", str(journal.relative_to(repo)))
+        self.assertEqual(staged.returncode, 0, staged.stderr)
+        env = {
+            "PATH": os.environ.get("PATH", ""),
+            "HOME": str(self.home),
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "PYTHONPYCACHEPREFIX": str(self.root / "xcode-python39-cache"),
+            "TMPDIR": os.environ.get("TMPDIR", str(self.root)),
+        }
+
+        result = subprocess.run(
+            [
+                "/usr/bin/xcrun",
+                "python3",
+                str(SCRIPT),
+                "adoption-status",
+                "--repo",
+                str(repo),
+            ],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            timeout=15,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        payload = json.loads(result.stdout)
+        self.assertTrue(payload["tracked_journal_adopted"])
+        self.assertEqual(payload["valid_tracked_journal_count"], 1)
+
     def test_git_policy_removes_ambient_git_control_environment(self) -> None:
         repo = self.init_repo()
         poison = {
@@ -3374,8 +3432,9 @@ class ProjectJournalTests(unittest.TestCase):
         run_git.assert_not_called()
 
     @unittest.skipUnless(
-        os.name == "posix" and hasattr(os, "WNOWAIT"),
-        "POSIX WNOWAIT process-status contract",
+        os.name == "posix"
+        and project_journal._posix_waitid_status_observation_available(),
+        "POSIX waitid/WNOWAIT process-status contract",
     )
     def test_process_status_observation_preserves_leader_fence(self) -> None:
         process = mock.Mock()
@@ -3402,6 +3461,57 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertTrue(options & os.WNOWAIT)
         process.poll.assert_not_called()
         process.wait.assert_not_called()
+
+    @unittest.skipUnless(
+        sys.platform == "darwin"
+        and project_journal._darwin_kqueue_status_observation_available(),
+        "Darwin kqueue child-status contract",
+    )
+    def test_darwin_kqueue_fallback_reaps_success_and_timeout_children(
+        self,
+    ) -> None:
+        actual_popen = subprocess.Popen
+        spawned: list[subprocess.Popen[bytes]] = []
+
+        def capture_popen(
+            *args: object,
+            **kwargs: object,
+        ) -> subprocess.Popen[bytes]:
+            process = actual_popen(*args, **kwargs)
+            spawned.append(process)
+            return process
+
+        with mock.patch.object(
+            project_journal,
+            "_posix_waitid_status_observation_available",
+            return_value=False,
+        ):
+            with mock.patch.object(
+                project_journal.subprocess,
+                "Popen",
+                side_effect=capture_popen,
+            ):
+                result = self.capture_process(
+                    [sys.executable, "-c", "raise SystemExit(7)"],
+                    timeout_seconds=5,
+                    stdout_limit=1024,
+                )
+                with self.assertRaisesRegex(
+                    project_journal.UserError,
+                    "test process timed out",
+                ):
+                    self.capture_process(
+                        [sys.executable, "-c", "import time; time.sleep(30)"],
+                        timeout_seconds=0.05,
+                        stdout_limit=1024,
+                    )
+
+        self.assertEqual(result.returncode, 7)
+        self.assertEqual(len(spawned), 2)
+        for process in spawned:
+            self.assertIsInstance(process.returncode, int)
+            with self.assertRaises(ChildProcessError):
+                os.waitpid(process.pid, os.WNOHANG)
 
     def test_linux_group_member_proof_parses_live_nonleader_and_skips_zombies(
         self,
@@ -6441,8 +6551,13 @@ class ProjectJournalTests(unittest.TestCase):
         )
         self.assertIn("one bounded `git cat-file --batch` session", skill)
         self.assertIn("final raw index revalidation", skill)
-        self.assertIn("stays unreaped as the PID/PGID identity fence", skill)
+        self.assertIn(
+            "keep the direct child unreaped as the PID/PGID identity fence",
+            skill,
+        )
         self.assertIn("status is observed with `WNOWAIT`", skill)
+        self.assertIn("Xcode Python 3.9.6", skill)
+        self.assertIn("kqueue `NOTE_EXIT`", skill)
         self.assertIn("Explicit ownership states", skill)
         self.assertIn("reuses the already claimed ownership object", skill)
         self.assertIn(
@@ -6537,6 +6652,8 @@ class ProjectJournalTests(unittest.TestCase):
             "active `sessions` and flat `archived_sessions`",
             skill,
         )
+        self.assertIn("`O_NOFOLLOW|O_NONBLOCK` descriptor", skill)
+        self.assertIn("distinct `inspection_reason` values", skill)
         self.assertIn("Require `coverage_status: complete`", skill)
         self.assertIn("bounded three-line marker prefix", skill)
         self.assertIn(
@@ -6642,7 +6759,12 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertIn("one absolute monotonic deadline", readme)
         self.assertIn("structured per-path validity", readme)
         self.assertIn("entry/field/list/issue budgets", readme)
-        self.assertIn("unreaped direct child fences the PID/PGID", readme)
+        self.assertIn(
+            "unreaped direct child as the PID/PGID identity fence",
+            readme,
+        )
+        self.assertIn("Xcode Python 3.9.6", readme)
+        self.assertIn("kqueue `NOTE_EXIT`", readme)
         self.assertIn("Explicit cleanup ownership states", readme)
         self.assertIn("never signals a numeric PGID after the final reap", readme)
         self.assertIn("reports `cleanup-incomplete`", readme)
@@ -6673,6 +6795,8 @@ class ProjectJournalTests(unittest.TestCase):
             readme,
         )
         self.assertIn("one shared 60-second monotonic deadline", readme)
+        self.assertIn("required `O_NOFOLLOW|O_NONBLOCK`", readme)
+        self.assertIn("distinct `inspection_reason`", readme)
         self.assertIn("`coverage_status: complete`", readme)
         self.assertIn("three-line marker prefix", readme)
         self.assertIn(
@@ -9625,6 +9749,191 @@ class ProjectJournalTests(unittest.TestCase):
                 self.assertEqual(coverage["byte_offset"], 0)
                 self.assertEqual(coverage["rollout_records_scanned"], 1)
                 self.assertEqual(coverage["rollout_bytes_scanned"], len(payload))
+
+    def test_discover_repos_rejects_fifo_and_symlink_rollout_replacement(
+        self,
+    ) -> None:
+        original_iterator = project_journal._iter_rollout_paths
+        for replacement_kind, expected_reason in (
+            ("fifo", "non_regular_replacement"),
+            ("symlink", "symlink_replacement"),
+        ):
+            with self.subTest(replacement_kind=replacement_kind):
+                codex_home = self.root / f"codex-home-{replacement_kind}"
+                rollout_dir = codex_home / "sessions/2026/05/05"
+                rollout_dir.mkdir(parents=True)
+                rollout = rollout_dir / "rollout-replaced.jsonl"
+                payload = b'{"event":"stable"}\n'
+                rollout.write_bytes(payload)
+                symlink_target = rollout_dir / "target.jsonl"
+                symlink_target.write_bytes(payload)
+
+                def replace_after_enumeration(
+                    root: pathlib.Path,
+                    state: project_journal._DiscoveryScanState,
+                ) -> object:
+                    for candidate in original_iterator(root, state):
+                        if candidate.path == rollout:
+                            rollout.unlink()
+                            if replacement_kind == "fifo":
+                                os.mkfifo(rollout)
+                            else:
+                                rollout.symlink_to(symlink_target)
+                        yield candidate
+
+                started = time.monotonic()
+                with mock.patch.object(
+                    project_journal,
+                    "_iter_rollout_paths",
+                    side_effect=replace_after_enumeration,
+                ):
+                    rows = project_journal._discover_repos(codex_home, 9999)
+                elapsed = time.monotonic() - started
+
+                self.assertLess(elapsed, 1.0)
+                self.assertEqual(len(rows), 1)
+                row = rows[0]
+                self.assertIsNone(row["repo"])
+                self.assertEqual(row["coverage_status"], "partial")
+                coverage = row["discovery_error"]["discovery_coverage"]
+                self.assertEqual(
+                    coverage["code"],
+                    "discovery_rollout_inspection_failed",
+                )
+                self.assertEqual(
+                    coverage["inspection_reason"],
+                    expected_reason,
+                )
+                self.assertEqual(pathlib.Path(coverage["source"]), rollout)
+
+    def test_discover_repos_reports_unreadable_rollout_distinctly(self) -> None:
+        codex_home = self.root / "codex-home-unreadable-rollout"
+        rollout_dir = codex_home / "sessions/2026/05/05"
+        rollout_dir.mkdir(parents=True)
+        rollout = rollout_dir / "rollout-unreadable.jsonl"
+        rollout.write_bytes(b'{"event":"stable"}\n')
+        actual_open = project_journal.os.open
+
+        def deny_rollout_open(
+            path: os.PathLike[str] | str,
+            flags: int,
+            *args: object,
+            **kwargs: object,
+        ) -> int:
+            if pathlib.Path(path) == rollout:
+                raise PermissionError(
+                    errno.EACCES,
+                    "injected unreadable rollout",
+                    str(path),
+                )
+            return actual_open(path, flags, *args, **kwargs)
+
+        with mock.patch.object(
+            project_journal.os,
+            "open",
+            side_effect=deny_rollout_open,
+        ):
+            rows = project_journal._discover_repos(codex_home, 9999)
+
+        coverage = rows[0]["discovery_error"]["discovery_coverage"]
+        self.assertEqual(
+            coverage["code"],
+            "discovery_rollout_inspection_failed",
+        )
+        self.assertEqual(coverage["inspection_reason"], "unreadable")
+        self.assertEqual(coverage["errno"], errno.EACCES)
+        self.assertEqual(coverage["error_name"], "EACCES")
+
+    def test_discover_repos_detects_concurrent_rollout_content_change(
+        self,
+    ) -> None:
+        codex_home = self.root / "codex-home-content-change"
+        rollout_dir = codex_home / "sessions/2026/05/05"
+        rollout_dir.mkdir(parents=True)
+        rollout = rollout_dir / "rollout-content-change.jsonl"
+        rollout.write_bytes(b'{"value":"aaaa"}\n')
+        original_verifier = project_journal._read_rollout_verification_digest
+        changed = False
+
+        def mutate_before_verification(
+            fd: int,
+            candidate: project_journal._RolloutCandidate,
+            expected_bytes: int,
+            state: project_journal._DiscoveryScanState,
+        ) -> tuple[bytes, int]:
+            nonlocal changed
+            if not changed:
+                changed = True
+                candidate.path.write_bytes(b'{"value":"bbbb"}\n')
+            return original_verifier(
+                fd,
+                candidate,
+                expected_bytes,
+                state,
+            )
+
+        with mock.patch.object(
+            project_journal,
+            "_read_rollout_verification_digest",
+            side_effect=mutate_before_verification,
+        ):
+            rows = project_journal._discover_repos(codex_home, 9999)
+
+        self.assertTrue(changed)
+        coverage = rows[0]["discovery_error"]["discovery_coverage"]
+        self.assertEqual(
+            coverage["code"],
+            "discovery_rollout_inspection_failed",
+        )
+        self.assertEqual(coverage["inspection_reason"], "content_changed")
+        self.assertEqual(coverage["rollout_bytes_scanned"], rollout.stat().st_size)
+
+    def test_discover_repos_detects_concurrent_rollout_object_replacement(
+        self,
+    ) -> None:
+        codex_home = self.root / "codex-home-object-change"
+        rollout_dir = codex_home / "sessions/2026/05/05"
+        rollout_dir.mkdir(parents=True)
+        rollout = rollout_dir / "rollout-object-change.jsonl"
+        payload = b'{"event":"stable"}\n'
+        rollout.write_bytes(payload)
+        replacement = rollout_dir / "replacement.jsonl"
+        replacement.write_bytes(payload)
+        original_verifier = project_journal._read_rollout_verification_digest
+        replaced = False
+
+        def replace_before_verification(
+            fd: int,
+            candidate: project_journal._RolloutCandidate,
+            expected_bytes: int,
+            state: project_journal._DiscoveryScanState,
+        ) -> tuple[bytes, int]:
+            nonlocal replaced
+            if not replaced:
+                replaced = True
+                os.replace(replacement, candidate.path)
+            return original_verifier(
+                fd,
+                candidate,
+                expected_bytes,
+                state,
+            )
+
+        with mock.patch.object(
+            project_journal,
+            "_read_rollout_verification_digest",
+            side_effect=replace_before_verification,
+        ):
+            rows = project_journal._discover_repos(codex_home, 9999)
+
+        self.assertTrue(replaced)
+        coverage = rows[0]["discovery_error"]["discovery_coverage"]
+        self.assertEqual(
+            coverage["code"],
+            "discovery_rollout_inspection_failed",
+        )
+        self.assertEqual(coverage["inspection_reason"], "path_replaced")
+        self.assertEqual(pathlib.Path(coverage["source"]), rollout)
 
     def test_discover_repos_keeps_prior_rows_when_later_record_is_invalid(
         self,
