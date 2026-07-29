@@ -20,6 +20,7 @@ superseded_by:
 - The three findings from GitHub Codex review `4784362350` are addressed without changing index-authoritative adoption semantics.
 - The final fresh-review findings are closed by adding bounded active/archive session coverage, one aggregate discovery deadline and cap ledger, and explicit generated-index marker outcomes.
 - The newest fresh-review findings are closed by making every non-empty rollout parse failure explicit, unioning same-name active/archive evidence without double-counting a logical rollout, and validating bounded strict-UTF-8 CWDs before path construction.
+- The latest fresh-review finding is closed by carrying one absolute candidate deadline through every adoption, Git, and auxiliary file probe and by making generated-index, exclude, hook, and index inspections nonblocking, type-safe, and byte-bounded.
 
 ## Current State
 
@@ -31,7 +32,8 @@ superseded_by:
 - Complete candidate coverage is explicit. A source I/O failure, non-empty record parse failure, invalid CWD encoding, deadline, or cap preserves healthy rows already found but marks `coverage_status: partial` with bounded counters and structured `discovery_coverage`; when no repository was found, an inconclusive sentinel prevents partial coverage from looking like authoritative `[]`.
 - The helper and hook rename primitive now reject every host other than macOS and Linux before Git selection or platform-specific libc lookup.
 - Missing auxiliary paths remain authoritative negatives, while EACCES, EIO, and other inspection failures independently null `has_journal_dir`, `journal_count`, `has_index`, `index_ignored`, or `hooks_installed` and attach structured errno evidence.
-- Worktree generated-index classification reads only a bounded three-line prefix. A truly disappeared entry is skipped, while EACCES, EIO, a dangling symlink, a directory, or an oversized marker produces a dedicated structured error and leaves `journal_count` unknown.
+- Repository resolution establishes one candidate deadline capped by the aggregate scan deadline. Adoption, journal enumeration, generated-index classification, exclude-path Git lookup and read, hook configuration lookup and reads, and index presence inspection all consume that same absolute deadline.
+- Worktree generated-index, exclude, and hook reads use no-follow/nonblocking descriptors, require stable regular-file identity, and enforce hard retained-byte ceilings. A truly disappeared entry is an authoritative negative, while a deadline, EACCES, EIO, FIFO, symlink, directory, unstable file, or oversized input produces structured partial/limit evidence and leaves only the affected field unknown.
 - This is the repository's intentional first journal entry because the finalization task explicitly requires durable repo-owned validation and handoff evidence; no top-level tracker, generated index, or local hook is introduced.
 
 ## Next Steps
@@ -58,3 +60,9 @@ superseded_by:
 - Latest Python 3.13 full suite: 223 passed, 2 skipped in 317.097 seconds.
 - Latest Python 3.13 and Xcode Python 3.9.6 `py_compile` checks passed for the helper and tests; the Xcode cache was redirected into a task-scoped worktree directory and removed afterward.
 - Ruff check and format verification, Joey's installed OpenAI skill-validator wrapper, project journal validation, and `git diff --check` passed.
+- New shared-deadline, FIFO, unsafe-file, oversize, and slow-Git regressions: 17 passed in 0.595 seconds with Python 3.13.0 and 17 passed in 0.742 seconds with Xcode Python 3.9.6.
+- Combined discovery, hook, and Git-configuration regressions: 28 passed in 18.637 seconds with Python 3.13.0.
+- Latest Python 3.13 full suite after auxiliary-probe hardening: 232 passed, 2 skipped in 254.705 seconds.
+- Python 3.13.0 and Xcode Python 3.9.6 `py_compile` checks passed for the helper and tests.
+- Final Python 3.13 full suite after README, skill, and journal synchronization: 232 passed, 2 skipped in 233.502 seconds.
+- The installed OpenAI validator wrapper could not acquire PyYAML because sandbox DNS was unavailable and the local Python runtime did not provide the module. Its documented fallback passed by parsing `SKILL.md` frontmatter and `agents/openai.yaml`, enforcing the validator's frontmatter constraints, and verifying referenced resources; no external runtime was installed.

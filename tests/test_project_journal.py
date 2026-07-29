@@ -133,19 +133,23 @@ class ProjectJournalTests(unittest.TestCase):
     def make_fake_git_runtime(
         self,
         name: str,
+        *,
+        source_text: str | None = None,
     ) -> project_journal._GitRuntime:
         source = self.root / f"{name}-source"
         source.write_text(
-            textwrap.dedent(
+            source_text
+            if source_text is not None
+            else textwrap.dedent(
                 """\
-                #!/bin/sh
-                if [ "$1" = "probe" ]; then
-                  printf 'safe-launch\\n'
-                  exit 0
-                fi
-                printf 'unexpected invocation\\n' >&2
-                exit 91
-                """
+                    #!/bin/sh
+                    if [ "$1" = "probe" ]; then
+                      printf 'safe-launch\\n'
+                      exit 0
+                    fi
+                    printf 'unexpected invocation\\n' >&2
+                    exit 91
+                    """
             ),
             encoding="utf-8",
         )
@@ -389,7 +393,7 @@ class ProjectJournalTests(unittest.TestCase):
 
         with self.assertRaises(project_journal.GeneratedIndexInspectionError) as raised:
             project_journal._generated_index_status(dangling)
-        self.assertEqual(raised.exception.errno, errno.ENOENT)
+        self.assertEqual(raised.exception.errno, errno.ELOOP)
 
     def test_generated_index_status_bounds_marker_prefix(self) -> None:
         marker = self.root / "oversized-marker.md"
@@ -404,6 +408,56 @@ class ProjectJournalTests(unittest.TestCase):
         ):
             project_journal._generated_index_status(marker)
 
+    def test_generated_index_status_rejects_fifo_without_blocking(self) -> None:
+        marker = self.root / "marker-fifo.md"
+        os.mkfifo(marker)
+        started = time.monotonic()
+
+        with self.assertRaises(project_journal.GeneratedIndexInspectionError) as raised:
+            project_journal._generated_index_status(
+                marker,
+                deadline=started + 1.0,
+            )
+
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertEqual(
+            raised.exception.errno,
+            getattr(errno, "ENXIO", errno.EINVAL),
+        )
+        self.assertIn("not a regular file", str(raised.exception))
+
+    def test_generated_index_status_consumes_existing_near_deadline(
+        self,
+    ) -> None:
+        marker = self.root / "near-deadline.md"
+        marker.write_text("---\n", encoding="utf-8")
+        clock = {"now": 100.0}
+        actual_read = project_journal.os.read
+
+        def read_past_deadline(fd: int, byte_count: int) -> bytes:
+            content = actual_read(fd, byte_count)
+            clock["now"] = 101.0
+            return content
+
+        with mock.patch.object(
+            project_journal.time,
+            "monotonic",
+            side_effect=lambda: clock["now"],
+        ):
+            with mock.patch.object(
+                project_journal.os,
+                "read",
+                side_effect=read_past_deadline,
+            ):
+                with self.assertRaisesRegex(
+                    project_journal.GeneratedIndexInspectionError,
+                    "shared deadline",
+                ):
+                    project_journal._generated_index_status(
+                        marker,
+                        deadline=100.5,
+                    )
+
     def test_journal_scan_treats_disappeared_entry_as_missing(self) -> None:
         repo = self.init_repo()
         journal = repo / "docs/project_journal/disappearing.md"
@@ -411,9 +465,13 @@ class ProjectJournalTests(unittest.TestCase):
         journal.write_text("---\n", encoding="utf-8")
         original_status = project_journal._generated_index_status
 
-        def disappear(path: pathlib.Path) -> str:
+        def disappear(
+            path: pathlib.Path,
+            *,
+            deadline: float | None = None,
+        ) -> str:
             path.unlink()
-            return original_status(path)
+            return original_status(path, deadline=deadline)
 
         with mock.patch.object(
             project_journal,
@@ -10086,7 +10144,10 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertEqual(row["discovery_status"], "inconclusive")
         self.assertEqual(set(row["discovery_error"]), {"hooks_installed"})
         hook_error = row["discovery_error"]["hooks_installed"]
-        self.assertEqual(hook_error["code"], "repo_discovery_failed")
+        self.assertEqual(
+            hook_error["code"],
+            "discovery_auxiliary_inspection_failed",
+        )
         self.assertIn(
             "implicit system Git config path cannot be proved safely",
             hook_error["message"],
@@ -10126,6 +10187,415 @@ class ProjectJournalTests(unittest.TestCase):
             discovery_error["index_ignored"]["message"],
         )
 
+    def test_enrich_rejects_journal_fifo_without_blocking(self) -> None:
+        repo = self.init_repo().resolve()
+        journal = repo / "docs/project_journal/entry.md"
+        journal.parent.mkdir(parents=True)
+        os.mkfifo(journal)
+        row: dict[str, object] = {"repo": str(repo)}
+        adoption = {
+            "adoption_status": "unadopted",
+            "adoption_error": None,
+            "tracked_journal_adopted": False,
+            "tracked_non_generated_journal_count": 0,
+            "valid_tracked_journal_count": 0,
+        }
+        started = time.monotonic()
+
+        with mock.patch.object(
+            project_journal,
+            "_discover_adoption_status",
+            return_value=adoption,
+        ):
+            with mock.patch.object(
+                project_journal,
+                "_is_excluded",
+                return_value=False,
+            ):
+                with mock.patch.object(
+                    project_journal,
+                    "_has_hook_marker",
+                    return_value=False,
+                ):
+                    project_journal._enrich_discovered_repo(
+                        repo,
+                        row,
+                        SCRIPT,
+                        deadline=started + 1.0,
+                    )
+
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertIsNone(row["journal_count"])
+        error = row["discovery_error"]["journal_count"]
+        self.assertEqual(error["code"], "generated_index_inspection_failed")
+        self.assertEqual(
+            error["errno"],
+            getattr(errno, "ENXIO", errno.EINVAL),
+        )
+
+    def test_enrich_rejects_exclude_fifo_without_blocking(self) -> None:
+        repo = self.init_repo().resolve()
+        exclude = repo / "exclude-fifo"
+        os.mkfifo(exclude)
+        row: dict[str, object] = {"repo": str(repo)}
+        adoption = {
+            "adoption_status": "unadopted",
+            "adoption_error": None,
+            "tracked_journal_adopted": False,
+            "tracked_non_generated_journal_count": 0,
+            "valid_tracked_journal_count": 0,
+        }
+        started = time.monotonic()
+
+        with mock.patch.object(
+            project_journal,
+            "_discover_adoption_status",
+            return_value=adoption,
+        ):
+            with mock.patch.object(
+                project_journal,
+                "_journal_paths",
+                return_value=[],
+            ):
+                with mock.patch.object(
+                    project_journal,
+                    "_git_path",
+                    return_value=exclude,
+                ):
+                    with mock.patch.object(
+                        project_journal,
+                        "_has_hook_marker",
+                        return_value=False,
+                    ):
+                        project_journal._enrich_discovered_repo(
+                            repo,
+                            row,
+                            SCRIPT,
+                            deadline=started + 1.0,
+                        )
+
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertIsNone(row["index_ignored"])
+        error = row["discovery_error"]["index_ignored"]
+        self.assertEqual(
+            error["code"],
+            "discovery_auxiliary_inspection_failed",
+        )
+        self.assertEqual(
+            error["errno"],
+            getattr(errno, "ENXIO", errno.EINVAL),
+        )
+
+    def test_enrich_rejects_hook_fifo_without_blocking(self) -> None:
+        repo = self.init_repo().resolve()
+        hook_dir = repo / "hook-fifo"
+        hook_dir.mkdir()
+        os.mkfifo(hook_dir / "post-merge")
+        row: dict[str, object] = {"repo": str(repo)}
+        adoption = {
+            "adoption_status": "unadopted",
+            "adoption_error": None,
+            "tracked_journal_adopted": False,
+            "tracked_non_generated_journal_count": 0,
+            "valid_tracked_journal_count": 0,
+        }
+        started = time.monotonic()
+
+        with mock.patch.object(
+            project_journal,
+            "_discover_adoption_status",
+            return_value=adoption,
+        ):
+            with mock.patch.object(
+                project_journal,
+                "_journal_paths",
+                return_value=[],
+            ):
+                with mock.patch.object(
+                    project_journal,
+                    "_is_excluded",
+                    return_value=False,
+                ):
+                    with mock.patch.object(
+                        project_journal,
+                        "_hook_path_plan",
+                        return_value=project_journal._HookPathPlan(
+                            root=repo,
+                            components=("hook-fifo",),
+                        ),
+                    ):
+                        project_journal._enrich_discovered_repo(
+                            repo,
+                            row,
+                            SCRIPT,
+                            deadline=started + 1.0,
+                        )
+
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertIsNone(row["hooks_installed"])
+        error = row["discovery_error"]["hooks_installed"]
+        self.assertEqual(
+            error["code"],
+            "discovery_auxiliary_inspection_failed",
+        )
+        self.assertEqual(
+            error["errno"],
+            getattr(errno, "ENXIO", errno.EINVAL),
+        )
+
+    def test_discovery_auxiliary_reader_rejects_unsafe_files(self) -> None:
+        target = self.root / "target"
+        target.write_text("target\n", encoding="utf-8")
+        symlink = self.root / "symlink"
+        symlink.symlink_to(target)
+        directory = self.root / "directory"
+        directory.mkdir()
+        oversized = self.root / "oversized"
+        oversized.write_bytes(b"x" * 5)
+
+        for name, path, byte_limit, expected_code in (
+            (
+                "symlink",
+                symlink,
+                16,
+                "discovery_auxiliary_inspection_failed",
+            ),
+            (
+                "directory",
+                directory,
+                16,
+                "discovery_auxiliary_inspection_failed",
+            ),
+            (
+                "oversized",
+                oversized,
+                4,
+                "discovery_auxiliary_inspection_limit_exceeded",
+            ),
+        ):
+            with self.subTest(name=name):
+                with self.assertRaises(
+                    project_journal.DiscoveryAuxiliaryInspectionError
+                ) as raised:
+                    project_journal._read_discovery_regular_path(
+                        path,
+                        label="test auxiliary",
+                        byte_limit=byte_limit,
+                        deadline=time.monotonic() + 1.0,
+                    )
+                self.assertEqual(raised.exception.code, expected_code)
+                if name == "oversized":
+                    self.assertEqual(raised.exception.limit, 4)
+                    self.assertEqual(raised.exception.observed, 5)
+
+    def test_enrich_reports_oversized_exclude_and_hook_files(self) -> None:
+        adoption = {
+            "adoption_status": "unadopted",
+            "adoption_error": None,
+            "tracked_journal_adopted": False,
+            "tracked_non_generated_journal_count": 0,
+            "valid_tracked_journal_count": 0,
+        }
+        for field in ("index_ignored", "hooks_installed"):
+            with self.subTest(field=field):
+                repo = self.init_repo(f"oversized-{field}").resolve()
+                auxiliary_dir = repo / "auxiliary"
+                auxiliary_dir.mkdir()
+                auxiliary = (
+                    auxiliary_dir / "exclude"
+                    if field == "index_ignored"
+                    else auxiliary_dir / "post-merge"
+                )
+                auxiliary.write_bytes(b"x" * 5)
+                row: dict[str, object] = {"repo": str(repo)}
+
+                with mock.patch.object(
+                    project_journal,
+                    "_discover_adoption_status",
+                    return_value=adoption,
+                ):
+                    with mock.patch.object(
+                        project_journal,
+                        "_journal_paths",
+                        return_value=[],
+                    ):
+                        if field == "index_ignored":
+                            with mock.patch.object(
+                                project_journal,
+                                "_git_path",
+                                return_value=auxiliary,
+                            ):
+                                with mock.patch.object(
+                                    project_journal,
+                                    "_has_hook_marker",
+                                    return_value=False,
+                                ):
+                                    with mock.patch.object(
+                                        project_journal,
+                                        "MAX_DISCOVERY_EXCLUDE_BYTES",
+                                        4,
+                                    ):
+                                        project_journal._enrich_discovered_repo(
+                                            repo,
+                                            row,
+                                            SCRIPT,
+                                        )
+                        else:
+                            with mock.patch.object(
+                                project_journal,
+                                "_is_excluded",
+                                return_value=False,
+                            ):
+                                with mock.patch.object(
+                                    project_journal,
+                                    "_hook_path_plan",
+                                    return_value=project_journal._HookPathPlan(
+                                        root=repo,
+                                        components=("auxiliary",),
+                                    ),
+                                ):
+                                    with mock.patch.object(
+                                        project_journal,
+                                        "MAX_DISCOVERY_HOOK_BYTES",
+                                        4,
+                                    ):
+                                        project_journal._enrich_discovered_repo(
+                                            repo,
+                                            row,
+                                            SCRIPT,
+                                        )
+
+                self.assertIsNone(row[field])
+                error = row["discovery_error"][field]
+                self.assertEqual(
+                    error["code"],
+                    "discovery_auxiliary_inspection_limit_exceeded",
+                )
+                self.assertEqual(error["limit"], 4)
+                self.assertEqual(error["observed"], 5)
+
+    def test_is_excluded_bounds_slow_git_to_candidate_deadline(self) -> None:
+        repo = self.init_repo().resolve()
+        runtime = self.make_fake_git_runtime(
+            "slow-discovery-git",
+            source_text="#!/bin/sh\nsleep 30\n",
+        )
+        started = time.monotonic()
+        try:
+            with mock.patch.object(project_journal, "_GIT_RUNTIME", runtime):
+                with mock.patch.object(
+                    project_journal,
+                    "_GIT_RUNTIME_ERROR",
+                    None,
+                ):
+                    with self.assertRaisesRegex(
+                        project_journal.DiscoveryAuxiliaryInspectionError,
+                        "candidate deadline",
+                    ):
+                        project_journal._is_excluded(
+                            repo,
+                            project_journal.DEFAULT_INDEX.as_posix(),
+                            deadline=started + 0.15,
+                        )
+        finally:
+            runtime.snapshot_owner.cleanup()
+
+        self.assertLess(time.monotonic() - started, 1.5)
+
+    def test_enrich_forwards_one_absolute_deadline_to_auxiliary_probes(
+        self,
+    ) -> None:
+        repo = self.init_repo().resolve()
+        row: dict[str, object] = {"repo": str(repo)}
+        deadline = time.monotonic() + 5.0
+        observed: list[float | None] = []
+        adoption = {
+            "adoption_status": "unadopted",
+            "adoption_error": None,
+            "tracked_journal_adopted": False,
+            "tracked_non_generated_journal_count": 0,
+            "valid_tracked_journal_count": 0,
+        }
+
+        def record_adoption(
+            root: pathlib.Path,
+            *,
+            deadline: float | None = None,
+        ) -> dict[str, object]:
+            del root
+            observed.append(deadline)
+            return adoption
+
+        def record_stat(
+            path: pathlib.Path,
+            *,
+            follow_symlinks: bool = True,
+            deadline: float | None = None,
+            deadline_error: str,
+        ) -> None:
+            del path, follow_symlinks, deadline_error
+            observed.append(deadline)
+            return None
+
+        def record_paths(
+            root: pathlib.Path,
+            *,
+            deadline: float | None = None,
+        ) -> list[pathlib.Path]:
+            del root
+            observed.append(deadline)
+            return []
+
+        def record_boolean(
+            root: pathlib.Path,
+            *args: str,
+            deadline: float | None = None,
+            **kwargs: object,
+        ) -> bool:
+            del root, args, kwargs
+            observed.append(deadline)
+            return False
+
+        with mock.patch.object(
+            project_journal,
+            "_discover_adoption_status",
+            side_effect=record_adoption,
+        ):
+            with mock.patch.object(
+                project_journal,
+                "_stat_path_if_present",
+                side_effect=record_stat,
+            ):
+                with mock.patch.object(
+                    project_journal,
+                    "_journal_paths",
+                    side_effect=record_paths,
+                ):
+                    with mock.patch.object(
+                        project_journal,
+                        "_is_excluded",
+                        side_effect=record_boolean,
+                    ):
+                        with mock.patch.object(
+                            project_journal,
+                            "_has_hook_marker",
+                            side_effect=record_boolean,
+                        ):
+                            with mock.patch.object(
+                                project_journal,
+                                "_discovery_regular_path_exists",
+                                side_effect=record_boolean,
+                            ):
+                                project_journal._enrich_discovered_repo(
+                                    repo,
+                                    row,
+                                    SCRIPT,
+                                    deadline=deadline,
+                                )
+
+        self.assertTrue(observed)
+        self.assertEqual(set(observed), {deadline})
+
     def test_enrich_missing_auxiliary_paths_are_authoritative_negatives(
         self,
     ) -> None:
@@ -10139,8 +10609,6 @@ class ProjectJournalTests(unittest.TestCase):
             "valid_tracked_journal_count": 0,
         }
         missing_exclude = repo / "missing-exclude"
-        missing_hook = repo / "missing-hook"
-
         with mock.patch.object(
             project_journal,
             "_discover_adoption_status",
@@ -10153,8 +10621,11 @@ class ProjectJournalTests(unittest.TestCase):
             ):
                 with mock.patch.object(
                     project_journal,
-                    "_hook_path",
-                    return_value=missing_hook,
+                    "_hook_path_plan",
+                    return_value=project_journal._HookPathPlan(
+                        root=repo,
+                        components=("missing-hooks",),
+                    ),
                 ):
                     project_journal._enrich_discovered_repo(repo, row, SCRIPT)
 
@@ -10296,7 +10767,7 @@ class ProjectJournalTests(unittest.TestCase):
             "tracked_non_generated_journal_count": 0,
             "valid_tracked_journal_count": 0,
         }
-        actual_open = pathlib.Path.open
+        actual_open = project_journal.os.open
 
         for error_number in (errno.EACCES, errno.EIO):
             with self.subTest(error_number=error_number):
@@ -10307,11 +10778,11 @@ class ProjectJournalTests(unittest.TestCase):
                 row: dict[str, object] = {"repo": str(repo)}
 
                 def fail_marker_open(
-                    path: pathlib.Path,
+                    path: os.PathLike[str] | str,
                     *args: object,
                     **kwargs: object,
-                ) -> object:
-                    if path == journal:
+                ) -> int:
+                    if pathlib.Path(path) == journal:
                         raise OSError(
                             error_number,
                             "injected marker read failure",
@@ -10335,9 +10806,8 @@ class ProjectJournalTests(unittest.TestCase):
                             return_value=False,
                         ):
                             with mock.patch.object(
-                                pathlib.Path,
+                                project_journal.os,
                                 "open",
-                                autospec=True,
                                 side_effect=fail_marker_open,
                             ):
                                 project_journal._enrich_discovered_repo(
@@ -10369,7 +10839,7 @@ class ProjectJournalTests(unittest.TestCase):
         }
 
         for kind, expected_code, expected_errno in (
-            ("dangling", "generated_index_inspection_failed", errno.ENOENT),
+            ("dangling", "generated_index_inspection_failed", errno.ELOOP),
             ("directory", "generated_index_inspection_failed", errno.EISDIR),
             (
                 "oversized",
@@ -10420,6 +10890,14 @@ class ProjectJournalTests(unittest.TestCase):
                 self.assertEqual(error["code"], expected_code)
                 if expected_errno is None:
                     self.assertNotIn("errno", error)
+                    self.assertEqual(
+                        error["limit_name"],
+                        "generated-index marker line bytes",
+                    )
+                    self.assertEqual(
+                        error["limit"],
+                        project_journal.MAX_GENERATED_INDEX_MARKER_LINE_BYTES,
+                    )
                 else:
                     self.assertEqual(error["errno"], expected_errno)
 
@@ -10431,7 +10909,9 @@ class ProjectJournalTests(unittest.TestCase):
         journal_root.mkdir(parents=True)
         index_path = repo / project_journal.DEFAULT_INDEX
         exclude_path = repo / "blocked-exclude"
-        hook_path = repo / "blocked-hook"
+        hook_dir = repo / "blocked-hooks"
+        hook_dir.mkdir()
+        hook_path = hook_dir / "post-merge"
         adoption = {
             "adoption_status": "unadopted",
             "adoption_error": None,
@@ -10439,7 +10919,7 @@ class ProjectJournalTests(unittest.TestCase):
             "tracked_non_generated_journal_count": 0,
             "valid_tracked_journal_count": 0,
         }
-        actual_stat = project_journal.os.stat
+        actual_open = project_journal.os.open
 
         for field, blocked_path, error_number in (
             ("has_index", index_path, errno.EIO),
@@ -10448,19 +10928,20 @@ class ProjectJournalTests(unittest.TestCase):
         ):
             with self.subTest(field=field):
                 row: dict[str, object] = {"repo": str(repo)}
+                blocked_path.write_text("blocked\n", encoding="utf-8")
 
                 def inaccessible_path(
-                    path: os.PathLike[str] | str | int,
+                    path: os.PathLike[str] | str,
                     *args: object,
                     **kwargs: object,
-                ) -> os.stat_result:
-                    if not isinstance(path, int) and pathlib.Path(path) == blocked_path:
+                ) -> int:
+                    if pathlib.Path(path) == blocked_path:
                         raise OSError(
                             error_number,
                             f"injected inaccessible {field}",
                             str(path),
                         )
-                    return actual_stat(path, *args, **kwargs)
+                    return actual_open(path, *args, **kwargs)
 
                 with mock.patch.object(
                     project_journal,
@@ -10468,25 +10949,32 @@ class ProjectJournalTests(unittest.TestCase):
                     return_value=adoption,
                 ):
                     with mock.patch.object(
-                        project_journal,
-                        "_git_path",
-                        return_value=exclude_path,
+                        project_journal, "_journal_paths", return_value=[]
                     ):
                         with mock.patch.object(
                             project_journal,
-                            "_hook_path",
-                            return_value=hook_path,
+                            "_git_path",
+                            return_value=exclude_path,
                         ):
                             with mock.patch.object(
-                                project_journal.os,
-                                "stat",
-                                side_effect=inaccessible_path,
+                                project_journal,
+                                "_hook_path_plan",
+                                return_value=project_journal._HookPathPlan(
+                                    root=repo,
+                                    components=("blocked-hooks",),
+                                ),
                             ):
-                                project_journal._enrich_discovered_repo(
-                                    repo,
-                                    row,
-                                    SCRIPT,
-                                )
+                                with mock.patch.object(
+                                    project_journal.os,
+                                    "open",
+                                    side_effect=inaccessible_path,
+                                ):
+                                    project_journal._enrich_discovered_repo(
+                                        repo,
+                                        row,
+                                        SCRIPT,
+                                    )
+                blocked_path.unlink()
 
                 self.assertEqual(row["journal_count"], 0)
                 self.assertEqual(row["discovery_status"], "inconclusive")

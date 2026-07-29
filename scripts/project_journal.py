@@ -77,6 +77,8 @@ MAX_GIT_VERSION_OUTPUT_BYTES = 4096
 MAX_GLOBAL_GIT_CONFIG_OUTPUT_BYTES = 16 * 1024
 MAX_GLOBAL_GIT_CONFIG_SOURCE_BYTES = 1024 * 1024
 MAX_EXISTING_HOOK_BYTES = 1024 * 1024
+MAX_DISCOVERY_EXCLUDE_BYTES = 1024 * 1024
+MAX_DISCOVERY_HOOK_BYTES = MAX_EXISTING_HOOK_BYTES
 MAX_HOOK_RECOVERY_PATH_SCAN_ENTRIES = 4096
 MAX_GENERIC_GIT_STDOUT_BYTES = 4 * 1024 * 1024
 MAX_GIT_EXECUTABLE_BYTES = 64 * 1024 * 1024
@@ -203,6 +205,54 @@ class GeneratedIndexInspectionLimitExceeded(GeneratedIndexInspectionError):
     """A possible generated-index marker exceeded its inspection budget."""
 
     code = "generated_index_inspection_limit_exceeded"
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        limit_name: str,
+        limit: int,
+        observed: int,
+    ) -> None:
+        self.limit_name = limit_name
+        self.limit = limit
+        self.observed = observed
+        super().__init__(message)
+
+
+class DiscoveryAuxiliaryInspectionError(UserError):
+    """A discovery-only auxiliary file could not be inspected safely."""
+
+    code = "discovery_auxiliary_inspection_failed"
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        error_number: int | None = None,
+    ) -> None:
+        if error_number is not None:
+            self.errno = error_number
+        super().__init__(message)
+
+
+class DiscoveryAuxiliaryInspectionLimitExceeded(DiscoveryAuxiliaryInspectionError):
+    """A discovery-only auxiliary file exceeded its inspection budget."""
+
+    code = "discovery_auxiliary_inspection_limit_exceeded"
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        limit_name: str,
+        limit: int,
+        observed: int,
+    ) -> None:
+        self.limit_name = limit_name
+        self.limit = limit
+        self.observed = observed
+        super().__init__(message)
 
 
 class DiscoveryLimitExceeded(UserError):
@@ -1437,7 +1487,10 @@ def _secure_read_regular_path(
     label: str,
     byte_limit: int,
     missing_ok: bool = False,
+    deadline: float | None = None,
+    deadline_error: str = "secure file inspection exceeded its shared deadline",
 ) -> bytes | None:
+    _check_deadline(deadline, deadline_error)
     flags = (
         os.O_RDONLY
         | getattr(os, "O_CLOEXEC", 0)
@@ -1459,6 +1512,7 @@ def _secure_read_regular_path(
         raise UserError(f"failed to open {label} {path}: {detail}") from exc
 
     try:
+        _check_deadline(deadline, deadline_error)
         before = os.fstat(fd)
         if not stat.S_ISREG(before.st_mode):
             raise UserError(f"{label} is not a regular file: {path}")
@@ -1470,6 +1524,7 @@ def _secure_read_regular_path(
             raise UserError(
                 f"{label} path became unavailable while being bound: {path}: {exc}"
             ) from exc
+        _check_deadline(deadline, deadline_error)
         identity = _file_identity(before)
         if _file_identity(path_before) != identity or not stat.S_ISREG(
             path_before.st_mode
@@ -1477,13 +1532,16 @@ def _secure_read_regular_path(
             raise UserError(f"{label} path changed while being bound: {path}")
 
         def read_once() -> bytes:
+            _check_deadline(deadline, deadline_error)
             os.lseek(fd, 0, os.SEEK_SET)
             content = bytearray()
             while len(content) <= byte_limit:
+                _check_deadline(deadline, deadline_error)
                 chunk = os.read(
                     fd,
                     min(PROCESS_READ_CHUNK_BYTES, byte_limit + 1 - len(content)),
                 )
+                _check_deadline(deadline, deadline_error)
                 if not chunk:
                     break
                 content.extend(chunk)
@@ -1492,8 +1550,10 @@ def _secure_read_regular_path(
             return bytes(content)
 
         first = read_once()
+        _check_deadline(deadline, deadline_error)
         between = os.fstat(fd)
         second = read_once()
+        _check_deadline(deadline, deadline_error)
         after = os.fstat(fd)
         try:
             path_after = os.stat(path, follow_symlinks=False)
@@ -1501,6 +1561,7 @@ def _secure_read_regular_path(
             raise UserError(
                 f"{label} path became unavailable while being read: {path}: {exc}"
             ) from exc
+        _check_deadline(deadline, deadline_error)
         if (
             _file_identity(between) != identity
             or _file_identity(after) != identity
@@ -2100,8 +2161,23 @@ def _resolve_repo(
     return _lexical_absolute_path(pathlib.Path(result.stdout.strip()))
 
 
-def _git_path(repo: pathlib.Path, rel: str) -> pathlib.Path:
-    result = _run_git(repo, "rev-parse", "--git-path", rel)
+def _git_path(
+    repo: pathlib.Path,
+    rel: str,
+    *,
+    deadline: float | None = None,
+    deadline_error: str = "Git path lookup exceeded its shared deadline",
+) -> pathlib.Path:
+    result = _run_git(
+        repo,
+        "rev-parse",
+        "--git-path",
+        rel,
+        deadline=deadline,
+        deadline_error=deadline_error,
+        operation="Git path lookup",
+    )
+    _check_deadline(deadline, deadline_error)
     if result.returncode != 0:
         detail = (
             result.stderr.strip() or result.stdout.strip() or "git path lookup failed"
@@ -2113,12 +2189,21 @@ def _git_path(repo: pathlib.Path, rel: str) -> pathlib.Path:
     return path
 
 
-def _stat_path_if_present(path: pathlib.Path) -> os.stat_result | None:
-    """Return a following stat while keeping absent distinct from unreadable."""
+def _stat_path_if_present(
+    path: pathlib.Path,
+    *,
+    follow_symlinks: bool = True,
+    deadline: float | None = None,
+    deadline_error: str = "file status inspection exceeded its shared deadline",
+) -> os.stat_result | None:
+    """Return a bounded stat while keeping absent distinct from unreadable."""
+    _check_deadline(deadline, deadline_error)
     try:
-        return os.stat(path)
+        result = os.stat(path, follow_symlinks=follow_symlinks)
     except (FileNotFoundError, NotADirectoryError):
         return None
+    _check_deadline(deadline, deadline_error)
+    return result
 
 
 def _to_repo_rel(repo: pathlib.Path, path_arg: str) -> str:
@@ -2352,27 +2437,37 @@ def _journal_paths(
     *,
     deadline: float | None = None,
 ) -> list[pathlib.Path]:
+    deadline_error = "journal discovery exceeded its shared deadline"
     root = repo / JOURNAL_ROOT
-    root_stat = _stat_path_if_present(root)
-    if root_stat is None or not stat.S_ISDIR(root_stat.st_mode):
+    root_stat = _stat_path_if_present(
+        root,
+        follow_symlinks=False,
+        deadline=deadline,
+        deadline_error=deadline_error,
+    )
+    if root_stat is None:
         return []
+    if not stat.S_ISDIR(root_stat.st_mode):
+        raise DiscoveryAuxiliaryInspectionError(
+            f"journal root is not a directory: {root}"
+        )
     paths: list[pathlib.Path] = []
     pending = [root]
     while pending:
-        _check_deadline(deadline, "journal discovery exceeded its shared deadline")
+        _check_deadline(deadline, deadline_error)
         directory = pending.pop()
         with os.scandir(directory) as entries:
             for entry in entries:
-                _check_deadline(
-                    deadline,
-                    "journal discovery exceeded its shared deadline",
-                )
+                _check_deadline(deadline, deadline_error)
                 path = pathlib.Path(entry.path)
                 if entry.is_dir(follow_symlinks=False):
                     pending.append(path)
                 if not entry.name.endswith(".md"):
                     continue
-                marker_status = _generated_index_status(path)
+                marker_status = _generated_index_status(
+                    path,
+                    deadline=deadline,
+                )
                 if marker_status in {"missing", "generated"}:
                     continue
                 paths.append(path)
@@ -2380,6 +2475,7 @@ def _journal_paths(
                     raise JournalLimitExceeded(
                         f"journal entry count exceeds {MAX_JOURNAL_ENTRIES}"
                     )
+        _check_deadline(deadline, deadline_error)
     return sorted(paths)
 
 
@@ -4063,68 +4159,209 @@ def _is_generated_index_blob(content: bytes) -> bool:
     )
 
 
-def _read_generated_index_marker_line(
-    handle: Any,
+def _check_generated_index_deadline(
+    deadline: float | None,
     path: pathlib.Path,
+) -> None:
+    try:
+        _check_deadline(
+            deadline,
+            f"{path}: generated-index marker inspection exceeded its shared deadline",
+        )
+    except UserError as exc:
+        raise GeneratedIndexInspectionError(str(exc)) from exc
+
+
+def _read_generated_index_marker_line(
+    content: bytes,
+    path: pathlib.Path,
+    offset: int,
     total_bytes: int,
-) -> tuple[bytes, int]:
-    line = handle.readline(MAX_GENERATED_INDEX_MARKER_LINE_BYTES + 1)
+) -> tuple[bytes, int, int]:
+    newline = content.find(b"\n", offset)
+    end = len(content) if newline < 0 else newline + 1
+    line = content[offset:end]
     total_bytes += len(line)
     if len(line) > MAX_GENERATED_INDEX_MARKER_LINE_BYTES:
         raise GeneratedIndexInspectionLimitExceeded(
             f"{path}: generated-index marker line exceeds "
-            f"{MAX_GENERATED_INDEX_MARKER_LINE_BYTES} bytes"
+            f"{MAX_GENERATED_INDEX_MARKER_LINE_BYTES} bytes",
+            limit_name="generated-index marker line bytes",
+            limit=MAX_GENERATED_INDEX_MARKER_LINE_BYTES,
+            observed=len(line),
         )
     if total_bytes > MAX_GENERATED_INDEX_MARKER_BYTES:
         raise GeneratedIndexInspectionLimitExceeded(
             f"{path}: generated-index marker inspection exceeds "
-            f"{MAX_GENERATED_INDEX_MARKER_BYTES} bytes"
+            f"{MAX_GENERATED_INDEX_MARKER_BYTES} bytes",
+            limit_name="generated-index marker inspection bytes",
+            limit=MAX_GENERATED_INDEX_MARKER_BYTES,
+            observed=total_bytes,
         )
-    return line, total_bytes
+    return line, total_bytes, end
 
 
-def _generated_index_status(path: pathlib.Path) -> str:
+def _read_generated_index_marker_prefix(
+    fd: int,
+    path: pathlib.Path,
+    *,
+    deadline: float | None,
+) -> bytes:
+    _check_generated_index_deadline(deadline, path)
+    os.lseek(fd, 0, os.SEEK_SET)
+    content = bytearray()
+    while len(content) <= MAX_GENERATED_INDEX_MARKER_BYTES:
+        _check_generated_index_deadline(deadline, path)
+        try:
+            chunk = os.read(
+                fd,
+                min(
+                    PROCESS_READ_CHUNK_BYTES,
+                    MAX_GENERATED_INDEX_MARKER_BYTES + 1 - len(content),
+                ),
+            )
+        except OSError as exc:
+            raise GeneratedIndexInspectionError(
+                f"{path}: generated-index marker read failed: {exc}",
+                error_number=exc.errno,
+            ) from exc
+        _check_generated_index_deadline(deadline, path)
+        if not chunk:
+            break
+        content.extend(chunk)
+    return bytes(content)
+
+
+def _generated_index_status_from_prefix(
+    content: bytes,
+    path: pathlib.Path,
+) -> str:
+    first, total_bytes, offset = _read_generated_index_marker_line(
+        content,
+        path,
+        0,
+        0,
+    )
+    if first.removesuffix(b"\n").removesuffix(b"\r") != b"# Project Journal Index":
+        return "non-generated"
+    second, total_bytes, offset = _read_generated_index_marker_line(
+        content,
+        path,
+        offset,
+        total_bytes,
+    )
+    third, _, _ = _read_generated_index_marker_line(
+        content,
+        path,
+        offset,
+        total_bytes,
+    )
+    marker = b"".join((first, second, third))
+    return "generated" if _is_generated_index_blob(marker) else "non-generated"
+
+
+def _generated_index_status(
+    path: pathlib.Path,
+    *,
+    deadline: float | None = None,
+) -> str:
     """Return missing, generated, or non-generated; propagate other I/O failures."""
 
+    _check_generated_index_deadline(deadline, path)
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | _required_open_flag("O_NOFOLLOW")
+        | _required_open_flag("O_NONBLOCK")
+    )
     try:
-        with path.open("rb") as handle:
-            first, total_bytes = _read_generated_index_marker_line(handle, path, 0)
-            if (
-                first.removesuffix(b"\n").removesuffix(b"\r")
-                != b"# Project Journal Index"
-            ):
-                return "non-generated"
-            second, total_bytes = _read_generated_index_marker_line(
-                handle,
-                path,
-                total_bytes,
-            )
-            third, _ = _read_generated_index_marker_line(
-                handle,
-                path,
-                total_bytes,
-            )
-    except FileNotFoundError as exc:
-        try:
-            os.lstat(path)
-        except FileNotFoundError:
-            return "missing"
-        except OSError as stat_error:
-            raise GeneratedIndexInspectionError(
-                f"{path}: generated-index marker existence check failed: {stat_error}",
-                error_number=stat_error.errno,
-            ) from stat_error
-        raise GeneratedIndexInspectionError(
-            f"{path}: generated-index marker target is missing",
-            error_number=exc.errno,
-        ) from exc
+        fd = os.open(path, flags)
+    except FileNotFoundError:
+        return "missing"
     except OSError as exc:
+        detail = (
+            "path is a symlink or could not be opened without following links"
+            if exc.errno in {errno.ELOOP, errno.EMLINK}
+            else str(exc)
+        )
         raise GeneratedIndexInspectionError(
-            f"{path}: generated-index marker read failed: {exc}",
+            f"{path}: generated-index marker open failed: {detail}",
             error_number=exc.errno,
         ) from exc
-    content = b"".join((first, second, third))
-    return "generated" if _is_generated_index_blob(content) else "non-generated"
+
+    try:
+        _check_generated_index_deadline(deadline, path)
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode):
+            error_number = (
+                errno.EISDIR
+                if stat.S_ISDIR(before.st_mode)
+                else getattr(errno, "ENXIO", errno.EINVAL)
+            )
+            raise GeneratedIndexInspectionError(
+                f"{path}: generated-index marker is not a regular file",
+                error_number=error_number,
+            )
+        try:
+            path_before = os.stat(path, follow_symlinks=False)
+        except OSError as exc:
+            raise GeneratedIndexInspectionError(
+                f"{path}: generated-index marker path binding failed: {exc}",
+                error_number=exc.errno,
+            ) from exc
+        identity = _file_identity(before)
+        if (
+            not stat.S_ISREG(path_before.st_mode)
+            or _file_identity(path_before) != identity
+        ):
+            raise GeneratedIndexInspectionError(
+                f"{path}: generated-index marker path changed while being bound"
+            )
+
+        first_status = _generated_index_status_from_prefix(
+            _read_generated_index_marker_prefix(
+                fd,
+                path,
+                deadline=deadline,
+            ),
+            path,
+        )
+        _check_generated_index_deadline(deadline, path)
+        between = os.fstat(fd)
+        second_status = _generated_index_status_from_prefix(
+            _read_generated_index_marker_prefix(
+                fd,
+                path,
+                deadline=deadline,
+            ),
+            path,
+        )
+        _check_generated_index_deadline(deadline, path)
+        after = os.fstat(fd)
+        try:
+            path_after = os.stat(path, follow_symlinks=False)
+        except OSError as exc:
+            raise GeneratedIndexInspectionError(
+                f"{path}: generated-index marker path revalidation failed: {exc}",
+                error_number=exc.errno,
+            ) from exc
+        if (
+            _file_identity(between) != identity
+            or _file_identity(after) != identity
+            or not stat.S_ISREG(path_after.st_mode)
+            or _file_identity(path_after) != identity
+        ):
+            raise GeneratedIndexInspectionError(
+                f"{path}: generated-index marker object changed during inspection"
+            )
+        if first_status != second_status:
+            raise GeneratedIndexInspectionError(
+                f"{path}: generated-index marker classification changed "
+                "during inspection"
+            )
+        return first_status
+    finally:
+        os.close(fd)
 
 
 def _load_entries_from_paths(
@@ -4543,8 +4780,21 @@ def _lexical_absolute_path(
     return pathlib.Path(os.path.abspath(os.path.normpath(os.fspath(path))))
 
 
-def _git_common_directory(repo: pathlib.Path) -> pathlib.Path:
-    common_dir = _run_git(repo, "rev-parse", "--git-common-dir")
+def _git_common_directory(
+    repo: pathlib.Path,
+    *,
+    deadline: float | None = None,
+    deadline_error: str = "Git common-directory lookup exceeded its shared deadline",
+) -> pathlib.Path:
+    common_dir = _run_git(
+        repo,
+        "rev-parse",
+        "--git-common-dir",
+        deadline=deadline,
+        deadline_error=deadline_error,
+        operation="Git common-directory lookup",
+    )
+    _check_deadline(deadline, deadline_error)
     if common_dir.returncode != 0 or not common_dir.stdout.strip():
         detail = (
             common_dir.stderr.strip()
@@ -4558,11 +4808,28 @@ def _git_common_directory(repo: pathlib.Path) -> pathlib.Path:
     )
 
 
-def _allowed_hook_roots(repo: pathlib.Path) -> list[pathlib.Path]:
+def _allowed_hook_roots(
+    repo: pathlib.Path,
+    *,
+    deadline: float | None = None,
+    deadline_error: str = "hook-root discovery exceeded its shared deadline",
+) -> list[pathlib.Path]:
     roots = [
         _lexical_absolute_path(repo),
-        _lexical_absolute_path(_git_path(repo, "."), base=repo),
-        _git_common_directory(repo),
+        _lexical_absolute_path(
+            _git_path(
+                repo,
+                ".",
+                deadline=deadline,
+                deadline_error=deadline_error,
+            ),
+            base=repo,
+        ),
+        _git_common_directory(
+            repo,
+            deadline=deadline,
+            deadline_error=deadline_error,
+        ),
     ]
     unique: list[pathlib.Path] = []
     for root in roots:
@@ -4571,7 +4838,13 @@ def _allowed_hook_roots(repo: pathlib.Path) -> list[pathlib.Path]:
     return unique
 
 
-def _hook_path_plan_from_config(repo: pathlib.Path, raw_path: str) -> _HookPathPlan:
+def _hook_path_plan_from_config(
+    repo: pathlib.Path,
+    raw_path: str,
+    *,
+    deadline: float | None = None,
+    deadline_error: str = "hook-path discovery exceeded its shared deadline",
+) -> _HookPathPlan:
     if raw_path == "":
         raise UserError(
             "core.hooksPath is empty; unset it or set a non-empty hook directory before installing"
@@ -4586,7 +4859,12 @@ def _hook_path_plan_from_config(repo: pathlib.Path, raw_path: str) -> _HookPathP
     hooks_dir = pathlib.Path(raw_path)
     hooks_dir = _lexical_absolute_path(hooks_dir, base=repo)
     candidates: list[tuple[pathlib.Path, tuple[str, ...]]] = []
-    for root in _allowed_hook_roots(repo):
+    for root in _allowed_hook_roots(
+        repo,
+        deadline=deadline,
+        deadline_error=deadline_error,
+    ):
+        _check_deadline(deadline, deadline_error)
         try:
             relative = hooks_dir.relative_to(root)
         except ValueError:
@@ -4604,9 +4882,18 @@ def _hook_path_plan_from_config(repo: pathlib.Path, raw_path: str) -> _HookPathP
     return _HookPathPlan(root=root, components=components)
 
 
-def _default_hook_path_plan(repo: pathlib.Path) -> _HookPathPlan:
+def _default_hook_path_plan(
+    repo: pathlib.Path,
+    *,
+    deadline: float | None = None,
+    deadline_error: str = "default hook-path discovery exceeded its shared deadline",
+) -> _HookPathPlan:
     return _HookPathPlan(
-        root=_git_common_directory(repo),
+        root=_git_common_directory(
+            repo,
+            deadline=deadline,
+            deadline_error=deadline_error,
+        ),
         components=("hooks",),
     )
 
@@ -4672,22 +4959,28 @@ def _global_git_config_entries(
     *,
     missing_ok: bool = False,
     label: str = "global Git config",
+    deadline: float | None = None,
+    deadline_error: str = "Git configuration inspection exceeded its shared deadline",
 ) -> list[tuple[str, str]]:
     content = _secure_read_regular_path(
         config_path,
         label=label,
         byte_limit=MAX_GLOBAL_GIT_CONFIG_SOURCE_BYTES,
         missing_ok=missing_ok,
+        deadline=deadline,
+        deadline_error=deadline_error,
     )
     if content is None:
         return []
 
+    _check_deadline(deadline, deadline_error)
     with tempfile.NamedTemporaryFile(
         prefix="project-journal-global-config-",
         suffix=".cfg",
     ) as staged:
         staged.write(content)
         staged.flush()
+        _check_deadline(deadline, deadline_error)
         runtime = _require_git_runtime()
         command = [
             str(runtime.executable),
@@ -4715,11 +5008,17 @@ def _global_git_config_entries(
                 f"{label} query stderr exceeds {MAX_GIT_STDERR_BYTES} bytes"
             ),
             timeout_error=(
-                f"{label} query timed out after "
-                f"{GIT_CONFIG_QUERY_TIMEOUT_SECONDS:g} seconds"
+                deadline_error
+                if deadline is not None
+                else (
+                    f"{label} query timed out after "
+                    f"{GIT_CONFIG_QUERY_TIMEOUT_SECONDS:g} seconds"
+                )
             ),
             operation=f"{label} query",
+            deadline=deadline,
         )
+    _check_deadline(deadline, deadline_error)
     if result.returncode != 0:
         detail = (
             result.stderr.decode("utf-8", errors="replace").strip()
@@ -4736,7 +5035,12 @@ def _git_env_flag_enabled(name: str) -> bool:
     return value.strip().lower() not in {"0", "false", "no", "off"}
 
 
-def _system_git_config_entries() -> list[tuple[str, str]]:
+def _system_git_config_entries(
+    *,
+    deadline: float | None = None,
+    deadline_error: str = "system Git configuration inspection exceeded its shared deadline",
+) -> list[tuple[str, str]]:
+    _check_deadline(deadline, deadline_error)
     if _git_env_flag_enabled("GIT_CONFIG_NOSYSTEM"):
         return []
 
@@ -4756,7 +5060,12 @@ def _system_git_config_entries() -> list[tuple[str, str]]:
         path = _lexical_absolute_path(path)
         if path == _lexical_absolute_path(pathlib.Path(os.devnull)):
             return []
-        return _global_git_config_entries(path, label="system Git config")
+        return _global_git_config_entries(
+            path,
+            label="system Git config",
+            deadline=deadline,
+            deadline_error=deadline_error,
+        )
 
     raise UserError(
         "implicit system Git config path cannot be proved safely without "
@@ -4765,8 +5074,17 @@ def _system_git_config_entries() -> list[tuple[str, str]]:
     )
 
 
-def _preflight_global_hooks_config(repo: pathlib.Path) -> None:
-    system_entries = _system_git_config_entries()
+def _preflight_global_hooks_config(
+    repo: pathlib.Path,
+    *,
+    deadline: float | None = None,
+    deadline_error: str = "global hook configuration inspection exceeded its shared deadline",
+) -> None:
+    _check_deadline(deadline, deadline_error)
+    system_entries = _system_git_config_entries(
+        deadline=deadline,
+        deadline_error=deadline_error,
+    )
     system_hooks = [value for key, value in system_entries if key == "core.hookspath"]
     system_includes = [
         key
@@ -4797,7 +5115,15 @@ def _preflight_global_hooks_config(repo: pathlib.Path) -> None:
 
     entries: list[tuple[str, str]] = []
     for config_path in _global_git_config_paths():
-        entries.extend(_global_git_config_entries(config_path, missing_ok=True))
+        _check_deadline(deadline, deadline_error)
+        entries.extend(
+            _global_git_config_entries(
+                config_path,
+                missing_ok=True,
+                deadline=deadline,
+                deadline_error=deadline_error,
+            )
+        )
     hooks_values = [value for key, value in entries if key == "core.hookspath"]
     include_keys = [
         key
@@ -4822,8 +5148,14 @@ def _preflight_global_hooks_config(repo: pathlib.Path) -> None:
     )
 
 
-def _hook_path_plan(repo: pathlib.Path) -> _HookPathPlan:
+def _hook_path_plan(
+    repo: pathlib.Path,
+    *,
+    deadline: float | None = None,
+    deadline_error: str = "hook-path discovery exceeded its shared deadline",
+) -> _HookPathPlan:
     for scope in ("--worktree", "--local"):
+        _check_deadline(deadline, deadline_error)
         operation = f"{scope} core.hooksPath query"
         command = _git_command(
             repo,
@@ -4849,17 +5181,28 @@ def _hook_path_plan(repo: pathlib.Path) -> _HookPathPlan:
                 f"{operation} stderr exceeds {MAX_GIT_STDERR_BYTES} bytes"
             ),
             timeout_error=(
-                f"{operation} timed out after "
-                f"{GIT_CONFIG_QUERY_TIMEOUT_SECONDS:g} seconds"
+                deadline_error
+                if deadline is not None
+                else (
+                    f"{operation} timed out after "
+                    f"{GIT_CONFIG_QUERY_TIMEOUT_SECONDS:g} seconds"
+                )
             ),
             operation=operation,
+            deadline=deadline,
         )
+        _check_deadline(deadline, deadline_error)
         if configured.returncode == 0:
             raw_path = _parse_nul_terminated_git_path(
                 configured.stdout,
                 operation,
             )
-            return _hook_path_plan_from_config(repo, raw_path)
+            return _hook_path_plan_from_config(
+                repo,
+                raw_path,
+                deadline=deadline,
+                deadline_error=deadline_error,
+            )
         if configured.returncode != 1:
             detail = (
                 configured.stderr.decode("utf-8", errors="replace").strip()
@@ -4868,12 +5211,33 @@ def _hook_path_plan(repo: pathlib.Path) -> _HookPathPlan:
             raise UserError(
                 f"failed to resolve {scope} core.hooksPath safely: {detail}"
             )
-    _preflight_global_hooks_config(repo)
-    return _default_hook_path_plan(repo)
+    _preflight_global_hooks_config(
+        repo,
+        deadline=deadline,
+        deadline_error=deadline_error,
+    )
+    return _default_hook_path_plan(
+        repo,
+        deadline=deadline,
+        deadline_error=deadline_error,
+    )
 
 
-def _hook_path(repo: pathlib.Path, name: str) -> pathlib.Path:
-    return _hook_path_plan(repo).path / name
+def _hook_path(
+    repo: pathlib.Path,
+    name: str,
+    *,
+    deadline: float | None = None,
+    deadline_error: str = "hook-path discovery exceeded its shared deadline",
+) -> pathlib.Path:
+    return (
+        _hook_path_plan(
+            repo,
+            deadline=deadline,
+            deadline_error=deadline_error,
+        ).path
+        / name
+    )
 
 
 def _validate_hook_directory_stat(
@@ -7117,22 +7481,268 @@ def _repo_root_for_path(
     return root
 
 
-def _has_hook_marker(repo: pathlib.Path) -> bool:
+def _check_discovery_auxiliary_deadline(
+    deadline: float | None,
+    label: str,
+) -> None:
+    try:
+        _check_deadline(
+            deadline,
+            f"{label} exceeded the repository discovery candidate deadline",
+        )
+    except UserError as exc:
+        raise DiscoveryAuxiliaryInspectionError(str(exc)) from exc
+
+
+def _open_discovery_regular_path(
+    path: pathlib.Path,
+    *,
+    label: str,
+    deadline: float | None,
+    missing_ok: bool,
+) -> tuple[int, tuple[int, int, int, int, int, int]] | None:
+    _check_discovery_auxiliary_deadline(deadline, label)
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | _required_open_flag("O_NOFOLLOW")
+        | _required_open_flag("O_NONBLOCK")
+    )
+    try:
+        fd = os.open(path, flags)
+    except FileNotFoundError:
+        if missing_ok:
+            return None
+        raise DiscoveryAuxiliaryInspectionError(
+            f"{label} does not exist: {path}",
+            error_number=errno.ENOENT,
+        ) from None
+    except OSError as exc:
+        detail = (
+            "path is a symlink or could not be opened without following links"
+            if exc.errno in {errno.ELOOP, errno.EMLINK}
+            else str(exc)
+        )
+        raise DiscoveryAuxiliaryInspectionError(
+            f"failed to open {label} {path}: {detail}",
+            error_number=exc.errno,
+        ) from exc
+
+    try:
+        _check_discovery_auxiliary_deadline(deadline, label)
+        descriptor_stat = os.fstat(fd)
+        if not stat.S_ISREG(descriptor_stat.st_mode):
+            error_number = (
+                errno.EISDIR
+                if stat.S_ISDIR(descriptor_stat.st_mode)
+                else getattr(errno, "ENXIO", errno.EINVAL)
+            )
+            raise DiscoveryAuxiliaryInspectionError(
+                f"{label} is not a regular file: {path}",
+                error_number=error_number,
+            )
+        try:
+            path_stat = os.stat(path, follow_symlinks=False)
+        except OSError as exc:
+            raise DiscoveryAuxiliaryInspectionError(
+                f"{label} path became unavailable while being bound: {path}: {exc}",
+                error_number=exc.errno,
+            ) from exc
+        identity = _file_identity(descriptor_stat)
+        if not stat.S_ISREG(path_stat.st_mode) or _file_identity(path_stat) != identity:
+            raise DiscoveryAuxiliaryInspectionError(
+                f"{label} path changed while being bound: {path}"
+            )
+        _check_discovery_auxiliary_deadline(deadline, label)
+        return fd, identity
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _read_discovery_regular_path(
+    path: pathlib.Path,
+    *,
+    label: str,
+    byte_limit: int,
+    deadline: float | None,
+    missing_ok: bool = False,
+) -> bytes | None:
+    opened = _open_discovery_regular_path(
+        path,
+        label=label,
+        deadline=deadline,
+        missing_ok=missing_ok,
+    )
+    if opened is None:
+        return None
+    fd, identity = opened
+
+    def read_once() -> bytes:
+        _check_discovery_auxiliary_deadline(deadline, label)
+        os.lseek(fd, 0, os.SEEK_SET)
+        content = bytearray()
+        while len(content) <= byte_limit:
+            _check_discovery_auxiliary_deadline(deadline, label)
+            try:
+                chunk = os.read(
+                    fd,
+                    min(
+                        PROCESS_READ_CHUNK_BYTES,
+                        byte_limit + 1 - len(content),
+                    ),
+                )
+            except OSError as exc:
+                raise DiscoveryAuxiliaryInspectionError(
+                    f"failed to read {label} {path}: {exc}",
+                    error_number=exc.errno,
+                ) from exc
+            _check_discovery_auxiliary_deadline(deadline, label)
+            if not chunk:
+                break
+            content.extend(chunk)
+        if len(content) > byte_limit:
+            raise DiscoveryAuxiliaryInspectionLimitExceeded(
+                f"{label} exceeds {byte_limit} bytes: {path}",
+                limit_name=f"{label} bytes",
+                limit=byte_limit,
+                observed=len(content),
+            )
+        return bytes(content)
+
+    try:
+        if identity[5] > byte_limit:
+            raise DiscoveryAuxiliaryInspectionLimitExceeded(
+                f"{label} exceeds {byte_limit} bytes: {path}",
+                limit_name=f"{label} bytes",
+                limit=byte_limit,
+                observed=identity[5],
+            )
+        first = read_once()
+        between = os.fstat(fd)
+        second = read_once()
+        after = os.fstat(fd)
+        try:
+            path_after = os.stat(path, follow_symlinks=False)
+        except OSError as exc:
+            raise DiscoveryAuxiliaryInspectionError(
+                f"{label} path became unavailable while being read: {path}: {exc}",
+                error_number=exc.errno,
+            ) from exc
+        _check_discovery_auxiliary_deadline(deadline, label)
+        if (
+            _file_identity(between) != identity
+            or _file_identity(after) != identity
+            or not stat.S_ISREG(path_after.st_mode)
+            or _file_identity(path_after) != identity
+        ):
+            raise DiscoveryAuxiliaryInspectionError(
+                f"{label} object changed while being read: {path}"
+            )
+        if first != second:
+            raise DiscoveryAuxiliaryInspectionError(
+                f"{label} content changed while being read: {path}"
+            )
+        return first
+    finally:
+        os.close(fd)
+
+
+def _discovery_regular_path_exists(
+    path: pathlib.Path,
+    *,
+    label: str,
+    deadline: float | None,
+) -> bool:
+    opened = _open_discovery_regular_path(
+        path,
+        label=label,
+        deadline=deadline,
+        missing_ok=True,
+    )
+    if opened is None:
+        return False
+    fd, _identity = opened
+    os.close(fd)
+    _check_discovery_auxiliary_deadline(deadline, label)
+    return True
+
+
+def _has_hook_marker(
+    repo: pathlib.Path,
+    *,
+    deadline: float | None = None,
+) -> bool:
+    deadline_error = (
+        "hook-path discovery exceeded the repository discovery candidate deadline"
+    )
+    try:
+        plan = _hook_path_plan(
+            repo,
+            deadline=deadline,
+            deadline_error=deadline_error,
+        )
+    except DiscoveryAuxiliaryInspectionError:
+        raise
+    except (OSError, UserError) as exc:
+        raise DiscoveryAuxiliaryInspectionError(
+            f"failed to resolve hook paths within the repository discovery "
+            f"candidate deadline: {exc}",
+            error_number=getattr(exc, "errno", None),
+        ) from exc
     for name in HOOK_NAMES:
-        hook = _hook_path(repo, name)
-        if _stat_path_if_present(hook) is None:
+        hook = plan.path / name
+        content = _read_discovery_regular_path(
+            hook,
+            label=f"{name} hook marker",
+            byte_limit=MAX_DISCOVERY_HOOK_BYTES,
+            deadline=deadline,
+            missing_ok=True,
+        )
+        if content is None:
             return False
-        content = hook.read_text(encoding="utf-8", errors="replace")
-        if HOOK_BEGIN not in content or HOOK_END not in content:
+        if (
+            HOOK_BEGIN.encode("utf-8") not in content
+            or HOOK_END.encode("utf-8") not in content
+        ):
             return False
     return True
 
 
-def _is_excluded(repo: pathlib.Path, rel: str) -> bool:
-    exclude = _git_path(repo, "info/exclude")
-    if _stat_path_if_present(exclude) is None:
+def _is_excluded(
+    repo: pathlib.Path,
+    rel: str,
+    *,
+    deadline: float | None = None,
+) -> bool:
+    try:
+        exclude = _git_path(
+            repo,
+            "info/exclude",
+            deadline=deadline,
+            deadline_error=(
+                "exclude-path discovery exceeded the repository discovery "
+                "candidate deadline"
+            ),
+        )
+    except DiscoveryAuxiliaryInspectionError:
+        raise
+    except (OSError, UserError) as exc:
+        raise DiscoveryAuxiliaryInspectionError(
+            f"failed to resolve the Git exclude path within the repository "
+            f"discovery candidate deadline: {exc}",
+            error_number=getattr(exc, "errno", None),
+        ) from exc
+    content = _read_discovery_regular_path(
+        exclude,
+        label="Git exclude file",
+        byte_limit=MAX_DISCOVERY_EXCLUDE_BYTES,
+        deadline=deadline,
+        missing_ok=True,
+    )
+    if content is None:
         return False
-    return rel in exclude.read_text(encoding="utf-8", errors="replace").splitlines()
+    return rel.encode("utf-8") in content.splitlines()
 
 
 def _discover_adoption_status(
@@ -7169,6 +7779,20 @@ def _discovery_error(exc: BaseException) -> dict[str, Any]:
         "code": getattr(exc, "code", "repo_discovery_failed"),
         "message": str(exc),
     }
+    if isinstance(
+        exc,
+        (
+            DiscoveryAuxiliaryInspectionLimitExceeded,
+            GeneratedIndexInspectionLimitExceeded,
+        ),
+    ):
+        error.update(
+            {
+                "limit_name": exc.limit_name,
+                "limit": exc.limit,
+                "observed": exc.observed,
+            }
+        )
     error_number = getattr(exc, "errno", None)
     if isinstance(error_number, int):
         error["errno"] = error_number
@@ -7185,6 +7809,8 @@ def _enrich_discovered_repo(
     *,
     deadline: float | None = None,
 ) -> None:
+    if deadline is None:
+        deadline = time.monotonic() + GIT_ADOPTION_VALIDATION_TIMEOUT_SECONDS
     journal_root = root / JOURNAL_ROOT
     index_rel = DEFAULT_INDEX.as_posix()
     adoption = _discover_adoption_status(root, deadline=deadline)
@@ -7192,11 +7818,25 @@ def _enrich_discovered_repo(
     row.setdefault("coverage_status", "complete")
 
     try:
-        journal_root_stat = _stat_path_if_present(journal_root)
-        has_journal_dir = journal_root_stat is not None and stat.S_ISDIR(
-            journal_root_stat.st_mode
+        _check_discovery_auxiliary_deadline(deadline, "journal-root inspection")
+        journal_root_stat = _stat_path_if_present(
+            journal_root,
+            follow_symlinks=False,
+            deadline=deadline,
+            deadline_error=(
+                "journal-root inspection exceeded the repository discovery "
+                "candidate deadline"
+            ),
         )
-    except OSError as exc:
+        if journal_root_stat is None:
+            has_journal_dir = False
+        elif stat.S_ISDIR(journal_root_stat.st_mode):
+            has_journal_dir = True
+        else:
+            raise DiscoveryAuxiliaryInspectionError(
+                f"journal root is not a directory: {journal_root}"
+            )
+    except (OSError, UserError) as exc:
         has_journal_dir = None
         auxiliary_errors["has_journal_dir"] = _discovery_error(exc)
 
@@ -7207,21 +7847,31 @@ def _enrich_discovered_repo(
         auxiliary_errors["journal_count"] = _discovery_error(exc)
 
     try:
-        index_ignored = _is_excluded(root, index_rel)
+        index_ignored = _is_excluded(
+            root,
+            index_rel,
+            deadline=deadline,
+        )
     except (OSError, UserError) as exc:
         index_ignored = None
         auxiliary_errors["index_ignored"] = _discovery_error(exc)
 
     try:
-        hooks_installed = _has_hook_marker(root)
+        hooks_installed = _has_hook_marker(
+            root,
+            deadline=deadline,
+        )
     except (OSError, UserError) as exc:
         hooks_installed = None
         auxiliary_errors["hooks_installed"] = _discovery_error(exc)
 
     try:
-        index_stat = _stat_path_if_present(root / index_rel)
-        has_index = index_stat is not None and stat.S_ISREG(index_stat.st_mode)
-    except OSError as exc:
+        has_index = _discovery_regular_path_exists(
+            root / index_rel,
+            label="generated project journal index",
+            deadline=deadline,
+        )
+    except (OSError, UserError) as exc:
         has_index = None
         auxiliary_errors["has_index"] = _discovery_error(exc)
 
