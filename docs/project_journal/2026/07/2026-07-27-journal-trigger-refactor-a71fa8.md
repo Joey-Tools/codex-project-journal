@@ -29,6 +29,7 @@ superseded_by:
 - The latest compatibility and cleanup-priority findings are closed by using a relocatable native Git fixture across supported Python runtimes, reporting the final known child return code, and retaining directory cleanup failures as bounded evidence beneath the already-proved inspection failure.
 - The newest two fresh-review findings are closed by bounding retained validation-path labels and aggregate issue bytes, and by preserving parse, limit, replacement, access-policy, and generator-exit primaries when rollout descriptor cleanup also fails.
 - The final three fresh-review findings are closed by bounding retained rollout associations across resolved and unresolved candidates, enforcing direct-child-only archive discovery, and integrating the Git source-descriptor close into launch preparation cleanup and exception precedence.
+- The two post-head fresh-review findings are closed by preserving snapshot-creation failures across every descriptor close and by replacing the fixed two-second Git version probe with the shared initialization deadline plus non-cacheable transient classification.
 
 ## Current State
 
@@ -51,6 +52,8 @@ superseded_by:
 - Indexed validation retains the exact invalid path for structured validity decisions, but caps formatted path labels at 4 KiB by replacing larger values with a stable JSON `path_ref` containing byte length and SHA-256. Retained issue text also has an independent 1 MiB aggregate cap.
 - Candidate-binding and rollout-extraction descriptor cleanup uses the same close-preserving helper as directory cleanup. A close fault is bounded and attached as `cleanup_errors` to the active parse, limit, replacement, access-policy, or generator-exit error instead of replacing that primary; an unaccompanied close fault still propagates.
 - Git launch preparation closes its source-snapshot descriptor before returning the prepared launch. A close fault remains secondary to an active preparation error; after otherwise successful preparation, it becomes the structured primary while the launch directory is removed or its cleanup locator is retained as bounded evidence.
+- Git snapshot creation closes its source, destination, and directory descriptors through the same bounded precedence helper. Copy, verification, deadline, or other active failures retain their exact object, arguments, and traceback with close evidence attached; an unaccompanied close fault becomes primary and the temporary snapshot is removed or its retained locator is reported.
+- The credential-free Git version probe now consumes the remainder of the existing five-second initialization deadline instead of a separate two-second cap. Timeout, nonzero exit, and malformed output raise non-cacheable `git_version_probe_failed`, so a later initialization retries; only a successfully parsed version below 2.45 is cached as `unsupported_git_version`.
 - This is the repository's intentional first journal entry because the finalization task explicitly requires durable repo-owned validation and handoff evidence; no top-level tracker, generated index, or local hook is introduced.
 
 ## Next Steps
@@ -116,6 +119,11 @@ superseded_by:
 - Final serial Xcode Python 3.9.6 full suite after the same fixes: 274 tests passed with 4 platform skips in 414.510 seconds.
 - Fresh named-single review of signed head `a425cbc1e8ab910f919b48d433057b16bd1d2998` identified the aggregate association, source-descriptor close, and flat-archive findings closed by this final patch.
 - Final finding-focused suite: 11 tests passed in 7.346 seconds with Python 3.13 and in 6.590 seconds with Xcode Python 3.9.6. It covers shared resolved/unresolved association pressure, physical-copy deduplication, direct-child archive membership and pre-stat skipping, nested archive date rejection, source binding/verification/launch close precedence, launch cleanup, and documentation contracts.
-- The first Python 3.13 full-suite attempt had three two-second Git version-probe timeouts under load; the exact three tests passed alone in 11.495 seconds. A clean serial rerun then passed all 282 tests with 3 platform skips in 381.513 seconds.
+- The first Python 3.13 full-suite attempt exposed three real failures at the former fixed two-second Git version-probe budget under load. The exact three tests passed alone in 11.495 seconds and a clean serial rerun passed all 282 tests with 3 platform skips in 381.513 seconds, but that rerun did not remove the structural timeout/cache defect addressed by the later evidence below.
 - Final serial Xcode Python 3.9.6 full suite: all 282 tests passed with 4 platform skips in 286.666 seconds.
+- Final Ruff check/format, Python 3.13 and Xcode Python 3.9.6 `py_compile`, installed Joey/OpenAI skill validation, project journal validation, and `git diff --check` passed.
+- Fresh whole-range review of signed head `ba582e4c99bcd83ba3417a1eadd84f9c0cbc4b31` identified the snapshot-creation descriptor-close and Git version-probe timeout/cache findings closed by this patch.
+- Post-head finding-focused coverage: 11 tests passed in 0.201 seconds with Python 3.13.0 and in 0.150 seconds with Xcode Python 3.9.6. The regressions inject active and otherwise-successful close faults independently for source, destination, and directory descriptors; preserve cleanup locators; and cover first-timeout-then-success, repeated timeout, nonzero, malformed, old-version caching, and shared-deadline exhaustion.
+- Final serial Python 3.13 full suite after snapshot-close and version-probe hardening: all 288 tests passed with 3 platform skips in 283.184 seconds; the former fixed two-second version timeout did not recur.
+- Final serial Xcode Python 3.9.6 full suite after the same fixes: all 288 tests passed with 4 platform skips in 313.683 seconds.
 - Final Ruff check/format, Python 3.13 and Xcode Python 3.9.6 `py_compile`, installed Joey/OpenAI skill validation, project journal validation, and `git diff --check` passed.

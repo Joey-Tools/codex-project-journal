@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import errno
 import importlib.util
@@ -17,7 +18,7 @@ import tempfile
 import textwrap
 import time
 import unittest
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from unittest import mock
 
 
@@ -194,6 +195,30 @@ class ProjectJournalTests(unittest.TestCase):
         shutil.copyfile(runtime.source_executable, destination)
         destination.chmod(0o755)
         return destination
+
+    @contextlib.contextmanager
+    def isolated_git_runtime_initialization(
+        self,
+        name: str,
+    ) -> Iterator[pathlib.Path]:
+        old_runtime = project_journal._GIT_RUNTIME
+        old_error = project_journal._GIT_RUNTIME_ERROR
+        fake_git = self.make_native_git_copy(name)
+        project_journal._GIT_RUNTIME = None
+        project_journal._GIT_RUNTIME_ERROR = None
+        try:
+            with mock.patch.object(
+                project_journal.shutil,
+                "which",
+                return_value=str(fake_git),
+            ):
+                yield fake_git
+        finally:
+            runtime = project_journal._GIT_RUNTIME
+            if runtime is not None and runtime is not old_runtime:
+                runtime.snapshot_owner.cleanup()
+            project_journal._GIT_RUNTIME = old_runtime
+            project_journal._GIT_RUNTIME_ERROR = old_error
 
     def make_terminal_mask_failure_runtime(
         self,
@@ -2036,6 +2061,200 @@ class ProjectJournalTests(unittest.TestCase):
             runtime.snapshot_owner.cleanup()
 
     @unittest.skipUnless(os.name == "posix", "POSIX Git runtime contract")
+    def test_git_snapshot_creation_descriptor_close_failure_priority(
+        self,
+    ) -> None:
+        actual_open = os.open
+        actual_close = os.close
+        actual_fstat = os.fstat
+        actual_write = os.write
+        actual_reject_acl = project_journal._reject_runtime_extended_acl
+
+        for descriptor in ("source", "destination", "directory"):
+            for has_active_error in (False, True):
+                with self.subTest(
+                    descriptor=descriptor,
+                    has_active_error=has_active_error,
+                ):
+                    source = self.make_native_git_copy(
+                        f"snapshot-close-{descriptor}-{has_active_error}"
+                    )
+                    expected_identity = project_journal._git_source_identity(
+                        source.stat()
+                    )
+                    owner = tempfile.TemporaryDirectory(
+                        prefix="project-journal-test-snapshot-close-",
+                        dir=self.root,
+                    )
+                    locator = pathlib.Path(owner.name).resolve()
+                    snapshot = locator / "git"
+                    opened_fds: dict[str, int] = {}
+                    close_failed = False
+                    interrupted = False
+                    close_error = OSError(
+                        errno.EIO,
+                        f"simulated {descriptor} descriptor close failure",
+                    )
+                    active_error = (
+                        LegacyInterrupt(
+                            f"simulated {descriptor} snapshot creation failure"
+                        )
+                        if has_active_error
+                        else None
+                    )
+                    active_args = active_error.args if active_error is not None else ()
+
+                    def track_open(
+                        path: os.PathLike[str] | str,
+                        flags: int,
+                        mode: int = 0o777,
+                        *,
+                        dir_fd: int | None = None,
+                    ) -> int:
+                        fd = actual_open(path, flags, mode, dir_fd=dir_fd)
+                        candidate = pathlib.Path(path)
+                        if candidate == source:
+                            opened_fds["source"] = fd
+                        elif candidate == snapshot:
+                            opened_fds["destination"] = fd
+                        elif candidate == locator:
+                            opened_fds["directory"] = fd
+                        return fd
+
+                    def close_target_then_fail(fd: int) -> None:
+                        nonlocal close_failed
+                        actual_close(fd)
+                        if not close_failed and opened_fds.get(descriptor) == fd:
+                            close_failed = True
+                            raise close_error
+
+                    def interrupt_source_fstat(fd: int) -> os.stat_result:
+                        nonlocal interrupted
+                        if (
+                            active_error is not None
+                            and descriptor == "source"
+                            and not interrupted
+                            and opened_fds.get("source") == fd
+                        ):
+                            interrupted = True
+                            raise active_error
+                        return actual_fstat(fd)
+
+                    def interrupt_destination_write(
+                        fd: int,
+                        data: bytes,
+                    ) -> int:
+                        nonlocal interrupted
+                        if (
+                            active_error is not None
+                            and descriptor == "destination"
+                            and not interrupted
+                            and opened_fds.get("destination") == fd
+                        ):
+                            interrupted = True
+                            raise active_error
+                        return actual_write(fd, data)
+
+                    def interrupt_directory_acl(
+                        fd: int,
+                        path: pathlib.Path,
+                        subject: str,
+                    ) -> None:
+                        nonlocal interrupted
+                        if (
+                            active_error is not None
+                            and descriptor == "directory"
+                            and not interrupted
+                            and pathlib.Path(path) == locator
+                        ):
+                            interrupted = True
+                            raise active_error
+                        actual_reject_acl(fd, path, subject)
+
+                    try:
+                        with contextlib.ExitStack() as stack:
+                            stack.enter_context(
+                                mock.patch.object(
+                                    project_journal.tempfile,
+                                    "TemporaryDirectory",
+                                    return_value=owner,
+                                )
+                            )
+                            for target, name, side_effect in (
+                                (project_journal.os, "open", track_open),
+                                (
+                                    project_journal.os,
+                                    "close",
+                                    close_target_then_fail,
+                                ),
+                                (
+                                    project_journal.os,
+                                    "fstat",
+                                    interrupt_source_fstat,
+                                ),
+                                (
+                                    project_journal.os,
+                                    "write",
+                                    interrupt_destination_write,
+                                ),
+                                (
+                                    project_journal,
+                                    "_reject_runtime_extended_acl",
+                                    interrupt_directory_acl,
+                                ),
+                            ):
+                                stack.enter_context(
+                                    mock.patch.object(
+                                        target,
+                                        name,
+                                        side_effect=side_effect,
+                                    )
+                                )
+                            try:
+                                project_journal._snapshot_git_executable(
+                                    source,
+                                    expected_source_identity=expected_identity,
+                                    deadline=time.monotonic() + 5,
+                                )
+                            except BaseException as exc:
+                                raised_error = exc
+                            else:
+                                self.fail("expected descriptor close failure")
+
+                        expected_error = active_error or close_error
+                        self.assertIs(raised_error, expected_error)
+                        self.assertEqual(raised_error.args, expected_error.args)
+                        self.assertTrue(close_failed)
+                        self.assertEqual(interrupted, has_active_error)
+                        notes = "\n".join(getattr(raised_error, "__notes__", ()))
+                        self.assertIn(
+                            f"{descriptor} descriptor cleanup failed",
+                            notes,
+                        )
+                        self.assertIn(str(close_error), notes)
+                        self.assertFalse(locator.exists())
+                        traceback_names = self.exception_traceback_names(raised_error)
+                        if active_error is not None:
+                            self.assertEqual(raised_error.args, active_args)
+                            self.assertTrue(
+                                any(
+                                    name.startswith("interrupt_")
+                                    for name in traceback_names
+                                )
+                            )
+                            self.assertNotIn(
+                                "_close_git_runtime_snapshot_descriptor_preserving_error",
+                                traceback_names,
+                            )
+                        else:
+                            self.assertIn(
+                                "close_target_then_fail",
+                                traceback_names,
+                            )
+                    finally:
+                        owner.cleanup()
+
+    @unittest.skipUnless(os.name == "posix", "POSIX Git runtime contract")
     def test_git_snapshot_creation_cleanup_failure_preserves_original_error(
         self,
     ) -> None:
@@ -2816,6 +3035,210 @@ class ProjectJournalTests(unittest.TestCase):
         )
         self.assertIsNone(rows[0]["index_ignored"])
         self.assertFalse(shim_log.exists())
+
+    def test_git_version_probe_timeout_retries_and_then_succeeds(self) -> None:
+        attempts = 0
+
+        def timeout_then_succeed(
+            *_args: object,
+            **_kwargs: object,
+        ) -> subprocess.CompletedProcess[bytes]:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise project_journal.UserError(
+                    "simulated transient Git version timeout"
+                )
+            return success
+
+        with self.isolated_git_runtime_initialization(
+            "version-timeout-retry-git"
+        ) as fake_git:
+            success = subprocess.CompletedProcess(
+                [str(fake_git), "--version"],
+                0,
+                b"git version 2.45.1\n",
+                b"",
+            )
+            with mock.patch.object(
+                project_journal,
+                "_capture_bounded_process",
+                side_effect=timeout_then_succeed,
+            ) as capture:
+                with self.assertRaises(project_journal.GitVersionProbeError) as raised:
+                    project_journal._initialize_git_runtime()
+
+                self.assertIn("inconclusive", str(raised.exception))
+                self.assertIsNone(project_journal._GIT_RUNTIME)
+                self.assertIsNone(project_journal._GIT_RUNTIME_ERROR)
+                project_journal._initialize_git_runtime()
+
+            self.assertEqual(attempts, 2)
+            self.assertEqual(capture.call_count, 2)
+            for call in capture.call_args_list:
+                self.assertEqual(
+                    call.kwargs["timeout_seconds"],
+                    project_journal.GIT_EXECUTABLE_SNAPSHOT_TIMEOUT_SECONDS,
+                )
+                self.assertIsNotNone(call.kwargs["deadline"])
+                self.assertIn("shared deadline", call.kwargs["timeout_error"])
+            self.assertIsNone(project_journal._GIT_RUNTIME_ERROR)
+            self.assertIsNotNone(project_journal._GIT_RUNTIME)
+
+    def test_git_version_probe_repeated_timeouts_are_not_cached(self) -> None:
+        attempts = 0
+
+        def always_timeout(
+            *_args: object,
+            **_kwargs: object,
+        ) -> subprocess.CompletedProcess[bytes]:
+            nonlocal attempts
+            attempts += 1
+            raise project_journal.UserError(
+                f"simulated transient Git version timeout {attempts}"
+            )
+
+        with self.isolated_git_runtime_initialization("version-repeated-timeout-git"):
+            with mock.patch.object(
+                project_journal,
+                "_capture_bounded_process",
+                side_effect=always_timeout,
+            ) as capture:
+                for expected_attempt in (1, 2):
+                    with self.assertRaises(
+                        project_journal.GitVersionProbeError
+                    ) as raised:
+                        project_journal._initialize_git_runtime()
+                    self.assertIn(
+                        f"timeout {expected_attempt}",
+                        str(raised.exception),
+                    )
+                    self.assertIsNone(project_journal._GIT_RUNTIME)
+                    self.assertIsNone(project_journal._GIT_RUNTIME_ERROR)
+
+            self.assertEqual(attempts, 2)
+            self.assertEqual(capture.call_count, 2)
+
+    def test_git_version_probe_malformed_is_transient_but_old_is_cached(
+        self,
+    ) -> None:
+        with self.isolated_git_runtime_initialization(
+            "version-classification-git"
+        ) as fake_git:
+            malformed = subprocess.CompletedProcess(
+                [str(fake_git), "--version"],
+                0,
+                b"not a Git version\n",
+                b"",
+            )
+            outdated = subprocess.CompletedProcess(
+                [str(fake_git), "--version"],
+                0,
+                b"git version 2.44.9\n",
+                b"",
+            )
+            with mock.patch.object(
+                project_journal,
+                "_capture_bounded_process",
+                side_effect=(malformed, outdated),
+            ) as capture:
+                with self.assertRaises(project_journal.GitVersionProbeError) as raised:
+                    project_journal._initialize_git_runtime()
+                self.assertIn(
+                    "unsupported response",
+                    str(raised.exception),
+                )
+                self.assertIsNone(project_journal._GIT_RUNTIME_ERROR)
+
+                project_journal._initialize_git_runtime()
+                self.assertIsInstance(
+                    project_journal._GIT_RUNTIME_ERROR,
+                    project_journal.UnsupportedGitVersion,
+                )
+                self.assertIn(
+                    "Git >= 2.45 is required",
+                    str(project_journal._GIT_RUNTIME_ERROR),
+                )
+
+                project_journal._initialize_git_runtime()
+
+            self.assertEqual(capture.call_count, 2)
+            self.assertIsNone(project_journal._GIT_RUNTIME)
+
+    def test_git_version_probe_nonzero_is_transient_and_not_cached(self) -> None:
+        with self.isolated_git_runtime_initialization(
+            "version-nonzero-git"
+        ) as fake_git:
+            failure = subprocess.CompletedProcess(
+                [str(fake_git), "--version"],
+                71,
+                b"",
+                b"temporary loader failure\n",
+            )
+            with mock.patch.object(
+                project_journal,
+                "_capture_bounded_process",
+                return_value=failure,
+            ) as capture:
+                with self.assertRaises(project_journal.GitVersionProbeError) as raised:
+                    project_journal._initialize_git_runtime()
+
+            self.assertIn("temporary loader failure", str(raised.exception))
+            self.assertIsNone(project_journal._GIT_RUNTIME)
+            self.assertIsNone(project_journal._GIT_RUNTIME_ERROR)
+            capture.assert_called_once()
+
+    def test_git_version_probe_obeys_exhausted_shared_deadline(self) -> None:
+        with self.isolated_git_runtime_initialization(
+            "version-shared-deadline-git"
+        ) as fake_git:
+            prepared_snapshot = project_journal._snapshot_git_executable(
+                fake_git,
+                expected_source_identity=project_journal._git_source_identity(
+                    fake_git.stat()
+                ),
+                deadline=time.monotonic() + 5,
+            )
+            snapshot_owner = prepared_snapshot[-1]
+            snapshot_locator = pathlib.Path(snapshot_owner.name)
+            clock = {"now": 100.0}
+
+            def exhaust_after_snapshot(
+                *_args: object,
+                deadline: float,
+                **_kwargs: object,
+            ) -> tuple[object, ...]:
+                self.assertEqual(deadline, 105.0)
+                clock["now"] = deadline
+                return prepared_snapshot
+
+            try:
+                with mock.patch.object(
+                    project_journal,
+                    "_snapshot_git_executable",
+                    side_effect=exhaust_after_snapshot,
+                ):
+                    with mock.patch.object(
+                        project_journal.time,
+                        "monotonic",
+                        side_effect=lambda: clock["now"],
+                    ):
+                        with mock.patch.object(
+                            project_journal.subprocess,
+                            "Popen",
+                        ) as popen:
+                            with self.assertRaises(
+                                project_journal.GitVersionProbeError
+                            ) as raised:
+                                project_journal._initialize_git_runtime()
+
+                self.assertIn("shared deadline", str(raised.exception))
+                self.assertIsNone(project_journal._GIT_RUNTIME)
+                self.assertIsNone(project_journal._GIT_RUNTIME_ERROR)
+                self.assertFalse(snapshot_locator.exists())
+                popen.assert_not_called()
+            finally:
+                snapshot_owner.cleanup()
 
     def test_native_old_git_version_fails_closed_before_repository_commands(
         self,
@@ -7568,6 +7991,18 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertIn("clears ambient Git control variables", skill)
         self.assertIn("bounded credential-free `git --version` gate", skill)
         self.assertIn("Git older than 2.45 fails closed", skill)
+        self.assertIn(
+            "remainder of the same five-second initialization deadline",
+            skill,
+        )
+        self.assertIn(
+            "classify a timeout, nonzero exit, or malformed response as non-cacheable",
+            skill,
+        )
+        self.assertIn(
+            "snapshot-creation source, destination, and directory descriptors",
+            skill,
+        )
         self.assertIn("one absolute monotonic deadline", skill)
         self.assertIn("frontmatter parsing, semantic validation", skill)
         self.assertIn("frontmatter field/list, validation-issue", skill)
@@ -7797,6 +8232,18 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertIn("ignores ambient Git control/configuration redirections", readme)
         self.assertIn(
             "requires those exact bytes to return a bounded credential-free",
+            readme,
+        )
+        self.assertIn(
+            "remainder of the same five-second initialization deadline",
+            readme,
+        )
+        self.assertIn(
+            "timeout, nonzero exit, or malformed response is a non-cacheable",
+            readme,
+        )
+        self.assertIn(
+            "source, destination, and directory descriptors through one bounded precedence helper",
             readme,
         )
         self.assertIn(

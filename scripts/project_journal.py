@@ -106,7 +106,6 @@ MAX_DISCOVERY_ERROR_DETAIL_CHARS = 512
 DISCOVERY_ENRICHMENT_MAX_ATTEMPTS_PER_ROOT = 2
 DISCOVERY_ENRICHMENT_RETRY_MIN_BUDGET_GAIN_SECONDS = 1.0
 GIT_COMMAND_TIMEOUT_SECONDS = 10.0
-GIT_VERSION_TIMEOUT_SECONDS = 2.0
 GIT_EXECUTABLE_SNAPSHOT_TIMEOUT_SECONDS = 5.0
 GIT_CONFIG_QUERY_TIMEOUT_SECONDS = 5.0
 GIT_PROCESS_TERMINATE_GRACE_SECONDS = 0.25
@@ -183,6 +182,12 @@ class UnsupportedGitVersion(UserError):
     """The fixed Git runtime cannot satisfy the helper's safety contract."""
 
     code = "unsupported_git_version"
+
+
+class GitVersionProbeError(UserError):
+    """The bounded Git version probe did not establish a compatible version."""
+
+    code = "git_version_probe_failed"
 
 
 class UnsupportedPlatform(UserError):
@@ -1831,19 +1836,22 @@ def _open_bound_git_runtime_snapshot(
 
 def _close_git_runtime_snapshot_descriptor_preserving_error(
     fd: int,
-    active_error: BaseException,
+    active_error: BaseException | None,
     *,
     context: str,
+    descriptor: str = "source",
 ) -> None:
     try:
         os.close(fd)
     except BaseException as cleanup_error:
-        _add_exception_detail(
-            active_error,
-            _bounded_signal_report_detail(
-                f"{context} source descriptor cleanup failed: {cleanup_error}"
-            ),
+        detail = _bounded_signal_report_detail(
+            f"{context} {descriptor} descriptor cleanup failed: {cleanup_error}"
         )
+        if active_error is not None:
+            _add_exception_detail(active_error, detail)
+            return
+        _add_exception_detail(cleanup_error, detail)
+        raise
 
 
 def _verify_git_runtime_snapshot(
@@ -4245,8 +4253,21 @@ def _snapshot_git_executable(
                 )
                 _check_deadline(deadline, deadline_error)
                 destination_stat = os.fstat(destination_fd)
-            finally:
-                os.close(destination_fd)
+            except BaseException as exc:
+                _close_git_runtime_snapshot_descriptor_preserving_error(
+                    destination_fd,
+                    exc,
+                    context="Git runtime snapshot creation",
+                    descriptor="destination",
+                )
+                raise
+            else:
+                _close_git_runtime_snapshot_descriptor_preserving_error(
+                    destination_fd,
+                    None,
+                    context="Git runtime snapshot creation",
+                    descriptor="destination",
+                )
             source_after = os.fstat(source_fd)
             source_path_after = os.stat(source, follow_symlinks=False)
             _check_deadline(deadline, deadline_error)
@@ -4269,8 +4290,19 @@ def _snapshot_git_executable(
             source_verified = os.fstat(source_fd)
             source_path_verified = os.stat(source, follow_symlinks=False)
             _check_deadline(deadline, deadline_error)
-        finally:
-            os.close(source_fd)
+        except BaseException as exc:
+            _close_git_runtime_snapshot_descriptor_preserving_error(
+                source_fd,
+                exc,
+                context="Git runtime snapshot creation",
+            )
+            raise
+        else:
+            _close_git_runtime_snapshot_descriptor_preserving_error(
+                source_fd,
+                None,
+                context="Git runtime snapshot creation",
+            )
 
         if (
             _git_source_identity(source_after) != source_identity
@@ -4320,8 +4352,21 @@ def _snapshot_git_executable(
                     "owner-private Git snapshot directory access policy changed "
                     "during ACL inspection"
                 )
-        finally:
-            os.close(directory_fd)
+        except BaseException as exc:
+            _close_git_runtime_snapshot_descriptor_preserving_error(
+                directory_fd,
+                exc,
+                context="Git runtime snapshot creation",
+                descriptor="directory",
+            )
+            raise
+        else:
+            _close_git_runtime_snapshot_descriptor_preserving_error(
+                directory_fd,
+                None,
+                context="Git runtime snapshot creation",
+                descriptor="directory",
+            )
         _check_deadline(deadline, deadline_error)
         return (
             snapshot,
@@ -4377,9 +4422,8 @@ def _initialize_git_runtime() -> None:
             f"failed to resolve the selected Git executable: {exc}"
         )
         return
-    except UserError as exc:
-        _GIT_RUNTIME_ERROR = UnsupportedGitVersion(str(exc))
-        return
+    except UserError:
+        raise
     if (
         not stat.S_ISREG(executable_stat.st_mode)
         or not stat.S_IMODE(executable_stat.st_mode) & 0o111
@@ -4408,13 +4452,15 @@ def _initialize_git_runtime() -> None:
             raise
         _GIT_RUNTIME_ERROR = exc
         return
-    except (OSError, UserError) as exc:
+    except OSError as exc:
         if _has_git_snapshot_cleanup_issue(exc):
             raise
         _GIT_RUNTIME_ERROR = UnsupportedGitVersion(
             f"failed to create an owner-private Git runtime snapshot: {exc}"
         )
         return
+    except UserError:
+        raise
     if launcher_kind != "native":
         _cleanup_git_snapshot_owner(
             snapshot_owner,
@@ -4453,6 +4499,10 @@ def _initialize_git_runtime() -> None:
         if key in os.environ
     }
     version_env.update(SAFE_GIT_ENV)
+    version_deadline_error = (
+        "Git runtime initialization exceeded its shared deadline during "
+        "the Git version probe"
+    )
     try:
         provisional_runtime = _GitRuntime(
             executable=snapshot,
@@ -4468,7 +4518,7 @@ def _initialize_git_runtime() -> None:
             [str(snapshot), "--version"],
             env=version_env,
             verified_runtime=provisional_runtime,
-            timeout_seconds=GIT_VERSION_TIMEOUT_SECONDS,
+            timeout_seconds=GIT_EXECUTABLE_SNAPSHOT_TIMEOUT_SECONDS,
             stdout_limit=MAX_GIT_VERSION_OUTPUT_BYTES,
             stderr_limit=MAX_GIT_VERSION_OUTPUT_BYTES,
             stdout_overflow_error=(
@@ -4477,10 +4527,7 @@ def _initialize_git_runtime() -> None:
             stderr_overflow_error=(
                 f"Git version stderr exceeds {MAX_GIT_VERSION_OUTPUT_BYTES} bytes"
             ),
-            timeout_error=(
-                f"Git version probe timed out after "
-                f"{GIT_VERSION_TIMEOUT_SECONDS:g} seconds"
-            ),
+            timeout_error=version_deadline_error,
             operation="Git version probe",
             deadline=snapshot_deadline,
         )
@@ -4492,13 +4539,19 @@ def _initialize_git_runtime() -> None:
         )
         if not cleanup_completed:
             raise
-        if isinstance(exc, _WaitableSigchldUnavailable):
+        if isinstance(
+            exc,
+            (
+                _WaitableSigchldUnavailable,
+                UnsupportedGitVersion,
+                UnsupportedPlatform,
+            ),
+        ):
             _GIT_RUNTIME_ERROR = exc
-        else:
-            _GIT_RUNTIME_ERROR = UnsupportedGitVersion(
-                f"failed the bounded credential-free Git version gate: {exc}"
-            )
-        return
+            return
+        raise GitVersionProbeError(
+            f"bounded credential-free Git version probe was inconclusive: {exc}"
+        ) from exc
     except BaseException as exc:
         _cleanup_git_snapshot_owner(
             snapshot_owner,
@@ -4507,31 +4560,29 @@ def _initialize_git_runtime() -> None:
         )
         raise
     if result.returncode != 0:
-        _cleanup_git_snapshot_owner(
-            snapshot_owner,
-            "a nonzero Git version probe",
-            None,
-        )
         detail = (
             result.stderr.decode("utf-8", errors="replace").strip()
             or result.stdout.decode("utf-8", errors="replace").strip()
             or f"exit {result.returncode}"
         )
-        _GIT_RUNTIME_ERROR = UnsupportedGitVersion(
-            f"Git version probe failed: {detail}"
+        error = GitVersionProbeError(f"Git version probe failed: {detail}")
+        _cleanup_git_snapshot_owner(
+            snapshot_owner,
+            "a nonzero Git version probe",
+            error,
         )
-        return
+        raise error
     match = GIT_VERSION_RE.fullmatch(result.stdout)
     if match is None:
+        error = GitVersionProbeError(
+            "Git version probe returned an unsupported response"
+        )
         _cleanup_git_snapshot_owner(
             snapshot_owner,
             "an unsupported Git version response",
-            None,
+            error,
         )
-        _GIT_RUNTIME_ERROR = UnsupportedGitVersion(
-            "Git version probe returned an unsupported response"
-        )
-        return
+        raise error
     version = tuple(int(part or 0) for part in match.groups())
     if version < MINIMUM_GIT_VERSION:
         _cleanup_git_snapshot_owner(
@@ -4572,7 +4623,10 @@ def _initialize_git_runtime() -> None:
         )
         if not cleanup_completed:
             raise
-        _GIT_RUNTIME_ERROR = UnsupportedGitVersion(str(exc))
+        if isinstance(exc, UnsupportedGitVersion):
+            _GIT_RUNTIME_ERROR = exc
+            return
+        raise
     except BaseException as exc:
         _GIT_RUNTIME = None
         _cleanup_git_snapshot_owner(
