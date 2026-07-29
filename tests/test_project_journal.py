@@ -10380,6 +10380,115 @@ class ProjectJournalTests(unittest.TestCase):
                 self.assertEqual(coverage["rollout_records_scanned"], 1)
                 self.assertEqual(coverage["rollout_bytes_scanned"], len(payload))
 
+    def test_discover_repos_marks_non_regular_rollout_candidates_partial(
+        self,
+    ) -> None:
+        for candidate_kind in ("symlink", "fifo", "directory"):
+            with self.subTest(candidate_kind=candidate_kind):
+                repo = self.init_repo(f"healthy-repo-{candidate_kind}")
+                codex_home = self.root / f"codex-home-stable-{candidate_kind}"
+                rollout_dir = codex_home / "sessions/2026/05/05"
+                rollout_dir.mkdir(parents=True)
+                healthy = rollout_dir / "rollout-healthy.jsonl"
+                healthy.write_text(
+                    json.dumps({"payload": {"cwd": str(repo)}}) + "\n",
+                    encoding="utf-8",
+                )
+                candidate = rollout_dir / f"rollout-{candidate_kind}.jsonl"
+                if candidate_kind == "symlink":
+                    target = rollout_dir / "symlink-target"
+                    target.write_bytes(b'{"event":"target"}\n')
+                    candidate.symlink_to(target)
+                elif candidate_kind == "fifo":
+                    os.mkfifo(candidate)
+                else:
+                    candidate.mkdir()
+
+                rows = project_journal._discover_repos(codex_home, 9999)
+
+                self.assertEqual(len(rows), 1)
+                row = rows[0]
+                self.assertTrue(os.path.samefile(row["repo"], repo))
+                self.assertEqual(row["rollout_count"], 1)
+                self.assertEqual(row["coverage_status"], "partial")
+                coverage = row["discovery_error"]["discovery_coverage"]
+                self.assertEqual(
+                    coverage["code"],
+                    "discovery_rollout_inspection_failed",
+                )
+                self.assertEqual(
+                    coverage["inspection_reason"],
+                    "non_regular_candidate",
+                )
+                self.assertEqual(pathlib.Path(coverage["source"]), candidate)
+
+    def test_discover_repos_marks_rollout_disappearing_during_enumeration_partial(
+        self,
+    ) -> None:
+        repo = self.init_repo("healthy-repo-enumeration-race")
+        codex_home = self.root / "codex-home-enumeration-race"
+        rollout_dir = codex_home / "sessions/2026/05/05"
+        rollout_dir.mkdir(parents=True)
+        healthy = rollout_dir / "rollout-healthy.jsonl"
+        healthy.write_text(
+            json.dumps({"payload": {"cwd": str(repo)}}) + "\n",
+            encoding="utf-8",
+        )
+        disappearing = rollout_dir / "rollout-disappearing.jsonl"
+        disappearing.write_bytes(b'{"event":"disappearing"}\n')
+        actual_scandir = project_journal.os.scandir
+
+        with actual_scandir(rollout_dir) as entries:
+            healthy_entry = next(
+                entry for entry in entries if pathlib.Path(entry.path) == healthy
+            )
+        vanishing_entry = mock.Mock()
+        vanishing_entry.name = disappearing.name
+        vanishing_entry.path = str(disappearing)
+        vanishing_entry.stat.side_effect = FileNotFoundError(
+            errno.ENOENT,
+            "injected enumeration race",
+            str(disappearing),
+        )
+        target_scandir = mock.MagicMock()
+        target_scandir.__enter__.return_value = iter([healthy_entry, vanishing_entry])
+        target_scandir.__exit__.return_value = False
+
+        def inject_enumeration_race(
+            path: int | os.PathLike[str] | str,
+        ) -> object:
+            if not isinstance(path, int) and pathlib.Path(path) == rollout_dir:
+                disappearing.unlink()
+                return target_scandir
+            return actual_scandir(path)
+
+        with mock.patch.object(
+            project_journal.os,
+            "scandir",
+            side_effect=inject_enumeration_race,
+        ):
+            rows = project_journal._discover_repos(codex_home, 9999)
+
+        self.assertFalse(disappearing.exists())
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertIsNotNone(row["repo"], row)
+        self.assertTrue(os.path.samefile(row["repo"], repo))
+        self.assertEqual(row["rollout_count"], 1)
+        self.assertEqual(row["coverage_status"], "partial")
+        coverage = row["discovery_error"]["discovery_coverage"]
+        self.assertEqual(
+            coverage["code"],
+            "discovery_rollout_inspection_failed",
+        )
+        self.assertEqual(
+            coverage["inspection_reason"],
+            "enumeration_revalidation_failed",
+        )
+        self.assertEqual(coverage["errno"], errno.ENOENT)
+        self.assertEqual(pathlib.Path(coverage["source"]), disappearing)
+        vanishing_entry.stat.assert_called_once_with(follow_symlinks=False)
+
     def test_discover_repos_rejects_fifo_and_symlink_rollout_replacement(
         self,
     ) -> None:

@@ -7497,6 +7497,12 @@ class _RolloutCandidate:
     mtime: float
 
 
+@dataclasses.dataclass(frozen=True)
+class _RolloutInspectionFailure:
+    path: pathlib.Path
+    error: DiscoveryRolloutInspectionError
+
+
 def _rollout_object_identity(value: os.stat_result) -> tuple[int, int]:
     return value.st_dev, value.st_ino
 
@@ -7643,7 +7649,7 @@ def _rollout_candidate_from_stat(
 ) -> _RolloutCandidate:
     if not stat.S_ISREG(path_stat.st_mode):
         raise DiscoveryRolloutInspectionError(
-            inspection_reason="non_regular_replacement",
+            inspection_reason="non_regular_candidate",
             path=path,
             detail="rollout path is not a regular file",
         )
@@ -7680,7 +7686,7 @@ def _coerce_rollout_candidate(
 def _iter_rollout_paths(
     root: pathlib.Path,
     state: _DiscoveryScanState,
-) -> Iterable[_RolloutCandidate]:
+) -> Iterable[_RolloutCandidate | _RolloutInspectionFailure]:
     state.check_deadline()
     try:
         root_stat = os.stat(root)
@@ -7704,22 +7710,41 @@ def _iter_rollout_paths(
         with os.scandir(directory) as entries:
             for entry in entries:
                 state.add_scan_entry()
+                is_rollout = entry.name.startswith("rollout-") and entry.name.endswith(
+                    ".jsonl"
+                )
                 try:
                     entry_stat = entry.stat(follow_symlinks=False)
-                except FileNotFoundError:
+                except OSError as exc:
+                    if is_rollout:
+                        path = pathlib.Path(entry.path)
+                        yield _RolloutInspectionFailure(
+                            path=path,
+                            error=DiscoveryRolloutInspectionError(
+                                inspection_reason="enumeration_revalidation_failed",
+                                path=path,
+                                detail=str(exc),
+                                error_number=exc.errno,
+                            ),
+                        )
+                        continue
+                    if isinstance(exc, FileNotFoundError):
+                        continue
+                    raise
+                if is_rollout:
+                    path = pathlib.Path(entry.path)
+                    try:
+                        candidate = _rollout_candidate_from_stat(
+                            path,
+                            entry_stat,
+                        )
+                    except DiscoveryRolloutInspectionError as exc:
+                        yield _RolloutInspectionFailure(path=path, error=exc)
+                    else:
+                        yield candidate
                     continue
                 if stat.S_ISDIR(entry_stat.st_mode):
                     pending.append(pathlib.Path(entry.path))
-                    continue
-                if (
-                    stat.S_ISREG(entry_stat.st_mode)
-                    and entry.name.startswith("rollout-")
-                    and entry.name.endswith(".jsonl")
-                ):
-                    yield _rollout_candidate_from_stat(
-                        pathlib.Path(entry.path),
-                        entry_stat,
-                    )
 
 
 def _open_rollout_candidate(
@@ -8895,11 +8920,16 @@ def _discover_repos(codex_home: pathlib.Path, since_days: int) -> list[dict[str,
                     break
                 rollout_path = (
                     rollout_value.path
-                    if isinstance(rollout_value, _RolloutCandidate)
+                    if isinstance(
+                        rollout_value,
+                        (_RolloutCandidate, _RolloutInspectionFailure),
+                    )
                     else pathlib.Path(rollout_value)
                 )
                 try:
                     state.check_deadline()
+                    if isinstance(rollout_value, _RolloutInspectionFailure):
+                        raise rollout_value.error
                     rollout = _coerce_rollout_candidate(
                         rollout_value,
                         state,
