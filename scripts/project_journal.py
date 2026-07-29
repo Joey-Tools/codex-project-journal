@@ -95,6 +95,7 @@ MAX_DISCOVERY_TOTAL_BYTES = 256 * 1024 * 1024
 MAX_DISCOVERY_LINE_BYTES = 4 * 1024 * 1024
 MAX_DISCOVERY_RECORDS = 1_000_000
 MAX_DISCOVERY_DISTINCT_CWDS = 4096
+MAX_DISCOVERY_ROLLOUT_ASSOCIATIONS = 131_072
 MAX_DISCOVERY_JSON_DEPTH = 64
 MAX_DISCOVERY_JSON_INTEGER_DIGITS = 4096
 MAX_DISCOVERY_CWD_UTF8_BYTES = 16 * 1024
@@ -1818,10 +1819,31 @@ def _open_bound_git_runtime_snapshot(
             deadline_error=deadline_error,
         )
         _check_deadline(deadline, deadline_error)
-    except BaseException:
-        os.close(fd)
+    except BaseException as exc:
+        _close_git_runtime_snapshot_descriptor_preserving_error(
+            fd,
+            exc,
+            context="Git runtime snapshot binding",
+        )
         raise
     return fd
+
+
+def _close_git_runtime_snapshot_descriptor_preserving_error(
+    fd: int,
+    active_error: BaseException,
+    *,
+    context: str,
+) -> None:
+    try:
+        os.close(fd)
+    except BaseException as cleanup_error:
+        _add_exception_detail(
+            active_error,
+            _bounded_signal_report_detail(
+                f"{context} source descriptor cleanup failed: {cleanup_error}"
+            ),
+        )
 
 
 def _verify_git_runtime_snapshot(
@@ -1857,7 +1879,14 @@ def _verify_git_runtime_snapshot(
                 raise OSError("owner-private Git snapshot size changed")
             if digest != runtime.digest:
                 raise OSError("owner-private Git snapshot content changed")
-        finally:
+        except BaseException as exc:
+            _close_git_runtime_snapshot_descriptor_preserving_error(
+                fd,
+                exc,
+                context="Git runtime snapshot verification",
+            )
+            raise
+        else:
             os.close(fd)
     except OSError as exc:
         raise UnsupportedGitVersion(
@@ -1886,6 +1915,28 @@ def _prepare_git_runtime_launch(
             "Git launch preparation",
             active_error,
         )
+
+    def close_source(active_error: BaseException | None) -> None:
+        nonlocal source_fd
+
+        if source_fd is None:
+            return
+        fd = source_fd
+        source_fd = None
+        try:
+            os.close(fd)
+        except BaseException as cleanup_error:
+            detail = _bounded_signal_report_detail(
+                "Git launch preparation source descriptor cleanup failed: "
+                f"{cleanup_error}"
+            )
+            if active_error is not None:
+                _add_exception_detail(active_error, detail)
+                return
+            if isinstance(cleanup_error, Exception):
+                raise UnsupportedGitVersion(detail) from cleanup_error
+            _add_exception_detail(cleanup_error, detail)
+            raise
 
     try:
         source_fd = _open_bound_git_runtime_snapshot(
@@ -2113,7 +2164,7 @@ def _prepare_git_runtime_launch(
         finally:
             os.close(destination_read_fd)
 
-        return _GitLaunchCopy(
+        launch = _GitLaunchCopy(
             executable=executable,
             directory=directory,
             source_argv0=runtime.source_executable,
@@ -2122,14 +2173,19 @@ def _prepare_git_runtime_launch(
         error = UnsupportedGitVersion(
             f"failed to bind Git execution to verified bytes: {exc}"
         )
+        close_source(error)
         cleanup_owner(error)
         raise error from exc
     except BaseException as exc:
+        close_source(exc)
         cleanup_owner(exc)
         raise
-    finally:
-        if source_fd is not None:
-            os.close(source_fd)
+    try:
+        close_source(None)
+    except BaseException as exc:
+        cleanup_owner(exc)
+        raise
+    return launch
 
 
 def _git_environment() -> dict[str, str]:
@@ -7687,6 +7743,7 @@ class _DiscoveryScanState:
     verification_bytes: int = 0
     records_scanned: int = 0
     distinct_cwds: set[str] = dataclasses.field(default_factory=set)
+    rollout_associations: int = 0
 
     def check_deadline(self) -> None:
         _raise_if_termination_pending()
@@ -7758,6 +7815,15 @@ class _DiscoveryScanState:
         )
         self.distinct_cwds.add(cwd)
 
+    def add_rollout_association(self) -> None:
+        self.check_deadline()
+        self.rollout_associations += 1
+        self._check_limit(
+            "retained rollout association count",
+            self.rollout_associations,
+            MAX_DISCOVERY_ROLLOUT_ASSOCIATIONS,
+        )
+
     def coverage_counters(self) -> dict[str, int]:
         return {
             "filesystem_entries_scanned": self.scan_entries,
@@ -7766,6 +7832,7 @@ class _DiscoveryScanState:
             "rollout_verification_bytes_read": self.verification_bytes,
             "rollout_records_scanned": self.records_scanned,
             "distinct_cwds_scanned": len(self.distinct_cwds),
+            "rollout_associations_counted": self.rollout_associations,
         }
 
 
@@ -7782,7 +7849,7 @@ def _path_date(
             return dt.date(*(int(value) for value in relative.parts[:3]))
         except ValueError:
             return None
-    if rollout_root.name == "archived_sessions":
+    if rollout_root.name == "archived_sessions" and len(relative.parts) == 1:
         match = ARCHIVED_ROLLOUT_DATE_RE.match(path.name)
         if match is not None:
             try:
@@ -8394,6 +8461,8 @@ def _revalidate_and_close_unframed_rollout_directory(
 def _iter_rollout_paths(
     root: pathlib.Path,
     state: _DiscoveryScanState,
+    *,
+    recurse_directories: bool,
 ) -> Iterable[_RolloutCandidate | _RolloutInspectionFailure]:
     root_result = _bind_rollout_root_directory(root, state)
     if root_result is None:
@@ -8482,6 +8551,8 @@ def _iter_rollout_paths(
             is_rollout = entry.name.startswith("rollout-") and entry.name.endswith(
                 ".jsonl"
             )
+            if not recurse_directories and not is_rollout:
+                continue
             try:
                 entry_stat = entry.stat(follow_symlinks=False)
             except OSError as exc:
@@ -9807,14 +9878,29 @@ def _discover_repos(codex_home: pathlib.Path, since_days: int) -> list[dict[str,
                 coverage_errors.append(limit_error)
             stop_all_sources = True
 
-    for rollout_root in (
-        codex_home / "sessions",
-        codex_home / "archived_sessions",
+    def count_rollout_association(
+        associations: set[tuple[str, Any]],
+        association: tuple[str, Any],
+        row: dict[str, Any],
+    ) -> None:
+        if association in associations:
+            return
+        state.add_rollout_association()
+        associations.add(association)
+        row["rollout_count"] = int(row["rollout_count"]) + 1
+
+    for rollout_root, recurse_directories in (
+        (codex_home / "sessions", True),
+        (codex_home / "archived_sessions", False),
     ):
         if stop_all_sources:
             break
         try:
-            rollouts = _iter_rollout_paths(rollout_root, state)
+            rollouts = _iter_rollout_paths(
+                rollout_root,
+                state,
+                recurse_directories=recurse_directories,
+            )
             for rollout_value in rollouts:
                 if stop_all_sources:
                     break
@@ -9847,117 +9933,107 @@ def _discover_repos(codex_home: pathlib.Path, since_days: int) -> list[dict[str,
                         known_rollouts.add(rollout_identity)
                         state.add_rollout()
                     last_seen = _rollout_last_seen(rollout)
-                    roots_for_rollout: set[pathlib.Path] = set()
-                    unresolved_for_rollout: set[str] = set()
                     cwds_for_rollout: set[str] = set()
-                    try:
-                        for raw_cwd in _extract_cwds(rollout, state):
+                    for raw_cwd in _extract_cwds(rollout, state):
+                        state.check_deadline()
+                        cwd = _normalize_discovery_cwd(raw_cwd)
+                        state.add_cwd(cwd)
+                        if cwd in cwds_for_rollout:
+                            continue
+                        cwds_for_rollout.add(cwd)
+                        if cwd not in resolved_roots:
+                            now = time.monotonic()
                             state.check_deadline()
-                            cwd = _normalize_discovery_cwd(raw_cwd)
-                            state.add_cwd(cwd)
-                            if cwd in cwds_for_rollout:
-                                continue
-                            cwds_for_rollout.add(cwd)
-                            if cwd not in resolved_roots:
-                                now = time.monotonic()
+                            resolution_deadline = min(
+                                state.deadline,
+                                now + GIT_ADOPTION_VALIDATION_TIMEOUT_SECONDS,
+                            )
+                            resolution_deadlines[cwd] = resolution_deadline
+                            try:
+                                resolved_roots[cwd] = _repo_root_for_path(
+                                    cwd,
+                                    codex_home=codex_home,
+                                    deadline=resolution_deadline,
+                                )
+                            except (OSError, UserError) as exc:
                                 state.check_deadline()
-                                resolution_deadline = min(
-                                    state.deadline,
-                                    now + GIT_ADOPTION_VALIDATION_TIMEOUT_SECONDS,
-                                )
-                                resolution_deadlines[cwd] = resolution_deadline
-                                try:
-                                    resolved_roots[cwd] = _repo_root_for_path(
+                                resolved_roots[cwd] = None
+                                resolution_errors[cwd] = _discovery_error(exc)
+                        root = resolved_roots[cwd]
+                        if root is None:
+                            resolution_error = resolution_errors.get(cwd)
+                            if resolution_error is not None:
+                                row = unresolved.setdefault(
+                                    cwd,
+                                    _repository_resolution_error_row(
                                         cwd,
-                                        codex_home=codex_home,
-                                        deadline=resolution_deadline,
-                                    )
-                                except (OSError, UserError) as exc:
-                                    state.check_deadline()
-                                    resolved_roots[cwd] = None
-                                    resolution_errors[cwd] = _discovery_error(exc)
-                            root = resolved_roots[cwd]
-                            if root is None:
-                                resolution_error = resolution_errors.get(cwd)
-                                if resolution_error is not None:
-                                    row = unresolved.setdefault(
-                                        cwd,
-                                        _repository_resolution_error_row(
-                                            cwd,
-                                            last_seen,
-                                            resolution_error,
-                                        ),
-                                    )
-                                    row["last_seen"] = max(
-                                        str(row["last_seen"]),
                                         last_seen,
-                                    )
-                                    unresolved_for_rollout.add(cwd)
-                                continue
-                            if root not in seen:
-                                row = {
-                                    "repo": str(root),
-                                    "last_seen": last_seen,
-                                    "rollout_count": 0,
-                                    "coverage_status": "complete",
-                                }
-                                seen[root] = row
-                                remaining_budget = max(
-                                    0.0,
-                                    resolution_deadlines[cwd] - time.monotonic(),
+                                        resolution_error,
+                                    ),
                                 )
+                                row["last_seen"] = max(
+                                    str(row["last_seen"]),
+                                    last_seen,
+                                )
+                                count_rollout_association(
+                                    counted_unresolved_rollouts,
+                                    (rollout_identity, cwd),
+                                    row,
+                                )
+                            continue
+                        if root not in seen:
+                            row = {
+                                "repo": str(root),
+                                "last_seen": last_seen,
+                                "rollout_count": 0,
+                                "coverage_status": "complete",
+                            }
+                            seen[root] = row
+                            remaining_budget = max(
+                                0.0,
+                                resolution_deadlines[cwd] - time.monotonic(),
+                            )
+                            enrichment_remaining_budgets[root] = remaining_budget
+                            enrichment_attempts[root] = 1
+                            _enrich_discovered_repo(
+                                root,
+                                row,
+                                script,
+                                deadline=resolution_deadlines[cwd],
+                            )
+                        else:
+                            row = seen[root]
+                            remaining_budget = max(
+                                0.0,
+                                resolution_deadlines[cwd] - time.monotonic(),
+                            )
+                            if (
+                                row.get("adoption_status") == "inconclusive"
+                                and enrichment_attempts[root]
+                                < DISCOVERY_ENRICHMENT_MAX_ATTEMPTS_PER_ROOT
+                                and remaining_budget
+                                >= (
+                                    enrichment_remaining_budgets[root]
+                                    + DISCOVERY_ENRICHMENT_RETRY_MIN_BUDGET_GAIN_SECONDS
+                                )
+                            ):
                                 enrichment_remaining_budgets[root] = remaining_budget
-                                enrichment_attempts[root] = 1
+                                enrichment_attempts[root] += 1
                                 _enrich_discovered_repo(
                                     root,
                                     row,
                                     script,
                                     deadline=resolution_deadlines[cwd],
                                 )
-                            else:
-                                row = seen[root]
-                                remaining_budget = max(
-                                    0.0,
-                                    resolution_deadlines[cwd] - time.monotonic(),
-                                )
-                                if (
-                                    row.get("adoption_status") == "inconclusive"
-                                    and enrichment_attempts[root]
-                                    < DISCOVERY_ENRICHMENT_MAX_ATTEMPTS_PER_ROOT
-                                    and remaining_budget
-                                    >= (
-                                        enrichment_remaining_budgets[root]
-                                        + DISCOVERY_ENRICHMENT_RETRY_MIN_BUDGET_GAIN_SECONDS
-                                    )
-                                ):
-                                    enrichment_remaining_budgets[root] = (
-                                        remaining_budget
-                                    )
-                                    enrichment_attempts[root] += 1
-                                    _enrich_discovered_repo(
-                                        root,
-                                        row,
-                                        script,
-                                        deadline=resolution_deadlines[cwd],
-                                    )
-                            roots_for_rollout.add(root)
-                    finally:
-                        for root in roots_for_rollout:
-                            row = seen[root]
-                            row["last_seen"] = max(
-                                str(row["last_seen"]),
-                                last_seen,
-                            )
-                            association = (rollout_identity, root)
-                            if association not in counted_repo_rollouts:
-                                counted_repo_rollouts.add(association)
-                                row["rollout_count"] = int(row["rollout_count"]) + 1
-                        for cwd in unresolved_for_rollout:
-                            row = unresolved[cwd]
-                            association = (rollout_identity, cwd)
-                            if association not in counted_unresolved_rollouts:
-                                counted_unresolved_rollouts.add(association)
-                                row["rollout_count"] = int(row["rollout_count"]) + 1
+                        row["last_seen"] = max(
+                            str(row["last_seen"]),
+                            last_seen,
+                        )
+                        count_rollout_association(
+                            counted_repo_rollouts,
+                            (rollout_identity, root),
+                            row,
+                        )
                     state.check_deadline()
                 except (DiscoveryDeadlineExceeded, DiscoveryLimitExceeded) as exc:
                     record_coverage_error(exc, rollout_path)

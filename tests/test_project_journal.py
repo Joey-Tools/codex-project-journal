@@ -1688,6 +1688,353 @@ class ProjectJournalTests(unittest.TestCase):
         finally:
             runtime.snapshot_owner.cleanup()
 
+    def test_git_snapshot_binding_close_failure_preserves_active_error(
+        self,
+    ) -> None:
+        runtime = self.make_fake_git_runtime("snapshot-binding-close-error")
+        actual_close = project_journal.os.close
+        source_fd: int | None = None
+        source_close_failed = False
+        original_error = LegacyInterrupt(
+            "simulated Git snapshot binding interruption",
+        )
+        original_args = original_error.args
+
+        def interrupt_binding(
+            runtime_value: project_journal._GitRuntime,
+            fd: int,
+            *,
+            deadline: float | None = None,
+            deadline_error: str,
+        ) -> None:
+            nonlocal source_fd
+            del runtime_value, deadline, deadline_error
+            source_fd = fd
+            raise original_error
+
+        def close_source_then_fail(fd: int) -> None:
+            nonlocal source_close_failed
+            if fd == source_fd and not source_close_failed:
+                source_close_failed = True
+                actual_close(fd)
+                raise OSError(
+                    errno.EIO,
+                    "simulated snapshot binding close failure",
+                )
+            actual_close(fd)
+
+        try:
+            with mock.patch.object(
+                project_journal,
+                "_revalidate_open_git_runtime_snapshot",
+                side_effect=interrupt_binding,
+            ):
+                with mock.patch.object(
+                    project_journal.os,
+                    "close",
+                    side_effect=close_source_then_fail,
+                ):
+                    try:
+                        project_journal._open_bound_git_runtime_snapshot(
+                            runtime,
+                            deadline=time.monotonic() + 5,
+                            deadline_error="snapshot binding timed out",
+                        )
+                    except LegacyInterrupt as exc:
+                        raised_error = exc
+                    else:
+                        self.fail("expected Git snapshot binding interruption")
+
+            self.assertIs(raised_error, original_error)
+            self.assertEqual(raised_error.args, original_args)
+            self.assertTrue(source_close_failed)
+            notes = "\n".join(getattr(raised_error, "__notes__", ()))
+            self.assertIn("source descriptor cleanup failed", notes)
+            self.assertIn("snapshot binding close failure", notes)
+            traceback_names = self.exception_traceback_names(raised_error)
+            self.assertIn("interrupt_binding", traceback_names)
+            self.assertNotIn(
+                "_close_git_runtime_snapshot_descriptor_preserving_error",
+                traceback_names,
+            )
+        finally:
+            runtime.snapshot_owner.cleanup()
+
+    def test_git_snapshot_verification_close_failure_preserves_active_error(
+        self,
+    ) -> None:
+        runtime = self.make_fake_git_runtime("snapshot-verification-close-error")
+        actual_open = project_journal._open_bound_git_runtime_snapshot
+        actual_close = project_journal.os.close
+        source_fd: int | None = None
+        source_close_failed = False
+        original_error = LegacyInterrupt(
+            "simulated Git snapshot verification interruption",
+        )
+        original_args = original_error.args
+
+        def capture_source(
+            runtime_value: project_journal._GitRuntime,
+            *,
+            deadline: float | None = None,
+            deadline_error: str,
+        ) -> int:
+            nonlocal source_fd
+            source_fd = actual_open(
+                runtime_value,
+                deadline=deadline,
+                deadline_error=deadline_error,
+            )
+            return source_fd
+
+        def interrupt_hash(
+            fd: int,
+            *,
+            deadline: float | None,
+            deadline_error: str,
+        ) -> tuple[str, int]:
+            del deadline, deadline_error
+            self.assertEqual(fd, source_fd)
+            raise original_error
+
+        def close_source_then_fail(fd: int) -> None:
+            nonlocal source_close_failed
+            if fd == source_fd and not source_close_failed:
+                source_close_failed = True
+                actual_close(fd)
+                raise OSError(
+                    errno.EIO,
+                    "simulated snapshot verification close failure",
+                )
+            actual_close(fd)
+
+        try:
+            with mock.patch.object(
+                project_journal,
+                "_open_bound_git_runtime_snapshot",
+                side_effect=capture_source,
+            ):
+                with mock.patch.object(
+                    project_journal,
+                    "_hash_open_file",
+                    side_effect=interrupt_hash,
+                ):
+                    with mock.patch.object(
+                        project_journal.os,
+                        "close",
+                        side_effect=close_source_then_fail,
+                    ):
+                        try:
+                            project_journal._verify_git_runtime_snapshot(
+                                runtime,
+                                deadline=time.monotonic() + 5,
+                                deadline_error="snapshot verification timed out",
+                            )
+                        except LegacyInterrupt as exc:
+                            raised_error = exc
+                        else:
+                            self.fail("expected Git snapshot verification interruption")
+
+            self.assertIs(raised_error, original_error)
+            self.assertEqual(raised_error.args, original_args)
+            self.assertTrue(source_close_failed)
+            notes = "\n".join(getattr(raised_error, "__notes__", ()))
+            self.assertIn("source descriptor cleanup failed", notes)
+            self.assertIn("snapshot verification close failure", notes)
+            traceback_names = self.exception_traceback_names(raised_error)
+            self.assertIn("interrupt_hash", traceback_names)
+            self.assertNotIn(
+                "_close_git_runtime_snapshot_descriptor_preserving_error",
+                traceback_names,
+            )
+        finally:
+            runtime.snapshot_owner.cleanup()
+
+    def test_git_launch_source_close_failure_cleans_prepared_launch(self) -> None:
+        runtime = self.make_fake_git_runtime("launch-source-close-error")
+        actual_open_source = project_journal._open_bound_git_runtime_snapshot
+        actual_close = project_journal.os.close
+        actual_mkdtemp = tempfile.mkdtemp
+        source_fd: int | None = None
+        source_close_failed = False
+        launch_directories: list[pathlib.Path] = []
+        close_error = OSError(
+            errno.EIO,
+            "simulated Git launch source close failure",
+        )
+
+        def capture_source(*args: object, **kwargs: object) -> int:
+            nonlocal source_fd
+            source_fd = actual_open_source(*args, **kwargs)
+            return source_fd
+
+        def close_source_then_fail(fd: int) -> None:
+            nonlocal source_close_failed
+            if fd == source_fd and not source_close_failed:
+                source_close_failed = True
+                actual_close(fd)
+                raise close_error
+            actual_close(fd)
+
+        def capture_launch_directory(*args: object, **kwargs: object) -> str:
+            directory = actual_mkdtemp(*args, **kwargs)
+            if pathlib.Path(directory).name.startswith("project-journal-git-launch-"):
+                launch_directories.append(pathlib.Path(directory))
+            return directory
+
+        try:
+            with mock.patch.object(
+                project_journal,
+                "_open_bound_git_runtime_snapshot",
+                side_effect=capture_source,
+            ):
+                with mock.patch.object(
+                    project_journal.tempfile,
+                    "mkdtemp",
+                    side_effect=capture_launch_directory,
+                ):
+                    with mock.patch.object(
+                        project_journal.os,
+                        "close",
+                        side_effect=close_source_then_fail,
+                    ):
+                        with self.assertRaises(
+                            project_journal.UnsupportedGitVersion,
+                        ) as raised:
+                            project_journal._prepare_git_runtime_launch(
+                                runtime,
+                                deadline=time.monotonic() + 5,
+                                deadline_error="launch preparation timed out",
+                            )
+
+            self.assertTrue(source_close_failed)
+            self.assertIs(raised.exception.__cause__, close_error)
+            self.assertIn(
+                "source descriptor cleanup failed",
+                str(raised.exception),
+            )
+            self.assertEqual(len(launch_directories), 1)
+            self.assertFalse(launch_directories[0].exists())
+        finally:
+            for directory in launch_directories:
+                if directory.exists():
+                    os.chmod(directory, 0o700)
+                    shutil.rmtree(directory)
+            runtime.snapshot_owner.cleanup()
+
+    def test_git_launch_source_close_failure_is_secondary_to_active_error(
+        self,
+    ) -> None:
+        runtime = self.make_fake_git_runtime("launch-source-close-secondary")
+        actual_open_source = project_journal._open_bound_git_runtime_snapshot
+        actual_close = project_journal.os.close
+        actual_mkdtemp = tempfile.mkdtemp
+        actual_chmod = project_journal.os.chmod
+        source_fd: int | None = None
+        source_close_failed = False
+        interrupted = False
+        launch_directories: list[pathlib.Path] = []
+        original_error = LegacyInterrupt(
+            "simulated launch preparation interruption",
+        )
+        original_args = original_error.args
+
+        def capture_source(*args: object, **kwargs: object) -> int:
+            nonlocal source_fd
+            source_fd = actual_open_source(*args, **kwargs)
+            return source_fd
+
+        def close_source_then_fail(fd: int) -> None:
+            nonlocal source_close_failed
+            if fd == source_fd and not source_close_failed:
+                source_close_failed = True
+                actual_close(fd)
+                raise OSError(
+                    errno.EIO,
+                    "simulated secondary source close failure",
+                )
+            actual_close(fd)
+
+        def capture_launch_directory(*args: object, **kwargs: object) -> str:
+            directory = actual_mkdtemp(*args, **kwargs)
+            if pathlib.Path(directory).name.startswith("project-journal-git-launch-"):
+                launch_directories.append(pathlib.Path(directory))
+            return directory
+
+        def interrupt_initial_launch_chmod(
+            path: os.PathLike[str] | str,
+            mode: int,
+            *,
+            dir_fd: int | None = None,
+            follow_symlinks: bool = True,
+        ) -> None:
+            nonlocal interrupted
+            candidate = pathlib.Path(path)
+            if (
+                not interrupted
+                and mode == 0o700
+                and candidate.name.startswith("project-journal-git-launch-")
+            ):
+                interrupted = True
+                raise original_error
+            actual_chmod(
+                path,
+                mode,
+                dir_fd=dir_fd,
+                follow_symlinks=follow_symlinks,
+            )
+
+        try:
+            with mock.patch.object(
+                project_journal,
+                "_open_bound_git_runtime_snapshot",
+                side_effect=capture_source,
+            ):
+                with mock.patch.object(
+                    project_journal.tempfile,
+                    "mkdtemp",
+                    side_effect=capture_launch_directory,
+                ):
+                    with mock.patch.object(
+                        project_journal.os,
+                        "chmod",
+                        side_effect=interrupt_initial_launch_chmod,
+                    ):
+                        with mock.patch.object(
+                            project_journal.os,
+                            "close",
+                            side_effect=close_source_then_fail,
+                        ):
+                            try:
+                                project_journal._prepare_git_runtime_launch(
+                                    runtime,
+                                    deadline=time.monotonic() + 5,
+                                    deadline_error="launch preparation timed out",
+                                )
+                            except LegacyInterrupt as exc:
+                                raised_error = exc
+                            else:
+                                self.fail("expected launch preparation interruption")
+
+            self.assertIs(raised_error, original_error)
+            self.assertEqual(raised_error.args, original_args)
+            self.assertTrue(interrupted)
+            self.assertTrue(source_close_failed)
+            notes = "\n".join(getattr(raised_error, "__notes__", ()))
+            self.assertIn("source descriptor cleanup failed", notes)
+            self.assertIn("secondary source close failure", notes)
+            self.assertEqual(len(launch_directories), 1)
+            self.assertFalse(launch_directories[0].exists())
+            traceback_names = self.exception_traceback_names(raised_error)
+            self.assertIn("interrupt_initial_launch_chmod", traceback_names)
+            self.assertNotIn("close_source", traceback_names)
+        finally:
+            for directory in launch_directories:
+                if directory.exists():
+                    os.chmod(directory, 0o700)
+                    shutil.rmtree(directory)
+            runtime.snapshot_owner.cleanup()
+
     @unittest.skipUnless(os.name == "posix", "POSIX Git runtime contract")
     def test_git_snapshot_creation_cleanup_failure_preserves_original_error(
         self,
@@ -7301,6 +7648,10 @@ class ProjectJournalTests(unittest.TestCase):
             "preserve the exact original exception object, type, code, arguments, and traceback",
             skill,
         )
+        self.assertIn(
+            "source-snapshot descriptor inside that same preparation cleanup flow",
+            skill,
+        )
         self.assertIn("native no-replace or exchange rename semantics", skill)
         self.assertIn("reported recovery locator", skill)
         self.assertIn("installed-target-committed state", skill)
@@ -7351,6 +7702,8 @@ class ProjectJournalTests(unittest.TestCase):
             "active `sessions` and flat `archived_sessions`",
             skill,
         )
+        self.assertIn("`archived_sessions` as direct-child-only", skill)
+        self.assertIn("131,072-association budget", skill)
         self.assertIn("`O_NOFOLLOW|O_NONBLOCK` descriptor", skill)
         self.assertIn("distinct `inspection_reason` values", skill)
         self.assertIn(
@@ -7490,6 +7843,10 @@ class ProjectJournalTests(unittest.TestCase):
             readme,
         )
         self.assertIn(
+            "source-snapshot descriptor closes inside that same preparation cleanup flow",
+            readme,
+        )
+        self.assertIn(
             "existing precedence for an earlier terminal-convergence failure "
             "or managed-signal propagation is unchanged",
             readme,
@@ -7502,6 +7859,14 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertIn("each root is enriched at most twice", readme)
         self.assertIn(
             "active `sessions` and flat `archived_sessions`",
+            readme,
+        )
+        self.assertIn(
+            "archive source accepts only direct `rollout-*.jsonl` children",
+            readme,
+        )
+        self.assertIn(
+            "131,072 retained logical rollout associations",
             readme,
         )
         self.assertIn("one shared 60-second monotonic deadline", readme)
@@ -10277,6 +10642,12 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertIsNotNone(dated)
         self.assertEqual(dated.isoformat(), "2026-05-06")
 
+    def test_path_date_rejects_nested_archived_rollout_name(self) -> None:
+        rollout_root = pathlib.Path("/tmp/.codex/archived_sessions")
+        path = rollout_root / "backup" / "rollout-2026-05-06T12-34-56-abcdef.jsonl"
+
+        self.assertIsNone(project_journal._path_date(path, rollout_root))
+
     def test_rollout_directory_cleanup_attempts_every_bound_resource(self) -> None:
         first_entries = mock.Mock()
         second_entries = mock.Mock()
@@ -10779,6 +11150,94 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertEqual(rows[0]["rollout_count"], 1)
         self.assertEqual(rows[0]["coverage_status"], "complete")
 
+    def test_discover_repos_ignores_nested_archive_rollouts(self) -> None:
+        direct_repo = self.init_repo("direct-archive-repo")
+        nested_repo = self.init_repo("nested-archive-repo")
+        codex_home = self.root / "codex-home-flat-archive"
+        archive = codex_home / "archived_sessions"
+        nested_archive = archive / "backup"
+        nested_archive.mkdir(parents=True)
+        (archive / "rollout-2026-05-06T12-34-56-direct.jsonl").write_text(
+            json.dumps({"payload": {"cwd": str(direct_repo)}}) + "\n",
+            encoding="utf-8",
+        )
+        (nested_archive / "rollout-2026-05-07T12-34-56-nested.jsonl").write_text(
+            json.dumps({"payload": {"cwd": str(nested_repo)}}) + "\n",
+            encoding="utf-8",
+        )
+        (nested_archive / "rollout-2026-05-08T12-34-56-broken.jsonl").write_bytes(
+            b'{"payload":\n'
+        )
+
+        rows = project_journal._discover_repos(codex_home, 9999)
+
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(os.path.samefile(rows[0]["repo"], direct_repo))
+        self.assertEqual(rows[0]["rollout_count"], 1)
+        self.assertEqual(rows[0]["coverage_status"], "complete")
+
+    def test_discover_repos_does_not_inspect_nested_archive_directories(
+        self,
+    ) -> None:
+        repo = self.init_repo("direct-archive-unreadable-neighbor")
+        codex_home = self.root / "codex-home-flat-unreadable-archive"
+        archive = codex_home / "archived_sessions"
+        nested_archive = archive / "unreadable-backup"
+        nested_archive.mkdir(parents=True)
+        direct_rollout = archive / "rollout-2026-05-06T12-34-56-direct.jsonl"
+        direct_rollout.write_text(
+            json.dumps({"payload": {"cwd": str(repo)}}) + "\n",
+            encoding="utf-8",
+        )
+        actual_scandir = project_journal.os.scandir
+        with actual_scandir(archive) as entries:
+            direct_entry = next(
+                entry for entry in entries if pathlib.Path(entry.path) == direct_rollout
+            )
+        nested_entry = mock.Mock()
+        nested_entry.name = nested_archive.name
+        nested_entry.path = str(nested_archive)
+        nested_entry.stat.side_effect = AssertionError(
+            "flat archive discovery must not inspect child directories"
+        )
+        archive_scandir = mock.MagicMock()
+        archive_scandir.__next__.side_effect = [
+            direct_entry,
+            nested_entry,
+            StopIteration,
+        ]
+        archive_identity = project_journal._rollout_object_identity(archive.stat())
+
+        def inject_flat_archive(
+            path: int | os.PathLike[str] | str,
+        ) -> object:
+            if isinstance(path, int):
+                identity = project_journal._rollout_object_identity(os.fstat(path))
+                if identity == archive_identity:
+                    return archive_scandir
+            return actual_scandir(path)
+
+        with mock.patch.object(
+            project_journal.os,
+            "scandir",
+            side_effect=inject_flat_archive,
+        ):
+            with mock.patch.object(
+                project_journal,
+                "_bind_rollout_child_directory",
+                side_effect=AssertionError(
+                    "flat archive discovery must not bind child directories"
+                ),
+            ) as bind_child:
+                rows = project_journal._discover_repos(codex_home, 9999)
+
+        bind_child.assert_not_called()
+        nested_entry.stat.assert_not_called()
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(os.path.samefile(rows[0]["repo"], repo))
+        self.assertEqual(rows[0]["rollout_count"], 1)
+        self.assertEqual(rows[0]["coverage_status"], "complete")
+
     def test_discover_repos_aggregates_and_deduplicates_active_archive(
         self,
     ) -> None:
@@ -10797,7 +11256,12 @@ class ProjectJournalTests(unittest.TestCase):
             encoding="utf-8",
         )
 
-        rows = project_journal._discover_repos(codex_home, 9999)
+        with mock.patch.object(
+            project_journal,
+            "MAX_DISCOVERY_ROLLOUT_ASSOCIATIONS",
+            2,
+        ):
+            rows = project_journal._discover_repos(codex_home, 9999)
 
         self.assertEqual(len(rows), 1)
         self.assertTrue(os.path.samefile(rows[0]["repo"], repo))
@@ -11119,6 +11583,8 @@ class ProjectJournalTests(unittest.TestCase):
         def inject_old_failures(
             root: pathlib.Path,
             state: project_journal._DiscoveryScanState,
+            *,
+            recurse_directories: bool,
         ) -> object:
             if root == codex_home / "sessions":
                 for index in range(project_journal.MAX_DISCOVERY_ERRORS + 1):
@@ -11130,7 +11596,11 @@ class ProjectJournalTests(unittest.TestCase):
                         detail="injected old missing rollout",
                         error_number=errno.ENOENT,
                     )
-            yield from original_iterator(root, state)
+            yield from original_iterator(
+                root,
+                state,
+                recurse_directories=recurse_directories,
+            )
 
         with mock.patch.object(
             project_journal,
@@ -11159,6 +11629,8 @@ class ProjectJournalTests(unittest.TestCase):
         def inject_uncertain_failure(
             root: pathlib.Path,
             state: project_journal._DiscoveryScanState,
+            *,
+            recurse_directories: bool,
         ) -> object:
             if root == codex_home / "sessions":
                 yield project_journal._rollout_inspection_failure(
@@ -11168,7 +11640,11 @@ class ProjectJournalTests(unittest.TestCase):
                     detail="injected window-uncertain rollout",
                     error_number=errno.ENOENT,
                 )
-            yield from original_iterator(root, state)
+            yield from original_iterator(
+                root,
+                state,
+                recurse_directories=recurse_directories,
+            )
 
         with mock.patch.object(
             project_journal,
@@ -11207,6 +11683,8 @@ class ProjectJournalTests(unittest.TestCase):
         def inject_uncertain_failure(
             root: pathlib.Path,
             state: project_journal._DiscoveryScanState,
+            *,
+            recurse_directories: bool,
         ) -> object:
             if root == codex_home / "sessions":
                 yield project_journal._rollout_inspection_failure(
@@ -11216,7 +11694,11 @@ class ProjectJournalTests(unittest.TestCase):
                     detail="injected failure below a dated external ancestor",
                     error_number=errno.ENOENT,
                 )
-            yield from original_iterator(root, state)
+            yield from original_iterator(
+                root,
+                state,
+                recurse_directories=recurse_directories,
+            )
 
         with mock.patch.object(
             project_journal,
@@ -11562,8 +12044,14 @@ class ProjectJournalTests(unittest.TestCase):
                 def replace_after_enumeration(
                     root: pathlib.Path,
                     state: project_journal._DiscoveryScanState,
+                    *,
+                    recurse_directories: bool,
                 ) -> object:
-                    for candidate in original_iterator(root, state):
+                    for candidate in original_iterator(
+                        root,
+                        state,
+                        recurse_directories=recurse_directories,
+                    ):
                         if candidate.path == rollout:
                             rollout.unlink()
                             if replacement_kind == "fifo":
@@ -11617,8 +12105,14 @@ class ProjectJournalTests(unittest.TestCase):
                 def mutate_after_enumeration(
                     root: pathlib.Path,
                     state: project_journal._DiscoveryScanState,
+                    *,
+                    recurse_directories: bool,
                 ) -> object:
-                    for candidate in original_iterator(root, state):
+                    for candidate in original_iterator(
+                        root,
+                        state,
+                        recurse_directories=recurse_directories,
+                    ):
                         if candidate.path == rollout:
                             if mutation == "append":
                                 with rollout.open("ab") as handle:
@@ -12217,6 +12711,83 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertEqual(coverage["limit_name"], "distinct CWD count")
         self.assertEqual(coverage["observed"], 3)
 
+    def test_discover_repos_bounds_aggregate_rollout_associations(self) -> None:
+        repo = self.init_repo("association-repo").resolve()
+        resolved_cwd = str(self.root / "resolved-candidate")
+        unresolved_cwd = str(self.root / "unresolved-candidate")
+        codex_home = self.root / "codex-home-association-cap"
+        archive = codex_home / "archived_sessions"
+        archive.mkdir(parents=True)
+        payload = "".join(
+            (
+                json.dumps({"payload": {"cwd": resolved_cwd}}) + "\n",
+                json.dumps({"payload": {"cwd": unresolved_cwd}}) + "\n",
+            )
+        )
+        for index in range(2):
+            (
+                archive / f"rollout-2026-05-0{index + 6}T12-34-56-association.jsonl"
+            ).write_text(payload, encoding="utf-8")
+
+        def resolve_candidate(
+            path_text: str,
+            *,
+            codex_home: pathlib.Path | None = None,
+            deadline: float | None = None,
+        ) -> pathlib.Path:
+            del codex_home, deadline
+            if path_text == resolved_cwd:
+                return repo
+            raise project_journal.UserError("injected repository resolution failure")
+
+        def enrich_candidate(
+            root: pathlib.Path,
+            row: dict[str, object],
+            script: pathlib.Path,
+            *,
+            deadline: float | None = None,
+        ) -> None:
+            del root, script, deadline
+            row.update(
+                {
+                    "adoption_status": "unadopted",
+                    "adoption_error": None,
+                    "discovery_status": "complete",
+                    "discovery_error": None,
+                }
+            )
+
+        with mock.patch.object(
+            project_journal,
+            "MAX_DISCOVERY_ROLLOUT_ASSOCIATIONS",
+            3,
+        ):
+            with mock.patch.object(
+                project_journal,
+                "_repo_root_for_path",
+                side_effect=resolve_candidate,
+            ):
+                with mock.patch.object(
+                    project_journal,
+                    "_enrich_discovered_repo",
+                    side_effect=enrich_candidate,
+                ):
+                    rows = project_journal._discover_repos(codex_home, 9999)
+
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(sum(int(row["rollout_count"]) for row in rows), 3)
+        for row in rows:
+            self.assertEqual(row["coverage_status"], "partial")
+            coverage = row["discovery_error"]["discovery_coverage"]
+            self.assertEqual(coverage["code"], "discovery_limit_exceeded")
+            self.assertEqual(
+                coverage["limit_name"],
+                "retained rollout association count",
+            )
+            self.assertEqual(coverage["limit"], 3)
+            self.assertEqual(coverage["observed"], 4)
+            self.assertEqual(coverage["rollout_associations_counted"], 4)
+
     def test_discover_repos_shares_rollout_cap_across_active_archive(self) -> None:
         repo = self.init_repo().resolve()
         codex_home = self.root / "codex-home"
@@ -12288,7 +12859,13 @@ class ProjectJournalTests(unittest.TestCase):
         def iter_rollouts(
             root: pathlib.Path,
             state: project_journal._DiscoveryScanState,
+            *,
+            recurse_directories: bool,
         ) -> object:
+            self.assertEqual(
+                recurse_directories,
+                root.name == "sessions",
+            )
             state_ids.append(id(state))
             if root.name == "sessions":
                 yield active
@@ -12364,8 +12941,14 @@ class ProjectJournalTests(unittest.TestCase):
         def iter_rollouts(
             root: pathlib.Path,
             state: project_journal._DiscoveryScanState,
+            *,
+            recurse_directories: bool,
         ) -> object:
             del state
+            self.assertEqual(
+                recurse_directories,
+                root.name == "sessions",
+            )
             if root.name == "sessions":
                 raise PermissionError(
                     errno.EACCES,
