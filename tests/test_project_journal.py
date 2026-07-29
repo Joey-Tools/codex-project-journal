@@ -12275,6 +12275,78 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertEqual(coverage["inspection_reason"], "directory_replaced")
         self.assertEqual(pathlib.Path(coverage["source"]), target)
 
+    def test_discover_repos_prefers_ancestor_replacement_to_child_open_error(
+        self,
+    ) -> None:
+        healthy_repo = self.init_repo("healthy-repo-after-child-open-race")
+        untrusted_repo = self.init_repo("untrusted-repo-after-child-open-race")
+        codex_home = self.root / "codex-home-child-open-race"
+        year = codex_home / "sessions/2099"
+        month = year / "01"
+        target = month / "01"
+        target.mkdir(parents=True)
+        (target / "rollout-untrusted.jsonl").write_text(
+            json.dumps({"payload": {"cwd": str(untrusted_repo)}}) + "\n",
+            encoding="utf-8",
+        )
+        archive = codex_home / "archived_sessions"
+        archive.mkdir(parents=True)
+        (archive / "rollout-2099-01-02T00-00-00-healthy.jsonl").write_text(
+            json.dumps({"payload": {"cwd": str(healthy_repo)}}) + "\n",
+            encoding="utf-8",
+        )
+        month_identity = project_journal._rollout_object_identity(month.stat())
+        actual_open = project_journal.os.open
+        mutated = False
+
+        def replace_ancestor_and_deny_child_open(
+            path: os.PathLike[str] | str,
+            flags: int,
+            mode: int = 0o777,
+            *,
+            dir_fd: int | None = None,
+        ) -> int:
+            nonlocal mutated
+            if (
+                not mutated
+                and dir_fd is not None
+                and os.fspath(path) == target.name
+                and project_journal._rollout_object_identity(os.fstat(dir_fd))
+                == month_identity
+            ):
+                mutated = True
+                year.rename(codex_home / "detached-year-after-open-race")
+                year.mkdir()
+                raise PermissionError(
+                    errno.EACCES,
+                    "injected child directory open denial",
+                    os.fspath(path),
+                )
+            return actual_open(
+                path,
+                flags,
+                mode,
+                dir_fd=dir_fd,
+            )
+
+        with mock.patch.object(
+            project_journal.os,
+            "open",
+            side_effect=replace_ancestor_and_deny_child_open,
+        ):
+            with mock.patch.object(project_journal, "MAX_DISCOVERY_ERRORS", 1):
+                rows = project_journal._discover_repos(codex_home, 30)
+
+        self.assertTrue(mutated)
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertTrue(os.path.samefile(row["repo"], healthy_repo))
+        self.assertEqual(row["coverage_status"], "partial")
+        coverage = row["discovery_error"]["discovery_coverage"]
+        self.assertEqual(coverage["inspection_reason"], "directory_replaced")
+        self.assertEqual(pathlib.Path(coverage["source"]), year)
+        self.assertNotIn("errno", coverage)
+
     def test_discover_repos_revalidates_ancestors_before_scan_error_handoff(
         self,
     ) -> None:
@@ -12359,6 +12431,75 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertEqual(cleanup["errno"], errno.EIO)
         self.assertIn("descriptor close failure", cleanup["message"])
         self.assertIn(str(target), cleanup["context"])
+
+    def test_discover_repos_prefers_ancestor_policy_change_to_entry_stat_error(
+        self,
+    ) -> None:
+        healthy_repo = self.init_repo("healthy-repo-after-entry-stat-race")
+        codex_home = self.root / "codex-home-entry-stat-race"
+        year = codex_home / "sessions/2099"
+        target = year / "01/01"
+        target.mkdir(parents=True)
+        year.chmod(0o755)
+        archive = codex_home / "archived_sessions"
+        archive.mkdir(parents=True)
+        (archive / "rollout-2099-01-02T00-00-00-healthy.jsonl").write_text(
+            json.dumps({"payload": {"cwd": str(healthy_repo)}}) + "\n",
+            encoding="utf-8",
+        )
+        target_identity = project_journal._rollout_object_identity(target.stat())
+        actual_scandir = project_journal.os.scandir
+        target_scandir = mock.MagicMock()
+        failing_entry = mock.Mock()
+        failing_entry.name = "rollout-unreadable.jsonl"
+        policy_changed = False
+
+        def change_ancestor_policy_and_fail_stat(
+            *,
+            follow_symlinks: bool,
+        ) -> os.stat_result:
+            nonlocal policy_changed
+            self.assertFalse(follow_symlinks)
+            policy_changed = True
+            year.chmod(0o700)
+            raise OSError(errno.EIO, "injected rollout entry stat failure")
+
+        failing_entry.stat.side_effect = change_ancestor_policy_and_fail_stat
+        target_scandir.__next__.side_effect = [
+            failing_entry,
+            StopIteration,
+        ]
+
+        def inject_entry_stat_race(
+            path: int | os.PathLike[str] | str,
+        ) -> object:
+            if isinstance(path, int):
+                identity = project_journal._rollout_object_identity(os.fstat(path))
+                if identity == target_identity:
+                    return target_scandir
+            return actual_scandir(path)
+
+        with mock.patch.object(
+            project_journal.os,
+            "scandir",
+            side_effect=inject_entry_stat_race,
+        ):
+            with mock.patch.object(project_journal, "MAX_DISCOVERY_ERRORS", 1):
+                rows = project_journal._discover_repos(codex_home, 30)
+
+        self.assertTrue(policy_changed)
+        target_scandir.close.assert_called_once_with()
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertTrue(os.path.samefile(row["repo"], healthy_repo))
+        self.assertEqual(row["coverage_status"], "partial")
+        coverage = row["discovery_error"]["discovery_coverage"]
+        self.assertEqual(
+            coverage["inspection_reason"],
+            "directory_access_policy_changed",
+        )
+        self.assertEqual(pathlib.Path(coverage["source"]), year)
+        self.assertNotIn("errno", coverage)
 
     def test_discover_repos_detects_bound_directory_access_policy_change(
         self,

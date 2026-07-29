@@ -31,6 +31,7 @@ superseded_by:
 - The final three fresh-review findings are closed by bounding retained rollout associations across resolved and unresolved candidates, enforcing direct-child-only archive discovery, and integrating the Git source-descriptor close into launch preparation cleanup and exception precedence.
 - The two post-head fresh-review findings are closed by preserving snapshot-creation failures across every descriptor close and by replacing the fixed two-second Git version probe with the shared initialization deadline plus non-cacheable transient classification.
 - The hosted Linux Python 3.14 follow-up is closed by excluding only libc-injected `SA_RESTORER` trampoline metadata from restoration equivalence while retaining exact handler, mask, user-visible flag, `SA_NOCLDWAIT`, and real child-waitability checks.
+- A later traversal audit was traced to an earlier pre-fix head; two missing direct regressions now pin ancestor object-identity and access-policy failures ahead of coincident child open/stat errors even at the one-error coverage budget boundary.
 
 ## Current State
 
@@ -136,3 +137,5 @@ superseded_by:
 - A local Linux Python 3.14.6 rerun was unavailable because Apple Container had no configured Linux arm64 kernel and the installed Podman client had no running VM; no host VM or kernel configuration was initialized. The prior hosted failure remains the authoritative native-Linux evidence until the unpushed fix runs in CI.
 - Final Ruff check/format, Python 3.13 and Xcode Python 3.9.6 `py_compile`, installed Joey/OpenAI skill validation, project journal validation, and `git diff --check` passed. The system `quick_validate.py` fallback entrypoint could not import PyYAML, while the installed validator wrapper completed successfully without changing the runtime.
 - A fresh read-only narrow audit of the final SIGCHLD patch returned `No findings.`; it was an informal implementation audit, not a formal named-review lane.
+- Current-head traversal audit: the reported absolute-path date parsing and missing chain-revalidation branches were both already closed by `5593a093`; the still-missing child-open/ancestor-replacement and entry-stat/ancestor-policy race regressions each passed under Python 3.13.0 and Xcode Python 3.9.6.
+- Final exact-state Python 3.13.0 full suite: all 290 tests passed with 3 platform skips in 283.136 seconds. Final exact-state Xcode Python 3.9.6 full suite: all 290 tests passed with 4 platform skips in 295.896 seconds.
