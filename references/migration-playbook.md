@@ -14,6 +14,11 @@ adoption evidence; require repo policy or a valid tracked non-generated entry.
 
 - Start with the bundled `project_journal.py discover-repos` helper; do not crawl the full
   filesystem.
+- Treat `coverage_status: partial` as incomplete candidate evidence. Resolve
+  each row's `discovery_coverage_ref.coverage_id` to the one deterministic row
+  carrying the matching full `discovery_error.discovery_coverage` object; keep
+  row-local discovery errors separate. A sentinel row carries both the full
+  object and its own reference.
 - Treat discovery output and historical tracker presence as candidate evidence,
   not as authorization to introduce or migrate trackers.
 - For each discovered repo, check git history for committed trackers:

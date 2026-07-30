@@ -3698,6 +3698,49 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertEqual(batch.call_args.kwargs["deadline"], 102.5)
         self.assertEqual(validate.call_args.kwargs["deadline"], 102.5)
 
+    def test_failed_ls_files_reports_stdout_reference_without_echoing_paths(
+        self,
+    ) -> None:
+        repo = self.init_repo()
+        raw_stdout = (
+            b"100644 "
+            + b"a" * 40
+            + b" 0\tdocs/project_journal/"
+            + b"\xff-secret-path-fragment-" * 1024
+            + b".md\0"
+        )
+        expected_ref = {
+            "bytes": len(raw_stdout),
+            "sha256": project_journal.hashlib.sha256(raw_stdout).hexdigest(),
+        }
+
+        with mock.patch.object(
+            project_journal,
+            "_capture_bounded_process",
+            return_value=subprocess.CompletedProcess(
+                args=[],
+                returncode=7,
+                stdout=raw_stdout,
+                stderr=b"",
+            ),
+        ):
+            with self.assertRaises(project_journal.UserError) as raised:
+                project_journal._tracked_index_journal_snapshot(repo)
+
+        message = str(raised.exception)
+        self.assertIn(
+            "stdout_ref="
+            + json.dumps(
+                expected_ref,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            ),
+            message,
+        )
+        self.assertNotIn(os.fsdecode(raw_stdout), message)
+        self.assertNotIn("secret-path-fragment", message)
+
     def test_adoption_command_starts_deadline_before_repo_resolution(self) -> None:
         repo = self.init_repo().resolve()
         args = mock.Mock(repo=str(repo))
@@ -3965,6 +4008,105 @@ class ProjectJournalTests(unittest.TestCase):
             project_journal.MAX_VALIDATION_ISSUE_PATH_BYTES,
         )
 
+    def test_bounded_journal_path_label_counts_rendered_bytes_and_hashes_raw_path(
+        self,
+    ) -> None:
+        short_raw_path = b"docs/project_journal/non-utf8-\xff.md"
+        short_rel_path = os.fsdecode(short_raw_path)
+        short_label = project_journal._bounded_journal_path_label(short_raw_path)
+        expected_short_label = short_rel_path.encode(
+            "utf-8",
+            errors="backslashreplace",
+        ).decode("utf-8")
+
+        self.assertEqual(short_label, expected_short_label)
+        self.assertEqual(short_label.encode("utf-8").decode("utf-8"), short_label)
+        self.assertEqual(os.fsencode(short_rel_path), short_raw_path)
+        self.assertLessEqual(
+            len(short_label.encode("utf-8")),
+            project_journal.MAX_VALIDATION_ISSUE_PATH_BYTES,
+        )
+        collector = project_journal._IssueCollector()
+        collector.add(short_rel_path, "injected short-path error")
+        report = collector.report()
+        self.assertEqual(report.invalid_paths, frozenset({short_rel_path}))
+        self.assertEqual(
+            report.issues,
+            (f"{short_label}: injected short-path error",),
+        )
+
+        prefix = b"docs/project_journal/"
+        rendered_expansion = prefix + b"\xff" * 700 + b".md"
+        self.assertLess(
+            len(rendered_expansion),
+            project_journal.MAX_VALIDATION_ISSUE_PATH_BYTES,
+        )
+        self.assertGreater(
+            len(
+                os.fsdecode(rendered_expansion).encode(
+                    "utf-8",
+                    errors="backslashreplace",
+                )
+            ),
+            project_journal.MAX_VALIDATION_ISSUE_PATH_BYTES,
+        )
+
+        reference = project_journal._bounded_journal_path_label(rendered_expansion)
+        metadata = json.loads(reference.removeprefix("path_ref="))
+
+        self.assertTrue(reference.startswith("path_ref="))
+        self.assertEqual(metadata["bytes"], len(rendered_expansion))
+        self.assertEqual(
+            metadata["sha256"],
+            project_journal.hashlib.sha256(rendered_expansion).hexdigest(),
+        )
+        self.assertEqual(
+            project_journal._bounded_journal_path_label(
+                os.fsdecode(rendered_expansion)
+            ),
+            reference,
+        )
+
+    def test_discovery_json_output_writes_short_non_utf8_label_to_strict_sink(
+        self,
+    ) -> None:
+        raw_path = b"docs/project_journal/non-utf8-\xff.md"
+        label = project_journal._bounded_journal_path_label(raw_path)
+        rows = [
+            {
+                "repo": "/repo",
+                "adoption_error": {
+                    "code": "journal_semantic_limit_exceeded",
+                    "message": f"{label}: injected semantic limit",
+                },
+            }
+        ]
+        raw_stdout = io.BytesIO()
+        strict_stdout = io.TextIOWrapper(
+            raw_stdout,
+            encoding="utf-8",
+            errors="strict",
+        )
+        args = mock.Mock(
+            codex_home=str(self.root),
+            since_days=1,
+            json_output=True,
+        )
+
+        with mock.patch.object(
+            project_journal,
+            "_discover_repos",
+            return_value=rows,
+        ):
+            with mock.patch.object(project_journal.sys, "stdout", strict_stdout):
+                project_journal.command_discover_repos(args)
+                strict_stdout.flush()
+
+        rendered = raw_stdout.getvalue()
+        decoded = rendered.decode("utf-8", errors="strict")
+        self.assertIn("\\udcff", decoded)
+        self.assertEqual(json.loads(decoded), rows)
+
     def test_frontmatter_line_cap_does_not_count_long_body(self) -> None:
         body = "\n".join(
             f"Body line {index}"
@@ -4227,6 +4369,159 @@ class ProjectJournalTests(unittest.TestCase):
             "blob batch exceeds 0 records",
         ):
             project_journal._CatFileBatchStreamParser([blob], max_records=0)
+
+    def test_cat_file_batch_parser_bounds_every_path_bearing_error(self) -> None:
+        oid = "a" * 40
+        raw_path = b"docs/project_journal/" + b"\xff" * 700 + b"-cat-file-error.md"
+        label = project_journal._bounded_journal_path_label(raw_path)
+        blob = project_journal.IndexJournalBlob(
+            mode=b"100644",
+            oid=oid,
+            raw_path=raw_path,
+            rel_path=os.fsdecode(raw_path),
+        )
+        cases = (
+            b"garbage\n",
+            f"{'b' * 40} blob 0\n\n".encode("ascii"),
+            f"{oid} missing\n".encode("ascii"),
+            f"{oid} tree 0\n\n".encode("ascii"),
+            f"{oid} blob x\n".encode("ascii"),
+            f"{oid} blob 2\nx".encode("ascii"),
+            f"{oid} blob 1\nx!".encode("ascii"),
+            b"",
+            b"partial-header",
+            b"x" * (project_journal.MAX_CAT_FILE_BATCH_HEADER_BYTES + 1),
+        )
+
+        for response in cases:
+            with self.subTest(response=response[:32]):
+                parser = project_journal._CatFileBatchStreamParser([blob])
+                with self.assertRaises(project_journal.UserError) as raised:
+                    parser.feed(response)
+                    parser.finish()
+                message = str(raised.exception)
+                self.assertIn(label, message)
+                self.assertNotIn(blob.rel_path, message)
+                self.assertLessEqual(
+                    len(message.encode("utf-8", errors="backslashreplace")),
+                    project_journal.MAX_VALIDATION_ISSUE_PATH_BYTES,
+                )
+
+        invalid_blob = project_journal.dataclasses.replace(
+            blob,
+            oid="not-an-oid",
+        )
+        non_ascii_blob = project_journal.dataclasses.replace(
+            blob,
+            oid="\udcff",
+        )
+        for invalid in (invalid_blob, non_ascii_blob):
+            with self.subTest(invalid_oid=invalid.oid):
+                with self.assertRaises(project_journal.UserError) as raised:
+                    project_journal._CatFileBatchStreamParser([invalid])
+                self.assertIn(label, str(raised.exception))
+                self.assertNotIn(blob.rel_path, str(raised.exception))
+
+    def test_index_frontmatter_and_semantic_limits_share_bounded_path_label(
+        self,
+    ) -> None:
+        raw_path = b"docs/project_journal/" + b"\xff" * 700 + b"-frontmatter-limit.md"
+        rel_path = os.fsdecode(raw_path)
+        label = project_journal._bounded_journal_path_label(raw_path)
+        oversized_frontmatter = "\n".join(
+            ["---", "title: oversized"]
+            + [
+                "  ignored continuation"
+                for _ in range(project_journal.MAX_FRONTMATTER_LINES)
+            ]
+            + ["---"]
+        ).encode("utf-8")
+        blob = project_journal.IndexJournalBlob(
+            mode=b"100644",
+            oid="a" * 40,
+            raw_path=raw_path,
+            rel_path=rel_path,
+        )
+
+        with mock.patch.object(
+            project_journal,
+            "_tracked_index_journal_snapshot",
+            side_effect=((b"stable", [blob]), (b"stable", [blob])),
+        ):
+            with mock.patch.object(
+                project_journal,
+                "_read_index_blobs_batch",
+                return_value=[oversized_frontmatter],
+            ):
+                with self.assertRaises(project_journal.JournalLimitExceeded) as raised:
+                    project_journal._load_entries_from_index_report(self.root)
+
+        self.assertIn(label, str(raised.exception))
+        self.assertNotIn(rel_path, str(raised.exception))
+
+        entry = project_journal.JournalEntry(
+            path=self.root / "bounded-semantic.md",
+            rel_path=rel_path,
+            fields={
+                "id": "20260730-bounded-path",
+                "title": "Bounded semantic path",
+                "status": "active",
+                "created": "2026-07-30",
+                "updated": "2026-07-30",
+                "supersedes": [
+                    f"missing-{index}"
+                    for index in range(project_journal.MAX_FRONTMATTER_LIST_ITEMS + 1)
+                ],
+            },
+        )
+        with self.assertRaises(project_journal.JournalLimitExceeded) as semantic_raised:
+            project_journal._validate_entries([entry])
+
+        self.assertIn(label, str(semantic_raised.exception))
+        self.assertNotIn(rel_path, str(semantic_raised.exception))
+
+    def test_indexed_ordinary_error_uses_one_bounded_label_and_exact_invalid_path(
+        self,
+    ) -> None:
+        raw_path = b"docs/project_journal/" + b"\xff" * 700 + b"-ordinary-error.md"
+        rel_path = os.fsdecode(raw_path)
+        label = project_journal._bounded_journal_path_label(raw_path)
+        blob = project_journal.IndexJournalBlob(
+            mode=b"100644",
+            oid="a" * 40,
+            raw_path=raw_path,
+            rel_path=rel_path,
+        )
+
+        with mock.patch.object(
+            project_journal,
+            "_tracked_index_journal_snapshot",
+            side_effect=((b"stable", [blob]), (b"stable", [blob])),
+        ):
+            with mock.patch.object(
+                project_journal,
+                "_read_index_blobs_batch",
+                return_value=[b"missing frontmatter\n"],
+            ):
+                loaded = project_journal._load_entries_from_index_report(self.root)
+
+        self.assertEqual(
+            loaded.validation.invalid_paths,
+            frozenset({rel_path}),
+        )
+        self.assertEqual(len(loaded.validation.issues), 1)
+        issue = loaded.validation.issues[0]
+        self.assertEqual(issue.count(label), 1)
+        self.assertNotIn(rel_path, issue)
+        discovery_error = project_journal._discovery_error(
+            project_journal.JournalLimitExceeded(f"{label}: injected semantic limit")
+        )
+        self.assertEqual(
+            discovery_error["code"],
+            "journal_semantic_limit_exceeded",
+        )
+        self.assertIn(label, discovery_error["message"])
+        self.assertNotIn(rel_path, discovery_error["message"])
 
     def test_cat_file_batch_parser_enforces_blob_and_total_byte_limits(
         self,
@@ -8065,7 +8360,9 @@ class ProjectJournalTests(unittest.TestCase):
             skill,
         )
         self.assertIn("stable JSON `path_ref`", skill)
-        self.assertIn("aggregate retained issue text at 1 MiB", skill)
+        self.assertIn("final UTF-8-with-`backslashreplace` display bytes", skill)
+        self.assertIn("failed `git ls-files` must never echo stdout", skill)
+        self.assertIn("1 MiB aggregate retained-issue ceiling", skill)
         self.assertIn(
             "invalidates every member of a duplicate-ID group",
             skill,
@@ -8202,6 +8499,11 @@ class ProjectJournalTests(unittest.TestCase):
         )
         self.assertIn("append/truncation", skill)
         self.assertIn("Require `coverage_status: complete`", skill)
+        self.assertIn(
+            "full bounded `discovery_coverage` object, including a stable `coverage_id`, exactly once",
+            skill,
+        )
+        self.assertIn("small `discovery_coverage_ref` to every partial row", skill)
         self.assertIn("bounded three-line marker prefix", skill)
         self.assertIn(
             "Inaccessible journal, index, exclude, or hook paths remain null",
@@ -8211,6 +8513,13 @@ class ProjectJournalTests(unittest.TestCase):
             "Hook installation supports macOS and Linux only",
             skill,
         )
+        self.assertIn(
+            "`--includes --show-scope --show-origin --type=path --null --get core.hooksPath`",
+            skill,
+        )
+        self.assertIn("`effective_hook_destination_changed`", skill)
+        self.assertIn("`effective_hook_configuration_unverified`", skill)
+        self.assertIn("point-in-time proof", skill)
         self.assertIn(
             "leave `docs/PROJECT_STATE.md`, `docs/PROJECT_TODO.md`, and `docs/project_journal/` unchanged",
             skill,
@@ -8381,6 +8690,8 @@ class ProjectJournalTests(unittest.TestCase):
         )
         self.assertIn("append/truncation", readme)
         self.assertIn("`coverage_status: complete`", readme)
+        self.assertIn("one deterministic final-sort anchor", readme)
+        self.assertIn("small `discovery_coverage_ref`", readme)
         self.assertIn("three-line marker prefix", readme)
         self.assertIn(
             "Inaccessible journal, index, exclude, or hook paths",
@@ -8390,6 +8701,15 @@ class ProjectJournalTests(unittest.TestCase):
             "Opt-in hook installation supports macOS and Linux only",
             readme,
         )
+        self.assertIn(
+            "`--includes --show-scope --show-origin --type=path --null --get core.hooksPath`",
+            readme,
+        )
+        self.assertIn("`effective_hook_destination_changed`", readme)
+        self.assertIn("`effective_hook_configuration_unverified`", readme)
+        self.assertIn("point-in-time proof", readme)
+        self.assertIn("Every user-visible indexed-path diagnostic", readme)
+        self.assertIn("failed `git ls-files` never echoes stdout", readme)
         self.assertIn("duplicate-ID group invalidation", readme)
         self.assertIn("without erasing authoritative index adoption", readme)
         self.assertIn("`adopted`, `unadopted`, or `inconclusive`", readme)
@@ -8409,6 +8729,7 @@ class ProjectJournalTests(unittest.TestCase):
             "Treat discovery output and historical tracker presence as candidate evidence",
             migration,
         )
+        self.assertIn("`discovery_coverage_ref.coverage_id`", migration)
         self.assertIn(
             "migration merely because a repository belongs to Joey",
             migration,
@@ -9271,10 +9592,11 @@ class ProjectJournalTests(unittest.TestCase):
         temporary.write_text("staged hook\n", encoding="utf-8")
         temporary.chmod(0o600)
         binding = project_journal._bind_hook_directory(
+            repo,
             project_journal._HookPathPlan(
                 root=repo,
                 components=(".githooks",),
-            )
+            ),
         )
         cleanup_error = PermissionError(
             errno.EACCES,
@@ -9967,7 +10289,7 @@ class ProjectJournalTests(unittest.TestCase):
                 self.assertTrue(raced)
                 self.assertFalse(raced_target_verified)
                 self.assertIn(
-                    "final installed-target verification is incomplete",
+                    "final effective hook destination verification is incomplete",
                     str(raised.exception),
                 )
                 self.assertFalse((hooks_dir / "post-rewrite").exists())
@@ -9975,6 +10297,476 @@ class ProjectJournalTests(unittest.TestCase):
                     project_journal.HOOK_BEGIN,
                     (moved_hooks / "post-rewrite").read_text(encoding="utf-8"),
                 )
+
+    def test_install_hooks_detects_effective_destination_drift_after_final_snapshot(
+        self,
+    ) -> None:
+        for mode, initially_exists in (
+            ("local", False),
+            ("local-existing", True),
+            ("include", False),
+            ("worktree", False),
+        ):
+            with self.subTest(mode=mode):
+                repo = self.init_repo(f"repo-effective-drift-{mode}")
+                included = repo / ".git/hooks.inc"
+                if mode == "include":
+                    included.write_text(
+                        "[core]\n    hooksPath = .githooks-a\n",
+                        encoding="utf-8",
+                    )
+                    configured = run_git(
+                        repo,
+                        "config",
+                        "--local",
+                        "include.path",
+                        "hooks.inc",
+                    )
+                elif mode == "worktree":
+                    configured = run_git(
+                        repo,
+                        "config",
+                        "extensions.worktreeConfig",
+                        "true",
+                    )
+                    self.assertEqual(configured.returncode, 0, configured.stderr)
+                    configured = run_git(
+                        repo,
+                        "config",
+                        "--worktree",
+                        "core.hooksPath",
+                        ".githooks-a",
+                    )
+                else:
+                    configured = run_git(
+                        repo,
+                        "config",
+                        "--local",
+                        "core.hooksPath",
+                        ".githooks-a",
+                    )
+                self.assertEqual(configured.returncode, 0, configured.stderr)
+                if initially_exists:
+                    first = self.run_cli("install-hooks", "--repo", str(repo))
+                    self.assertEqual(first.returncode, 0, first.stderr)
+
+                actual_commit = project_journal._commit_hook_target_atomically
+                actual_snapshot = project_journal._snapshot_hook_target
+                actual_mark_verified = project_journal._HookCommitState.mark_verified
+                commit_returned = False
+                raced_commit_state: project_journal._HookCommitState | None = None
+                drifted = False
+                drifted_target_verified = False
+
+                def commit_and_mark(
+                    binding: project_journal._HookDirectoryBinding,
+                    target: project_journal._HookTargetSnapshot,
+                    temporary_name: str,
+                    staged: project_journal._HookTargetSnapshot,
+                    commit_state: project_journal._HookCommitState,
+                ) -> None:
+                    nonlocal commit_returned, raced_commit_state
+                    self.assertEqual(binding.repo, repo.resolve())
+                    self.assertEqual(
+                        binding.plan.path,
+                        repo.resolve() / ".githooks-a",
+                    )
+                    actual_commit(
+                        binding,
+                        target,
+                        temporary_name,
+                        staged,
+                        commit_state,
+                    )
+                    if target.name == "post-rewrite":
+                        commit_returned = True
+                        raced_commit_state = commit_state
+
+                def drift_after_final_snapshot(
+                    binding: project_journal._HookDirectoryBinding,
+                    name: str,
+                ) -> tuple[project_journal._HookTargetSnapshot, bytes | None]:
+                    nonlocal drifted
+                    snapshot = actual_snapshot(binding, name)
+                    if commit_returned and name == "post-rewrite" and not drifted:
+                        drifted = True
+                        if mode == "include":
+                            included.write_text(
+                                "[core]\n    hooksPath = .githooks-b\n",
+                                encoding="utf-8",
+                            )
+                            changed = subprocess.CompletedProcess(
+                                args=[],
+                                returncode=0,
+                                stdout="",
+                                stderr="",
+                            )
+                        elif mode == "worktree":
+                            changed = run_git(
+                                repo,
+                                "config",
+                                "--worktree",
+                                "core.hooksPath",
+                                ".githooks-b",
+                            )
+                        else:
+                            changed = run_git(
+                                repo,
+                                "config",
+                                "--local",
+                                "core.hooksPath",
+                                ".githooks-b",
+                            )
+                        self.assertEqual(changed.returncode, 0, changed.stderr)
+                    return snapshot
+
+                def record_mark_verified(
+                    commit_state: project_journal._HookCommitState,
+                ) -> None:
+                    nonlocal drifted_target_verified
+                    if commit_state is raced_commit_state:
+                        drifted_target_verified = True
+                    actual_mark_verified(commit_state)
+
+                args = mock.Mock(repo=str(repo))
+                with mock.patch.object(
+                    project_journal,
+                    "_commit_hook_target_atomically",
+                    side_effect=commit_and_mark,
+                ):
+                    with mock.patch.object(
+                        project_journal,
+                        "_snapshot_hook_target",
+                        side_effect=drift_after_final_snapshot,
+                    ):
+                        with mock.patch.object(
+                            project_journal._HookCommitState,
+                            "mark_verified",
+                            autospec=True,
+                            side_effect=record_mark_verified,
+                        ):
+                            with self.assertRaises(
+                                project_journal.EffectiveHookDestinationChanged
+                            ) as raised:
+                                project_journal.command_install_hooks(args)
+
+                self.assertTrue(drifted)
+                self.assertFalse(drifted_target_verified)
+                message = str(raised.exception)
+                self.assertIn("effective_hook_destination_changed", message)
+                self.assertIn("hook target installation committed", message)
+                self.assertIn(
+                    "final effective hook destination verification is incomplete",
+                    message,
+                )
+                self.assertTrue((repo / ".githooks-a/post-rewrite").exists())
+                self.assertFalse((repo / ".githooks-b/post-rewrite").exists())
+
+    def test_install_hooks_accepts_equivalent_effective_destination_change(
+        self,
+    ) -> None:
+        repo = self.init_repo("repo-equivalent-effective-destination")
+        configured = run_git(
+            repo,
+            "config",
+            "--local",
+            "core.hooksPath",
+            ".githooks",
+        )
+        self.assertEqual(configured.returncode, 0, configured.stderr)
+        actual_commit = project_journal._commit_hook_target_atomically
+        actual_snapshot = project_journal._snapshot_hook_target
+        commit_returned = False
+        changed = False
+
+        def commit_and_mark(
+            binding: project_journal._HookDirectoryBinding,
+            target: project_journal._HookTargetSnapshot,
+            temporary_name: str,
+            staged: project_journal._HookTargetSnapshot,
+            commit_state: project_journal._HookCommitState,
+        ) -> None:
+            nonlocal commit_returned
+            actual_commit(
+                binding,
+                target,
+                temporary_name,
+                staged,
+                commit_state,
+            )
+            if target.name == "post-rewrite":
+                commit_returned = True
+
+        def change_text_after_final_snapshot(
+            binding: project_journal._HookDirectoryBinding,
+            name: str,
+        ) -> tuple[project_journal._HookTargetSnapshot, bytes | None]:
+            nonlocal changed
+            snapshot = actual_snapshot(binding, name)
+            if commit_returned and name == "post-rewrite" and not changed:
+                changed = True
+                worktree_enabled = run_git(
+                    repo,
+                    "config",
+                    "extensions.worktreeConfig",
+                    "true",
+                )
+                self.assertEqual(
+                    worktree_enabled.returncode,
+                    0,
+                    worktree_enabled.stderr,
+                )
+                worktree_override = run_git(
+                    repo,
+                    "config",
+                    "--worktree",
+                    "core.hooksPath",
+                    "./.githooks",
+                )
+                self.assertEqual(
+                    worktree_override.returncode,
+                    0,
+                    worktree_override.stderr,
+                )
+            return snapshot
+
+        args = mock.Mock(repo=str(repo))
+        with mock.patch.object(
+            project_journal,
+            "_commit_hook_target_atomically",
+            side_effect=commit_and_mark,
+        ):
+            with mock.patch.object(
+                project_journal,
+                "_snapshot_hook_target",
+                side_effect=change_text_after_final_snapshot,
+            ):
+                installed = project_journal.command_install_hooks(args)
+
+        self.assertEqual(installed, 0)
+        self.assertTrue(changed)
+        for name in project_journal.HOOK_NAMES:
+            self.assertTrue((repo / ".githooks" / name).exists())
+
+    def test_effective_hook_query_failures_remain_unverified(self) -> None:
+        repo = self.init_repo("repo-effective-query-failures").resolve()
+        configured = run_git(
+            repo,
+            "config",
+            "--local",
+            "core.hooksPath",
+            ".githooks",
+        )
+        self.assertEqual(configured.returncode, 0, configured.stderr)
+        binding = project_journal._preflight_hook_targets(repo)
+        try:
+            cases = (
+                subprocess.CompletedProcess(
+                    args=[],
+                    returncode=0,
+                    stdout=b"malformed\0",
+                    stderr=b"",
+                ),
+                subprocess.CompletedProcess(
+                    args=[],
+                    returncode=9,
+                    stdout=b"",
+                    stderr=b"",
+                ),
+                project_journal.UserError(
+                    "effective core.hooksPath query timed out after 5 seconds"
+                ),
+            )
+            for result in cases:
+                with self.subTest(result=result):
+                    patch_value = (
+                        mock.patch.object(
+                            project_journal,
+                            "_capture_bounded_process",
+                            side_effect=result,
+                        )
+                        if isinstance(result, BaseException)
+                        else mock.patch.object(
+                            project_journal,
+                            "_capture_bounded_process",
+                            return_value=result,
+                        )
+                    )
+                    with patch_value:
+                        with self.assertRaises(
+                            project_journal.EffectiveHookConfigurationUnverified
+                        ) as raised:
+                            project_journal._revalidate_effective_hook_destination(
+                                binding
+                            )
+                self.assertIn(
+                    "effective_hook_configuration_unverified",
+                    str(raised.exception),
+                )
+        finally:
+            project_journal._close_hook_binding(binding)
+
+    def test_effective_hook_configuration_wrapper_preserves_source_notes(
+        self,
+    ) -> None:
+        note = (
+            "Git launch cleanup-incomplete; retained launch locator "
+            "/tmp/project-journal-launch"
+        )
+        source = project_journal.UserError("injected hook query failure")
+        project_journal._add_exception_detail(source, note)
+        binding = mock.Mock(
+            repo=self.root,
+            plan=project_journal._HookPathPlan(
+                root=self.root,
+                components=(".githooks",),
+            ),
+        )
+
+        with mock.patch.object(
+            project_journal,
+            "_hook_path_plan",
+            side_effect=source,
+        ):
+            with self.assertRaises(
+                project_journal.EffectiveHookConfigurationUnverified
+            ) as raised:
+                project_journal._revalidate_effective_hook_destination(binding)
+
+        self.assertEqual(
+            raised.exception.code, "effective_hook_configuration_unverified"
+        )
+        self.assertEqual(getattr(raised.exception, "__notes__", ()), [note])
+        self.assertIs(raised.exception.__cause__, source)
+
+    def test_post_commit_effective_hook_wrapper_preserves_notes(self) -> None:
+        repo = self.init_repo("repo-post-commit-effective-notes").resolve()
+        configured = run_git(
+            repo,
+            "config",
+            "--local",
+            "core.hooksPath",
+            ".githooks",
+        )
+        self.assertEqual(configured.returncode, 0, configured.stderr)
+        binding = project_journal._preflight_hook_targets(repo)
+        actual_hook_path_plan = project_journal._hook_path_plan
+        note = (
+            "Git launch cleanup-incomplete; retained launch locator "
+            "/tmp/project-journal-launch"
+        )
+        query_count = 0
+        source: project_journal.UserError | None = None
+
+        def fail_post_commit_query(
+            selected_repo: pathlib.Path,
+            *,
+            deadline: float | None = None,
+            deadline_error: str = "hook-path discovery exceeded its shared deadline",
+        ) -> project_journal._HookPathPlan:
+            nonlocal query_count, source
+            query_count += 1
+            if query_count == 2:
+                source = project_journal.UserError(
+                    "injected post-commit hook query failure"
+                )
+                project_journal._add_exception_detail(source, note)
+                raise source
+            return actual_hook_path_plan(
+                selected_repo,
+                deadline=deadline,
+                deadline_error=deadline_error,
+            )
+
+        try:
+            with mock.patch.object(
+                project_journal,
+                "_hook_path_plan",
+                side_effect=fail_post_commit_query,
+            ):
+                with self.assertRaises(
+                    project_journal.EffectiveHookConfigurationUnverified
+                ) as raised:
+                    project_journal._install_hook(
+                        binding,
+                        binding.targets[0],
+                    )
+        finally:
+            project_journal._close_hook_binding(binding)
+
+        self.assertEqual(query_count, 2)
+        self.assertEqual(
+            raised.exception.code, "effective_hook_configuration_unverified"
+        )
+        self.assertEqual(getattr(raised.exception, "__notes__", ()), [note])
+        first_wrapper = raised.exception.__cause__
+        self.assertIsInstance(
+            first_wrapper,
+            project_journal.EffectiveHookConfigurationUnverified,
+        )
+        self.assertEqual(getattr(first_wrapper, "__notes__", ()), [note])
+        self.assertIs(first_wrapper.__cause__, source)
+        self.assertIn("hook target installation committed", str(raised.exception))
+        self.assertIn(
+            "final effective hook destination verification is incomplete",
+            str(raised.exception),
+        )
+        self.assertTrue((repo / ".githooks/post-merge").exists())
+
+    def test_effective_destination_drift_before_commit_cleans_staged_hook(
+        self,
+    ) -> None:
+        repo = self.init_repo("repo-effective-precommit-drift")
+        configured = run_git(
+            repo,
+            "config",
+            "--local",
+            "core.hooksPath",
+            ".githooks-a",
+        )
+        self.assertEqual(configured.returncode, 0, configured.stderr)
+        actual_snapshot = project_journal._snapshot_hook_target
+        drifted = False
+
+        def drift_after_staged_snapshot(
+            binding: project_journal._HookDirectoryBinding,
+            name: str,
+        ) -> tuple[project_journal._HookTargetSnapshot, bytes | None]:
+            nonlocal drifted
+            snapshot = actual_snapshot(binding, name)
+            if name.startswith(".project-journal-post-merge-") and not drifted:
+                drifted = True
+                changed = run_git(
+                    repo,
+                    "config",
+                    "--local",
+                    "core.hooksPath",
+                    ".githooks-b",
+                )
+                self.assertEqual(changed.returncode, 0, changed.stderr)
+            return snapshot
+
+        args = mock.Mock(repo=str(repo))
+        with mock.patch.object(
+            project_journal,
+            "_snapshot_hook_target",
+            side_effect=drift_after_staged_snapshot,
+        ):
+            with mock.patch.object(
+                project_journal,
+                "_commit_hook_target_atomically",
+            ) as commit:
+                with self.assertRaises(project_journal.EffectiveHookDestinationChanged):
+                    project_journal.command_install_hooks(args)
+
+        self.assertTrue(drifted)
+        commit.assert_not_called()
+        self.assertFalse((repo / ".githooks-a/post-merge").exists())
+        self.assertFalse((repo / ".githooks-b/post-merge").exists())
+        self.assertEqual(
+            list((repo / ".githooks-a").glob(".project-journal-*.tmp")),
+            [],
+        )
 
     def test_install_hooks_reports_post_commit_verification_interrupt(
         self,
@@ -10078,7 +10870,7 @@ class ProjectJournalTests(unittest.TestCase):
     def test_hook_target_requires_no_follow_primitive(self) -> None:
         repo = self.init_repo().resolve()
         binding = project_journal._bind_hook_directory(
-            project_journal._default_hook_path_plan(repo)
+            repo, project_journal._default_hook_path_plan(repo)
         )
         try:
             with mock.patch.object(
@@ -10259,10 +11051,11 @@ class ProjectJournalTests(unittest.TestCase):
         (hooks / target_name).write_text("displaced hook\n", encoding="utf-8")
         (hooks / temporary_name).write_text("installed hook\n", encoding="utf-8")
         binding = project_journal._bind_hook_directory(
+            repo,
             project_journal._HookPathPlan(
                 root=repo,
                 components=(".githooks",),
-            )
+            ),
         )
         try:
             displaced, _content = project_journal._snapshot_hook_target(
@@ -10327,10 +11120,11 @@ class ProjectJournalTests(unittest.TestCase):
         (hooks / target_name).write_text("displaced hook\n", encoding="utf-8")
         (hooks / temporary_name).write_text("installed hook\n", encoding="utf-8")
         binding = project_journal._bind_hook_directory(
+            repo,
             project_journal._HookPathPlan(
                 root=repo,
                 components=(".githooks",),
-            )
+            ),
         )
         try:
             displaced, _content = project_journal._snapshot_hook_target(
@@ -10467,7 +11261,7 @@ class ProjectJournalTests(unittest.TestCase):
                 project_journal.UserError,
                 "requires POSIX descriptor-relative filesystem primitives",
             ):
-                project_journal._bind_hook_directory(plan)
+                project_journal._bind_hook_directory(plan.root, plan)
 
     def test_hook_rename_rejects_other_posix_before_loading_libc(self) -> None:
         with mock.patch.object(project_journal.os, "name", "posix"):
@@ -10783,6 +11577,150 @@ class ProjectJournalTests(unittest.TestCase):
                 b"path\0extra\0",
                 "test core.hooksPath query",
             )
+
+    def test_repo_hook_path_query_strictly_parses_one_scoped_record(self) -> None:
+        output = b"local\0file:/repo/.git/config\0 leading-\xff-trailing \0"
+
+        parsed = project_journal._parse_repo_hook_path_config(
+            output,
+            "test effective core.hooksPath query",
+        )
+
+        self.assertEqual(parsed.scope, "local")
+        self.assertEqual(parsed.origin, "file:/repo/.git/config")
+        self.assertEqual(
+            os.fsencode(parsed.raw_path),
+            b" leading-\xff-trailing ",
+        )
+        for malformed in (
+            b"",
+            b"local\0file:/repo/.git/config\0path",
+            b"local\0file:/repo/.git/config\0path\0extra\0",
+            b"global\0file:/repo/.git/config\0path\0",
+            b"local\0\0path\0",
+            b"local\0file:/repo/.git/config\0path\0"
+            b"worktree\0file:/repo/.git/config.worktree\0other\0",
+        ):
+            with self.subTest(malformed=malformed):
+                with self.assertRaises(project_journal.UserError):
+                    project_journal._parse_repo_hook_path_config(
+                        malformed,
+                        "test effective core.hooksPath query",
+                    )
+
+    def test_hook_path_plan_uses_one_effective_repo_scope_query(self) -> None:
+        repo = self.init_repo().resolve()
+        expected_plan = project_journal._HookPathPlan(
+            root=repo,
+            components=(".githooks",),
+        )
+        query_output = (
+            b"local\0file:" + os.fsencode(repo / ".git/config") + b"\0.githooks\0"
+        )
+
+        with mock.patch.object(
+            project_journal,
+            "_capture_bounded_process",
+            return_value=subprocess.CompletedProcess(
+                args=[],
+                returncode=0,
+                stdout=query_output,
+                stderr=b"",
+            ),
+        ) as capture:
+            with mock.patch.object(
+                project_journal,
+                "_hook_path_plan_from_config",
+                return_value=expected_plan,
+            ) as from_config:
+                actual_plan = project_journal._hook_path_plan(repo)
+
+        self.assertEqual(actual_plan, expected_plan)
+        capture.assert_called_once()
+        argv = capture.call_args.args[0]
+        self.assertEqual(
+            argv[-8:],
+            [
+                "config",
+                "--includes",
+                "--show-scope",
+                "--show-origin",
+                "--type=path",
+                "--null",
+                "--get",
+                "core.hooksPath",
+            ],
+        )
+        self.assertNotIn(f"core.hooksPath={os.devnull}", argv)
+        for safe_value in (
+            "core.askPass=",
+            f"core.attributesFile={os.devnull}",
+            "core.fsmonitor=false",
+            "credential.helper=",
+            "credential.interactive=never",
+        ):
+            self.assertIn(safe_value, argv)
+        self.assertEqual(
+            capture.call_args.kwargs["env"],
+            project_journal._git_environment(),
+        )
+        self.assertEqual(
+            capture.call_args.kwargs["verified_runtime"],
+            project_journal._require_git_runtime(),
+        )
+        self.assertEqual(
+            from_config.call_args.args[1],
+            ".githooks",
+        )
+
+    def test_default_hook_plan_requeries_repo_scope_after_safe_preflight(
+        self,
+    ) -> None:
+        repo = self.init_repo().resolve()
+        default_plan = project_journal._HookPathPlan(
+            root=repo / ".git",
+            components=("hooks",),
+        )
+        events: list[str] = []
+
+        def no_repo_value(*args: object, **kwargs: object) -> object:
+            del args, kwargs
+            events.append("query")
+            return subprocess.CompletedProcess(
+                args=[],
+                returncode=1,
+                stdout=b"",
+                stderr=b"",
+            )
+
+        def safe_preflight(*args: object, **kwargs: object) -> None:
+            del args, kwargs
+            events.append("preflight")
+
+        with mock.patch.object(
+            project_journal,
+            "_capture_bounded_process",
+            side_effect=no_repo_value,
+        ) as capture:
+            with mock.patch.object(
+                project_journal,
+                "_preflight_global_hooks_config",
+                side_effect=safe_preflight,
+            ):
+                with mock.patch.object(
+                    project_journal,
+                    "_default_hook_path_plan",
+                    return_value=default_plan,
+                ):
+                    plan = project_journal._hook_path_plan(repo)
+
+        self.assertEqual(plan, default_plan)
+        self.assertEqual(events, ["query", "preflight", "query"])
+        self.assertEqual(capture.call_count, 2)
+        self.assertEqual(
+            capture.call_args_list[0].args[0],
+            capture.call_args_list[1].args[0],
+        )
 
     def test_install_hooks_applies_git_prefix_path_semantics_before_roots(
         self,
@@ -11598,6 +12536,159 @@ class ProjectJournalTests(unittest.TestCase):
                 cleanup = coverage["cleanup_errors"][0]
                 self.assertEqual(cleanup["errno"], errno.EIO)
                 self.assertIn("descriptor close failure", cleanup["message"])
+
+    def test_partial_discovery_coverage_uses_one_deterministic_primary_anchor(
+        self,
+    ) -> None:
+        errors = [
+            {
+                "code": "discovery_rollout_parse_failed",
+                "message": f"unique-error-{index}-" + "x" * 256,
+                "source": f"/sessions/rollout-{index}.jsonl",
+            }
+            for index in range(project_journal.MAX_DISCOVERY_ERRORS)
+        ]
+        rows = [
+            {
+                "repo": "/repo-z",
+                "candidate_cwd": None,
+                "discovery_error": None,
+            },
+            {
+                "repo": None,
+                "candidate_cwd": "/repo-m",
+                "discovery_error": {
+                    "repo_resolution": {
+                        "code": "repository_resolution_failed",
+                        "message": "row-local failure",
+                    }
+                },
+            },
+            {
+                "repo": "/repo-a",
+                "candidate_cwd": None,
+                "discovery_error": None,
+            },
+        ]
+
+        def marked(input_rows: list[dict[str, object]]) -> list[dict[str, object]]:
+            state = project_journal._DiscoveryScanState(
+                deadline=time.monotonic() + 5,
+            )
+            cloned = json.loads(json.dumps(input_rows))
+            return project_journal._mark_partial_discovery_coverage(
+                cloned,
+                json.loads(json.dumps(errors)),
+                len(errors),
+                state,
+            )
+
+        forward = marked(rows)
+        reverse = marked(list(reversed(rows)))
+        forward_json = json.dumps(
+            forward,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        reverse_json = json.dumps(
+            reverse,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+
+        self.assertEqual(forward_json, reverse_json)
+        self.assertEqual(
+            [row["repo"] or row["candidate_cwd"] for row in forward],
+            ["/repo-a", "/repo-m", "/repo-z"],
+        )
+        primaries = [
+            row["discovery_error"]["discovery_coverage"]
+            for row in forward
+            if isinstance(row.get("discovery_error"), dict)
+            and "discovery_coverage" in row["discovery_error"]
+        ]
+        self.assertEqual(len(primaries), 1)
+        primary = primaries[0]
+        coverage_id = primary["coverage_id"]
+        self.assertEqual(primary["errors"], errors)
+        self.assertEqual(forward_json.count('"errors"'), 1)
+        self.assertEqual(forward_json.count("unique-error-31-"), 1)
+
+        anchors = {
+            row["discovery_error"]["discovery_coverage"]["coverage_id"]: row
+            for row in forward
+            if isinstance(row.get("discovery_error"), dict)
+            and "discovery_coverage" in row["discovery_error"]
+        }
+        for row in forward:
+            self.assertEqual(
+                row["discovery_coverage_ref"],
+                {"coverage_id": coverage_id},
+            )
+            self.assertIsNotNone(anchors[coverage_id]["repo"])
+            self.assertEqual(row["coverage_status"], "partial")
+            self.assertEqual(row["discovery_status"], "inconclusive")
+
+        unresolved = next(row for row in forward if row["candidate_cwd"] == "/repo-m")
+        self.assertIn("repo_resolution", unresolved["discovery_error"])
+        self.assertNotIn("discovery_coverage", unresolved["discovery_error"])
+        naive_repeated_error_bytes = len(forward) * len(
+            json.dumps(errors, separators=(",", ":"))
+        )
+        self.assertLess(len(forward_json), naive_repeated_error_bytes)
+
+        many_rows = [
+            {
+                "repo": f"/repo-{index:03d}",
+                "candidate_cwd": None,
+                "discovery_error": None,
+            }
+            for index in range(64)
+        ]
+        many_json = json.dumps(
+            marked(list(reversed(many_rows))),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        retained_error_bytes = len(json.dumps(errors, separators=(",", ":")))
+        self.assertEqual(many_json.count('"errors"'), 1)
+        self.assertEqual(many_json.count("unique-error-31-"), 1)
+        self.assertLess(
+            len(many_json),
+            retained_error_bytes * 2 + len(many_rows) * 1024,
+        )
+
+    def test_partial_discovery_coverage_sentinel_keeps_primary_and_reference(
+        self,
+    ) -> None:
+        state = project_journal._DiscoveryScanState(
+            deadline=time.monotonic() + 5,
+        )
+        errors = [
+            {
+                "code": "discovery_limit_exceeded",
+                "message": "injected coverage limit",
+                "source": "/sessions",
+            }
+        ]
+
+        rows = project_journal._mark_partial_discovery_coverage(
+            [],
+            errors,
+            1,
+            state,
+        )
+
+        self.assertEqual(len(rows), 1)
+        primary = rows[0]["discovery_error"]["discovery_coverage"]
+        self.assertEqual(
+            rows[0]["discovery_coverage_ref"],
+            {"coverage_id": primary["coverage_id"]},
+        )
+        self.assertEqual(primary["errors"], errors)
 
     def test_open_rollout_candidate_preserves_policy_failure_when_close_fails(
         self,
@@ -13522,9 +14613,19 @@ class ProjectJournalTests(unittest.TestCase):
 
         self.assertEqual(len(rows), 2)
         self.assertEqual(sum(int(row["rollout_count"]) for row in rows), 3)
+        anchors = {
+            row["discovery_error"]["discovery_coverage"]["coverage_id"]: (
+                row["discovery_error"]["discovery_coverage"]
+            )
+            for row in rows
+            if isinstance(row.get("discovery_error"), dict)
+            and "discovery_coverage" in row["discovery_error"]
+        }
+        self.assertEqual(len(anchors), 1)
         for row in rows:
             self.assertEqual(row["coverage_status"], "partial")
-            coverage = row["discovery_error"]["discovery_coverage"]
+            coverage_id = row["discovery_coverage_ref"]["coverage_id"]
+            coverage = anchors[coverage_id]
             self.assertEqual(coverage["code"], "discovery_limit_exceeded")
             self.assertEqual(
                 coverage["limit_name"],
@@ -13533,6 +14634,9 @@ class ProjectJournalTests(unittest.TestCase):
             self.assertEqual(coverage["limit"], 3)
             self.assertEqual(coverage["observed"], 4)
             self.assertEqual(coverage["rollout_associations_counted"], 4)
+        unresolved = next(row for row in rows if row["repo"] is None)
+        self.assertIn("repo_resolution", unresolved["discovery_error"])
+        self.assertNotIn("discovery_coverage", unresolved["discovery_error"])
 
     def test_discover_repos_shares_rollout_cap_across_active_archive(self) -> None:
         repo = self.init_repo().resolve()

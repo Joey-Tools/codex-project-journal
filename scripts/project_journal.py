@@ -174,10 +174,34 @@ SAFE_GIT_CONFIG_ARGS = (
     "-c",
     "credential.interactive=never",
 )
+HOOK_CONFIG_SAFE_GIT_CONFIG_ARGS = (
+    "-c",
+    "core.askPass=",
+    "-c",
+    f"core.attributesFile={os.devnull}",
+    "-c",
+    "core.fsmonitor=false",
+    "-c",
+    "credential.helper=",
+    "-c",
+    "credential.interactive=never",
+)
 
 
 class UserError(Exception):
     """A clean user-facing error."""
+
+
+class EffectiveHookDestinationChanged(UserError):
+    """The effective repo-scoped hook plan no longer matches the bound plan."""
+
+    code = "effective_hook_destination_changed"
+
+
+class EffectiveHookConfigurationUnverified(UserError):
+    """The effective repo-scoped hook plan could not be proved safely."""
+
+    code = "effective_hook_configuration_unverified"
 
 
 class UnsupportedGitVersion(UserError):
@@ -1182,6 +1206,13 @@ class _HookPathPlan:
 
 
 @dataclasses.dataclass(frozen=True)
+class _RepoHookPathConfig:
+    scope: str
+    origin: str
+    raw_path: str
+
+
+@dataclasses.dataclass(frozen=True)
 class _BoundHookDirectory:
     path: pathlib.Path
     fd: int
@@ -1193,6 +1224,8 @@ class _BoundHookDirectory:
 
 @dataclasses.dataclass(frozen=True)
 class _HookDirectoryBinding:
+    repo: pathlib.Path
+    plan: _HookPathPlan
     path: pathlib.Path
     fd: int
     identity: tuple[int, int, int, int, int]
@@ -1243,6 +1276,10 @@ class _HookCommitState:
         if self.installed_target_committed:
             self.pending_step = "final installed-target verification"
 
+    def mark_installed_target_verified(self) -> None:
+        if self.installed_target_committed:
+            self.pending_step = "final effective hook destination verification"
+
     def mark_verified(self) -> None:
         if self.installed_target_committed:
             self.pending_step = None
@@ -1262,6 +1299,24 @@ class _IndexedJournalLoad:
     valid_count: int
 
 
+def _bounded_journal_path_label(path: str | bytes) -> str:
+    raw_path = path if isinstance(path, bytes) else os.fsencode(path)
+    display = os.fsdecode(raw_path)
+    rendered_bytes = display.encode("utf-8", errors="backslashreplace")
+    if len(rendered_bytes) <= MAX_VALIDATION_ISSUE_PATH_BYTES:
+        return rendered_bytes.decode("utf-8")
+    reference = {
+        "bytes": len(raw_path),
+        "sha256": hashlib.sha256(raw_path).hexdigest(),
+    }
+    return "path_ref=" + json.dumps(
+        reference,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
 class _IssueCollector:
     def __init__(self) -> None:
         self._issues: list[str] = []
@@ -1274,20 +1329,7 @@ class _IssueCollector:
         label = self._path_labels.get(rel_path)
         if label is not None:
             return label
-        raw_path = os.fsencode(rel_path)
-        if len(raw_path) <= MAX_VALIDATION_ISSUE_PATH_BYTES:
-            label = rel_path
-        else:
-            reference = {
-                "bytes": len(raw_path),
-                "sha256": hashlib.sha256(raw_path).hexdigest(),
-            }
-            label = "path_ref=" + json.dumps(
-                reference,
-                ensure_ascii=True,
-                separators=(",", ":"),
-                sort_keys=True,
-            )
+        label = _bounded_journal_path_label(rel_path)
         self._path_labels[rel_path] = label
         return label
 
@@ -1303,8 +1345,11 @@ class _IssueCollector:
             raise JournalLimitExceeded(
                 f"journal validation issues exceed {MAX_VALIDATION_ISSUES_TOTAL} total"
             )
-        if detail.startswith(rel_path) and detail[len(rel_path) :].startswith(":"):
-            detail = detail[len(rel_path) + 1 :].lstrip()
+        for candidate in (rel_path, path_label):
+            prefix = f"{candidate}:"
+            if detail.startswith(prefix):
+                detail = detail[len(prefix) :].lstrip()
+                break
         prefix = f"{path_label}:"
         issue = detail if detail.startswith(prefix) else f"{prefix} {detail}"
         issue_bytes = len(issue.encode("utf-8", errors="backslashreplace")) + 1
@@ -2247,6 +2292,19 @@ def _git_command(repo: pathlib.Path, *args: str) -> list[str]:
     ]
 
 
+def _hook_config_command(repo: pathlib.Path, *args: str) -> list[str]:
+    runtime = _require_git_runtime()
+    return [
+        str(runtime.source_executable),
+        "--no-pager",
+        "--no-optional-locks",
+        *HOOK_CONFIG_SAFE_GIT_CONFIG_ARGS,
+        "-C",
+        str(repo),
+        *args,
+    ]
+
+
 def _run_git(
     repo: pathlib.Path,
     *args: str,
@@ -2523,17 +2581,22 @@ def _parse_frontmatter_text(
     return fields
 
 
-def _parse_frontmatter(path: pathlib.Path) -> dict[str, Any]:
+def _parse_frontmatter(
+    path: pathlib.Path,
+    *,
+    label: str | bytes | None = None,
+) -> dict[str, Any]:
+    path_label = _bounded_journal_path_label(str(path) if label is None else label)
     content = path.read_bytes()
     if len(content) > MAX_TRACKED_JOURNAL_BLOB_BYTES:
         raise JournalLimitExceeded(
-            f"{path}: journal file exceeds {MAX_TRACKED_JOURNAL_BLOB_BYTES} bytes"
+            f"{path_label}: journal file exceeds {MAX_TRACKED_JOURNAL_BLOB_BYTES} bytes"
         )
     try:
         text = content.decode("utf-8")
     except UnicodeDecodeError as exc:
-        raise UserError(f"{path}: journal file is not valid UTF-8") from exc
-    return _parse_frontmatter_text(text, str(path))
+        raise UserError(f"{path_label}: journal file is not valid UTF-8") from exc
+    return _parse_frontmatter_text(text, path_label)
 
 
 def _as_list(
@@ -2753,20 +2816,22 @@ class _CatFileBatchStreamParser:
             raise UserError(f"tracked journal blob batch exceeds {max_records} records")
 
         requested_oids: list[bytes] = []
+        path_labels: list[str] = []
         for blob in blobs:
+            path_label = _bounded_journal_path_label(blob.raw_path)
+            path_labels.append(path_label)
             try:
                 raw_oid = blob.oid.encode("ascii")
             except UnicodeEncodeError as exc:
                 raise UserError(
-                    f"{blob.rel_path}: invalid requested index blob object id"
+                    f"{path_label}: invalid requested index blob object id"
                 ) from exc
             if not INDEX_OID_RE.fullmatch(raw_oid):
-                raise UserError(
-                    f"{blob.rel_path}: invalid requested index blob object id"
-                )
+                raise UserError(f"{path_label}: invalid requested index blob object id")
             requested_oids.append(raw_oid)
 
         self._blobs = tuple(blobs)
+        self._path_labels = tuple(path_labels)
         self._requested_oids = tuple(requested_oids)
         self._max_blob_bytes = max_blob_bytes
         self._max_total_bytes = max_total_bytes
@@ -2778,37 +2843,38 @@ class _CatFileBatchStreamParser:
         self._finished = False
 
     def _parse_header(self, header: bytes) -> None:
-        blob = self._blobs[len(self._contents)]
+        path_label = self._path_labels[len(self._contents)]
         expected_oid = self._requested_oids[len(self._contents)]
         fields = header.split(b" ")
         if len(fields) not in {2, 3} or any(not field for field in fields):
-            raise UserError(f"{blob.rel_path}: malformed git cat-file batch header")
+            raise UserError(f"{path_label}: malformed git cat-file batch header")
         if fields[0] != expected_oid:
             raise UserError(
-                f"{blob.rel_path}: git cat-file batch returned a mismatched object id"
+                f"{path_label}: git cat-file batch returned a mismatched object id"
             )
         if len(fields) == 2:
             if fields[1] == b"missing":
-                raise UserError(f"{blob.rel_path}: index blob is missing")
-            raise UserError(f"{blob.rel_path}: malformed git cat-file batch header")
+                raise UserError(f"{path_label}: index blob is missing")
+            raise UserError(f"{path_label}: malformed git cat-file batch header")
 
         _raw_oid, object_type, raw_size = fields
         if object_type != b"blob":
             raise UserError(
-                f"{blob.rel_path}: git cat-file batch returned "
+                f"{path_label}: git cat-file batch returned "
                 f"object type {object_type.decode('ascii', errors='replace')!r}, "
                 "expected 'blob'"
             )
         if not raw_size.isdigit():
-            raise UserError(f"{blob.rel_path}: invalid git cat-file batch object size")
+            raise UserError(f"{path_label}: invalid git cat-file batch object size")
         size = int(raw_size)
         if size > self._max_blob_bytes:
             raise UserError(
-                f"{blob.rel_path}: index blob exceeds {self._max_blob_bytes} bytes"
+                f"{path_label}: index blob exceeds {self._max_blob_bytes} bytes"
             )
         if self._total_bytes + size > self._max_total_bytes:
             raise UserError(
-                f"tracked journal blobs exceed {self._max_total_bytes} total bytes"
+                f"{path_label}: tracked journal blobs exceed "
+                f"{self._max_total_bytes} total bytes"
             )
         self._total_bytes += size
         self._expected_size = size
@@ -2829,16 +2895,16 @@ class _CatFileBatchStreamParser:
                 terminator = self._pending.find(b"\n")
                 if terminator < 0:
                     if len(self._pending) > self._max_header_bytes:
-                        blob = self._blobs[len(self._contents)]
+                        path_label = self._path_labels[len(self._contents)]
                         raise UserError(
-                            f"{blob.rel_path}: git cat-file batch header exceeds "
+                            f"{path_label}: git cat-file batch header exceeds "
                             f"{self._max_header_bytes} bytes"
                         )
                     return
                 if terminator > self._max_header_bytes:
-                    blob = self._blobs[len(self._contents)]
+                    path_label = self._path_labels[len(self._contents)]
                     raise UserError(
-                        f"{blob.rel_path}: git cat-file batch header exceeds "
+                        f"{path_label}: git cat-file batch header exceeds "
                         f"{self._max_header_bytes} bytes"
                     )
                 header = bytes(self._pending[:terminator])
@@ -2850,9 +2916,9 @@ class _CatFileBatchStreamParser:
             if len(self._pending) < framed_size:
                 return
             if self._pending[self._expected_size : framed_size] != b"\n":
-                blob = self._blobs[len(self._contents)]
+                path_label = self._path_labels[len(self._contents)]
                 raise UserError(
-                    f"{blob.rel_path}: malformed git cat-file batch content framing"
+                    f"{path_label}: malformed git cat-file batch content framing"
                 )
             self._contents.append(bytes(self._pending[: self._expected_size]))
             del self._pending[:framed_size]
@@ -2862,13 +2928,17 @@ class _CatFileBatchStreamParser:
         if self._finished:
             return
         if self._expected_size is not None:
-            blob = self._blobs[len(self._contents)]
-            raise UserError(f"{blob.rel_path}: truncated git cat-file batch content")
+            path_label = self._path_labels[len(self._contents)]
+            raise UserError(f"{path_label}: truncated git cat-file batch content")
         if self._pending:
-            blob = self._blobs[len(self._contents)]
-            raise UserError(f"{blob.rel_path}: truncated git cat-file batch header")
+            path_label = self._path_labels[len(self._contents)]
+            raise UserError(f"{path_label}: truncated git cat-file batch header")
         if len(self._contents) != len(self._blobs):
-            raise UserError("git cat-file batch returned fewer records than requested")
+            path_label = self._path_labels[len(self._contents)]
+            raise UserError(
+                f"{path_label}: git cat-file batch returned fewer records "
+                "than requested"
+            )
         self._finished = True
 
     def contents(self) -> list[bytes]:
@@ -4681,11 +4751,18 @@ def _tracked_index_journal_snapshot(
         deadline=deadline,
     )
     if result.returncode != 0:
-        detail = (
-            result.stderr.decode("utf-8", errors="replace").strip()
-            or result.stdout.decode("utf-8", errors="replace").strip()
-            or "tracked journal lookup failed"
-        )
+        detail = result.stderr.decode("utf-8", errors="replace").strip()
+        if not detail:
+            stdout_ref = {
+                "bytes": len(result.stdout),
+                "sha256": hashlib.sha256(result.stdout).hexdigest(),
+            }
+            detail = "stdout_ref=" + json.dumps(
+                stdout_ref,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
         raise UserError(f"failed to list tracked journal entries: {detail}")
     return result.stdout, parser.blobs()
 
@@ -4979,7 +5056,7 @@ def _load_entries_from_paths(
     for path in paths:
         rel_path = path.relative_to(repo).as_posix()
         try:
-            fields = _parse_frontmatter(path)
+            fields = _parse_frontmatter(path, label=rel_path)
         except JournalLimitExceeded:
             raise
         except UserError as exc:
@@ -5054,7 +5131,7 @@ def _load_entries_from_index_report(
         try:
             fields = _parse_frontmatter_text(
                 text,
-                blob.rel_path,
+                _bounded_journal_path_label(blob.raw_path),
                 deadline=validation_deadline,
                 deadline_error=deadline_error,
             )
@@ -5146,40 +5223,40 @@ def _validate_entries(
 
     for entry in entries:
         _check_deadline(deadline, deadline_error)
-        label = entry.rel_path
+        rel_path = entry.rel_path
         for field in REQUIRED_FIELDS:
             _check_deadline(deadline, deadline_error)
             if field not in entry.fields:
-                collector.add(label, f"missing required field {field!r}")
+                collector.add(rel_path, f"missing required field {field!r}")
 
         if not entry.entry_id:
-            collector.add(label, "field 'id' must not be empty")
+            collector.add(rel_path, "field 'id' must not be empty")
         elif len(id_groups[entry.entry_id]) > 1:
-            collector.add(label, f"duplicate id {entry.entry_id!r}")
+            collector.add(rel_path, f"duplicate id {entry.entry_id!r}")
 
         if not entry.title:
-            collector.add(label, "field 'title' must not be empty")
+            collector.add(rel_path, "field 'title' must not be empty")
         if entry.status not in VALID_STATUSES:
             collector.add(
-                label,
+                rel_path,
                 f"invalid status {entry.status!r}; "
                 f"expected one of {', '.join(VALID_STATUSES)}",
             )
         if not entry.created:
-            collector.add(label, "field 'created' must not be empty")
+            collector.add(rel_path, "field 'created' must not be empty")
         elif not _validate_date(entry.created):
-            collector.add(label, f"invalid created date {entry.created!r}")
+            collector.add(rel_path, f"invalid created date {entry.created!r}")
         if not entry.updated:
-            collector.add(label, "field 'updated' must not be empty")
+            collector.add(rel_path, "field 'updated' must not be empty")
         elif not _validate_date(entry.updated):
-            collector.add(label, f"invalid updated date {entry.updated!r}")
+            collector.add(rel_path, f"invalid updated date {entry.updated!r}")
 
     valid_targets = set(ids) | rel_paths
     for entry in entries:
         _check_deadline(deadline, deadline_error)
         for superseded in _as_list(
             entry.fields.get("supersedes"),
-            label=entry.rel_path,
+            label=_bounded_journal_path_label(entry.rel_path),
             field="supersedes",
             deadline=deadline,
             deadline_error=deadline_error,
@@ -5559,6 +5636,90 @@ def _parse_nul_terminated_git_path(output: bytes, label: str) -> str:
     return os.fsdecode(output[:-1])
 
 
+def _parse_repo_hook_path_config(
+    output: bytes,
+    label: str,
+) -> _RepoHookPathConfig:
+    fields = output.split(b"\0")
+    if len(fields) != 4 or fields[-1] != b"":
+        raise UserError(f"{label} returned malformed scope/origin/value NUL framing")
+    raw_scope, raw_origin, raw_path, _terminator = fields
+    try:
+        scope = raw_scope.decode("ascii")
+    except UnicodeDecodeError as exc:
+        raise UserError(f"{label} returned a non-ASCII scope") from exc
+    if scope not in {"local", "worktree"}:
+        raise UserError(
+            f"{label} returned unsupported scope {scope!r}; expected local or worktree"
+        )
+    if not raw_origin:
+        raise UserError(f"{label} returned an empty origin")
+    return _RepoHookPathConfig(
+        scope=scope,
+        origin=os.fsdecode(raw_origin),
+        raw_path=os.fsdecode(raw_path),
+    )
+
+
+def _repo_hook_path_config(
+    repo: pathlib.Path,
+    *,
+    deadline: float | None = None,
+    deadline_error: str = "hook-path discovery exceeded its shared deadline",
+) -> _RepoHookPathConfig | None:
+    _check_deadline(deadline, deadline_error)
+    operation = "effective repo-scope core.hooksPath query"
+    command = _hook_config_command(
+        repo,
+        "config",
+        "--includes",
+        "--show-scope",
+        "--show-origin",
+        "--type=path",
+        "--null",
+        "--get",
+        "core.hooksPath",
+    )
+    configured = _capture_bounded_process(
+        command,
+        env=_git_environment(),
+        verified_runtime=_require_git_runtime(),
+        timeout_seconds=GIT_CONFIG_QUERY_TIMEOUT_SECONDS,
+        stdout_limit=MAX_GLOBAL_GIT_CONFIG_OUTPUT_BYTES,
+        stderr_limit=MAX_GIT_STDERR_BYTES,
+        stdout_overflow_error=(
+            f"{operation} stdout exceeds {MAX_GLOBAL_GIT_CONFIG_OUTPUT_BYTES} bytes"
+        ),
+        stderr_overflow_error=(
+            f"{operation} stderr exceeds {MAX_GIT_STDERR_BYTES} bytes"
+        ),
+        timeout_error=(
+            deadline_error
+            if deadline is not None
+            else (
+                f"{operation} timed out after "
+                f"{GIT_CONFIG_QUERY_TIMEOUT_SECONDS:g} seconds"
+            )
+        ),
+        operation=operation,
+        deadline=deadline,
+    )
+    _check_deadline(deadline, deadline_error)
+    if configured.returncode == 1:
+        if configured.stdout or configured.stderr:
+            raise UserError(f"{operation} returned malformed no-value output")
+        return None
+    if configured.returncode != 0:
+        detail = (
+            configured.stderr.decode("utf-8", errors="replace").strip()
+            or f"exit {configured.returncode}"
+        )
+        raise UserError(
+            f"failed to resolve effective repo-scope core.hooksPath safely: {detail}"
+        )
+    return _parse_repo_hook_path_config(configured.stdout, operation)
+
+
 def _global_git_config_entries(
     config_path: pathlib.Path,
     *,
@@ -5759,68 +5920,35 @@ def _hook_path_plan(
     deadline: float | None = None,
     deadline_error: str = "hook-path discovery exceeded its shared deadline",
 ) -> _HookPathPlan:
-    for scope in ("--worktree", "--local"):
-        _check_deadline(deadline, deadline_error)
-        operation = f"{scope} core.hooksPath query"
-        command = _git_command(
+    configured = _repo_hook_path_config(
+        repo,
+        deadline=deadline,
+        deadline_error=deadline_error,
+    )
+    if configured is not None:
+        return _hook_path_plan_from_config(
             repo,
-            "config",
-            "--includes",
-            scope,
-            "--type=path",
-            "--null",
-            "--get",
-            "core.hooksPath",
-        )
-        configured = _capture_bounded_process(
-            command,
-            env=_git_environment(),
-            verified_runtime=_require_git_runtime(),
-            timeout_seconds=GIT_CONFIG_QUERY_TIMEOUT_SECONDS,
-            stdout_limit=MAX_GLOBAL_GIT_CONFIG_OUTPUT_BYTES,
-            stderr_limit=MAX_GIT_STDERR_BYTES,
-            stdout_overflow_error=(
-                f"{operation} stdout exceeds {MAX_GLOBAL_GIT_CONFIG_OUTPUT_BYTES} bytes"
-            ),
-            stderr_overflow_error=(
-                f"{operation} stderr exceeds {MAX_GIT_STDERR_BYTES} bytes"
-            ),
-            timeout_error=(
-                deadline_error
-                if deadline is not None
-                else (
-                    f"{operation} timed out after "
-                    f"{GIT_CONFIG_QUERY_TIMEOUT_SECONDS:g} seconds"
-                )
-            ),
-            operation=operation,
+            configured.raw_path,
             deadline=deadline,
+            deadline_error=deadline_error,
         )
-        _check_deadline(deadline, deadline_error)
-        if configured.returncode == 0:
-            raw_path = _parse_nul_terminated_git_path(
-                configured.stdout,
-                operation,
-            )
-            return _hook_path_plan_from_config(
-                repo,
-                raw_path,
-                deadline=deadline,
-                deadline_error=deadline_error,
-            )
-        if configured.returncode != 1:
-            detail = (
-                configured.stderr.decode("utf-8", errors="replace").strip()
-                or f"exit {configured.returncode}"
-            )
-            raise UserError(
-                f"failed to resolve {scope} core.hooksPath safely: {detail}"
-            )
     _preflight_global_hooks_config(
         repo,
         deadline=deadline,
         deadline_error=deadline_error,
     )
+    configured = _repo_hook_path_config(
+        repo,
+        deadline=deadline,
+        deadline_error=deadline_error,
+    )
+    if configured is not None:
+        return _hook_path_plan_from_config(
+            repo,
+            configured.raw_path,
+            deadline=deadline,
+            deadline_error=deadline_error,
+        )
     return _default_hook_path_plan(
         repo,
         deadline=deadline,
@@ -5910,6 +6038,31 @@ def _revalidate_hook_directory(binding: _HookDirectoryBinding) -> None:
                 f"installation: {ancestor.path}"
             )
     _revalidate_hook_install_lock(binding)
+
+
+def _revalidate_effective_hook_destination(
+    binding: _HookDirectoryBinding,
+) -> None:
+    try:
+        current_plan = _hook_path_plan(binding.repo)
+    except Exception as exc:
+        wrapped = EffectiveHookConfigurationUnverified(
+            "effective_hook_configuration_unverified: effective "
+            "core.hooksPath could not be resolved safely at this "
+            f"verification point: {exc}"
+        )
+        _add_exception_details(wrapped, getattr(exc, "__notes__", ()))
+        raise wrapped from exc
+    if current_plan != binding.plan:
+        raise EffectiveHookDestinationChanged(
+            "effective_hook_destination_changed: effective core.hooksPath "
+            "resolved to a different destination during hook installation; "
+            f"expected {binding.plan.path}, observed {current_plan.path}"
+        )
+    # The configuration query is a point-in-time semantic check. The bound
+    # descriptor chain and lock separately prove object identity and access
+    # policy for the selected destination at the same verification boundary.
+    _revalidate_hook_directory(binding)
 
 
 def _hook_target_identity(value: os.stat_result) -> tuple[int, ...]:
@@ -6034,7 +6187,10 @@ def _revalidate_hook_target(
         )
 
 
-def _bind_hook_directory(plan: _HookPathPlan) -> _HookDirectoryBinding:
+def _bind_hook_directory(
+    repo: pathlib.Path,
+    plan: _HookPathPlan,
+) -> _HookDirectoryBinding:
     if os.name != "posix":
         raise UserError(
             "project journal hook installation requires POSIX descriptor-relative "
@@ -6153,6 +6309,8 @@ def _bind_hook_directory(plan: _HookPathPlan) -> _HookDirectoryBinding:
 
     final = opened[-1]
     binding = _HookDirectoryBinding(
+        repo=repo,
+        plan=plan,
         path=final.path,
         fd=final.fd,
         identity=final.identity,
@@ -6286,7 +6444,8 @@ def _acquire_hook_install_lock(
 
 
 def _preflight_hook_targets(repo: pathlib.Path) -> _HookDirectoryBinding:
-    binding = _bind_hook_directory(_hook_path_plan(repo))
+    plan = _hook_path_plan(repo)
+    binding = _bind_hook_directory(repo, plan)
     try:
         binding = _acquire_hook_install_lock(binding)
         provisional = dataclasses.replace(
@@ -7487,7 +7646,7 @@ def _install_hook(
             raise UserError(
                 f"staged hook failed verification: {binding.path / temporary_name}"
             )
-        _revalidate_hook_directory(binding)
+        _revalidate_effective_hook_destination(binding)
         _revalidate_hook_target(binding, target)
         _raise_if_termination_pending()
         _commit_hook_target_atomically(
@@ -7520,11 +7679,13 @@ def _install_hook(
                 f"hook target failed post-write verification: "
                 f"{binding.path / target.name}: {status}"
             )
+        commit_state.mark_installed_target_verified()
         # The descriptor-relative snapshot proves the installed target in the
-        # held directory, but not that the configured path still names that
-        # directory after the snapshot. Revalidate the complete ancestor chain
-        # before recording the transaction as verified.
-        _revalidate_hook_directory(binding)
+        # held directory. Re-resolve the effective repo-scoped configuration,
+        # compare only its semantic root/components plan, then revalidate the
+        # bound ancestor chain and lock before recording the transaction as
+        # verified.
+        _revalidate_effective_hook_destination(binding)
         commit_state.mark_verified()
         _raise_if_termination_pending()
     except _HookExchangeRecoveryRequired:
@@ -7588,11 +7749,25 @@ def _install_hook(
                 staged,
             )
             pending_step = commit_state.pending_step or "post-commit verification"
-            raise UserError(
+            message = (
                 f"hook target installation committed, but {pending_step} is "
                 f"incomplete: "
                 f"{exc}; {detail}"
-            ) from exc
+            )
+            if isinstance(
+                exc,
+                (
+                    EffectiveHookConfigurationUnverified,
+                    EffectiveHookDestinationChanged,
+                ),
+            ):
+                wrapped = type(exc)(message)
+                _add_exception_details(
+                    wrapped,
+                    getattr(exc, "__notes__", ()),
+                )
+                raise wrapped from exc
+            raise UserError(message) from exc
         raise
     except BaseException as exc:
         if commit_state.absent_rename_may_have_committed:
@@ -9843,6 +10018,24 @@ def _discovery_coverage_error(
     return error
 
 
+def _discovery_row_sort_key(row: dict[str, Any]) -> tuple[str, int]:
+    repo = row.get("repo")
+    candidate_cwd = row.get("candidate_cwd")
+    label = str(repo or candidate_cwd or "")
+    kind = 0 if repo is not None else 1 if candidate_cwd is not None else 2
+    return (label, kind)
+
+
+def _discovery_coverage_id(primary: dict[str, Any]) -> str:
+    canonical = json.dumps(
+        primary,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(canonical).hexdigest()
+
+
 def _mark_partial_discovery_coverage(
     rows: list[dict[str, Any]],
     errors: list[dict[str, Any]],
@@ -9853,6 +10046,8 @@ def _mark_partial_discovery_coverage(
     primary["error_count"] = error_count
     primary["errors"] = errors
     primary.update(state.coverage_counters())
+    primary["coverage_id"] = _discovery_coverage_id(primary)
+    coverage_ref = {"coverage_id": primary["coverage_id"]}
     if not rows:
         rows.append(
             {
@@ -9868,6 +10063,7 @@ def _mark_partial_discovery_coverage(
                 "coverage_status": "partial",
                 "discovery_status": "inconclusive",
                 "discovery_error": {"discovery_coverage": primary},
+                "discovery_coverage_ref": coverage_ref,
                 "install_command": None,
                 "generate_command": None,
                 "adoption_status": "inconclusive",
@@ -9883,15 +10079,18 @@ def _mark_partial_discovery_coverage(
                 "valid_tracked_journal_count": None,
             }
         )
-        return rows
+        return sorted(rows, key=_discovery_row_sort_key)
 
-    for row in rows:
+    sorted_rows = sorted(rows, key=_discovery_row_sort_key)
+    for index, row in enumerate(sorted_rows):
         row["coverage_status"] = "partial"
         row["discovery_status"] = "inconclusive"
+        row["discovery_coverage_ref"] = dict(coverage_ref)
         row_errors = dict(row.get("discovery_error") or {})
-        row_errors["discovery_coverage"] = primary
-        row["discovery_error"] = row_errors
-    return rows
+        if index == 0:
+            row_errors["discovery_coverage"] = primary
+        row["discovery_error"] = row_errors or None
+    return sorted_rows
 
 
 def _discover_repos(codex_home: pathlib.Path, since_days: int) -> list[dict[str, Any]]:
@@ -10126,10 +10325,7 @@ def _discover_repos(codex_home: pathlib.Path, since_days: int) -> list[dict[str,
             coverage_error_count,
             state,
         )
-    return sorted(
-        rows,
-        key=lambda row: str(row["repo"] or row.get("candidate_cwd") or ""),
-    )
+    return sorted(rows, key=_discovery_row_sort_key)
 
 
 def command_discover_repos(args: argparse.Namespace) -> int:
