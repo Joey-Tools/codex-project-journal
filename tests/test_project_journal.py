@@ -88,6 +88,318 @@ class ProjectJournalTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.tmp.cleanup()
 
+    @contextlib.contextmanager
+    def default_unblocked_sigint(self) -> Iterator[None]:
+        pthread_sigmask = getattr(signal, "pthread_sigmask", None)
+        sig_block = getattr(signal, "SIG_BLOCK", None)
+        sig_unblock = getattr(signal, "SIG_UNBLOCK", None)
+        sig_setmask = getattr(signal, "SIG_SETMASK", None)
+        if (
+            not callable(pthread_sigmask)
+            or not isinstance(sig_block, int)
+            or not isinstance(sig_unblock, int)
+            or not isinstance(sig_setmask, int)
+        ):
+            self.skipTest("POSIX SIGINT mask control is unavailable")
+        previous_handler = signal.getsignal(signal.SIGINT)
+        previous_mask = pthread_sigmask(sig_block, set())
+        try:
+            signal.signal(signal.SIGINT, signal.default_int_handler)
+            pthread_sigmask(sig_unblock, {signal.SIGINT})
+            yield
+        finally:
+            pthread_sigmask(sig_block, {signal.SIGINT})
+            signal.signal(signal.SIGINT, previous_handler)
+            pthread_sigmask(sig_setmask, previous_mask)
+
+    def exact_source_line(
+        self,
+        function: object,
+        source: str,
+        *,
+        occurrence: int = 0,
+    ) -> int:
+        source_lines, first_line = inspect.getsourcelines(function)
+        matches = [
+            first_line + offset
+            for offset, line in enumerate(source_lines)
+            if line.strip() == source
+        ]
+        self.assertGreater(len(matches), occurrence)
+        return matches[occurrence]
+
+    @unittest.skipUnless(os.name == "posix", "POSIX signal-mask contract")
+    def test_fd_close_signal_fence_preserves_pending_sigint_entry_mask(
+        self,
+    ) -> None:
+        pthread_sigmask = getattr(signal, "pthread_sigmask", None)
+        sigpending = getattr(signal, "sigpending", None)
+        sigwait = getattr(signal, "sigwait", None)
+        sig_block = getattr(signal, "SIG_BLOCK", None)
+        sig_setmask = getattr(signal, "SIG_SETMASK", None)
+        if (
+            not callable(pthread_sigmask)
+            or not callable(sigpending)
+            or not callable(sigwait)
+            or not isinstance(sig_block, int)
+            or not isinstance(sig_setmask, int)
+        ):
+            self.skipTest("POSIX pending-signal controls are unavailable")
+        if signal.SIGINT in sigpending():
+            self.skipTest("caller already has a pending SIGINT")
+
+        previous_handler = signal.getsignal(signal.SIGINT)
+        previous_mask = pthread_sigmask(sig_block, set())
+        entry_mask: set[int] | None = None
+        try:
+            signal.signal(signal.SIGINT, signal.default_int_handler)
+            pthread_sigmask(sig_block, {signal.SIGINT})
+            entry_mask = {int(value) for value in pthread_sigmask(sig_block, set())}
+            os.kill(os.getpid(), signal.SIGINT)
+            self.assertIn(signal.SIGINT, sigpending())
+
+            signal_fence = project_journal._block_fd_close_signals()
+            self.assertEqual(signal_fence.previous_mask, entry_mask)
+            fenced_mask = {int(value) for value in pthread_sigmask(sig_block, set())}
+            self.assertTrue(
+                {
+                    signal.SIGINT,
+                    *project_journal._termination_signals(),
+                }.issubset(fenced_mask)
+            )
+
+            signal_fence.restore()
+            restored_mask = {int(value) for value in pthread_sigmask(sig_block, set())}
+            self.assertEqual(restored_mask, entry_mask)
+            self.assertIn(signal.SIGINT, sigpending())
+            self.assertEqual(sigwait({signal.SIGINT}), signal.SIGINT)
+        finally:
+            pthread_sigmask(sig_block, {signal.SIGINT})
+            if signal.SIGINT in sigpending():
+                sigwait({signal.SIGINT})
+            signal.signal(signal.SIGINT, previous_handler)
+            pthread_sigmask(sig_setmask, previous_mask)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX signal-mask contract")
+    def test_fd_close_signal_fence_rolls_back_second_step_exception(
+        self,
+    ) -> None:
+        pthread_sigmask = getattr(signal, "pthread_sigmask", None)
+        sig_block = getattr(signal, "SIG_BLOCK", None)
+        if not callable(pthread_sigmask) or not isinstance(sig_block, int):
+            self.skipTest("POSIX signal-mask controls are unavailable")
+        entry_mask = {int(value) for value in pthread_sigmask(sig_block, set())}
+        interruption = LegacyInterrupt("injected post-mask pre-return interruption")
+        call_count = 0
+
+        def apply_then_interrupt(
+            how: int,
+            signals: set[int],
+        ) -> set[int]:
+            nonlocal call_count
+            call_count += 1
+            previous = {int(value) for value in pthread_sigmask(how, signals)}
+            if call_count == 2:
+                raise interruption
+            return previous
+
+        with mock.patch.object(
+            project_journal.signal,
+            "pthread_sigmask",
+            side_effect=apply_then_interrupt,
+        ):
+            with self.assertRaises(LegacyInterrupt) as raised:
+                project_journal._block_fd_close_signals()
+
+        self.assertIs(raised.exception, interruption)
+        self.assertEqual(call_count, 3)
+        restored_mask = {int(value) for value in pthread_sigmask(sig_block, set())}
+        self.assertEqual(restored_mask, entry_mask)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX signal-mask contract")
+    def test_fd_close_signal_fence_reports_rollback_failure_as_unverified(
+        self,
+    ) -> None:
+        pthread_sigmask = getattr(signal, "pthread_sigmask", None)
+        sig_block = getattr(signal, "SIG_BLOCK", None)
+        sig_setmask = getattr(signal, "SIG_SETMASK", None)
+        if (
+            not callable(pthread_sigmask)
+            or not isinstance(sig_block, int)
+            or not isinstance(sig_setmask, int)
+        ):
+            self.skipTest("POSIX signal-mask controls are unavailable")
+        entry_mask = {int(value) for value in pthread_sigmask(sig_block, set())}
+        interruption = LegacyInterrupt("injected post-mask pre-return interruption")
+        rollback_failure = LegacyInterrupt("injected entry-mask rollback interruption")
+        call_count = 0
+
+        def fail_after_mask_then_reject_rollback(
+            how: int,
+            signals: set[int],
+        ) -> set[int]:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 3:
+                raise rollback_failure
+            previous = {int(value) for value in pthread_sigmask(how, signals)}
+            if call_count == 2:
+                raise interruption
+            return previous
+
+        try:
+            with mock.patch.object(
+                project_journal.signal,
+                "pthread_sigmask",
+                side_effect=fail_after_mask_then_reject_rollback,
+            ):
+                with self.assertRaises(LegacyInterrupt) as raised:
+                    project_journal._block_fd_close_signals()
+
+            self.assertIs(raised.exception, interruption)
+            self.assertEqual(call_count, 3)
+            details = "\n".join(getattr(raised.exception, "__notes__", ()))
+            self.assertIn(str(rollback_failure), details)
+            self.assertIn("thread signal-mask state is unverified", details)
+            current_mask = {int(value) for value in pthread_sigmask(sig_block, set())}
+            self.assertTrue(
+                {
+                    signal.SIGINT,
+                    *project_journal._termination_signals(),
+                }.issubset(current_mask)
+            )
+        finally:
+            pthread_sigmask(sig_setmask, entry_mask)
+
+    def test_bounded_exception_note_propagation_deduplicates_and_caps(
+        self,
+    ) -> None:
+        target = project_journal.UserError("wrapped failure")
+        source = OSError(errno.EIO, "source failure")
+        source.__notes__ = [
+            "duplicate note",
+            "duplicate note",
+            *(
+                f"note {index}: " + ("x" * 5000)
+                for index in range(
+                    project_journal.MAX_DEFERRED_SIGNAL_REPORT_DETAILS + 2
+                )
+            ),
+        ]
+
+        project_journal._propagate_bounded_exception_notes(
+            target,
+            source,
+            context="wrapped context",
+        )
+        first_notes = tuple(getattr(target, "__notes__", ()))
+        for _ in range(2):
+            project_journal._propagate_bounded_exception_notes(
+                target,
+                source,
+                context="wrapped context",
+            )
+            self.assertEqual(
+                tuple(getattr(target, "__notes__", ())),
+                first_notes,
+            )
+
+        notes = getattr(target, "__notes__", ())
+        self.assertLessEqual(
+            len(notes),
+            project_journal.MAX_DEFERRED_SIGNAL_REPORT_DETAILS,
+        )
+        self.assertEqual(
+            notes.count("wrapped context: duplicate note"),
+            1,
+        )
+        self.assertEqual(len(notes), len(set(notes)))
+        self.assertTrue(all(note.startswith("wrapped context: ") for note in notes))
+        self.assertTrue(
+            all(
+                len(note)
+                <= (
+                    project_journal.MAX_DEFERRED_SIGNAL_REPORT_CHARS
+                    + len("…[truncated]")
+                )
+                for note in notes
+            )
+        )
+
+    def test_bounded_exception_details_are_stable_across_repeated_calls(
+        self,
+    ) -> None:
+        error = project_journal.UserError("bounded detail failure")
+        details = [
+            f"detail {index}"
+            for index in range(project_journal.MAX_DEFERRED_SIGNAL_REPORT_DETAILS + 3)
+        ]
+
+        project_journal._add_exception_details(error, details)
+        first_notes = tuple(getattr(error, "__notes__", ()))
+        for _ in range(2):
+            project_journal._add_exception_details(error, details)
+            self.assertEqual(
+                tuple(getattr(error, "__notes__", ())),
+                first_notes,
+            )
+
+        self.assertEqual(
+            first_notes,
+            (
+                *details[: project_journal.MAX_DEFERRED_SIGNAL_REPORT_DETAILS - 1],
+                details[-1],
+            ),
+        )
+        self.assertEqual(len(first_notes), len(set(first_notes)))
+
+    def test_fd_close_restore_merge_preserves_close_error_and_restore_evidence(
+        self,
+    ) -> None:
+        close_error = OSError(errno.EIO, "injected close failure")
+        underlying_restore_error = OSError(
+            errno.EIO,
+            "injected ordinary restore failure",
+        )
+        project_journal._add_exception_detail(
+            underlying_restore_error,
+            "injected restore source detail",
+        )
+        fence = project_journal._FdCloseSignalFence(
+            pthread_sigmask=mock.Mock(side_effect=underlying_restore_error),
+            sig_setmask=signal.SIG_SETMASK,
+            previous_mask=set(),
+        )
+
+        with self.assertRaises(project_journal.UnsupportedPlatform) as raised:
+            fence.restore()
+        restore_error = raised.exception
+        self.assertIs(restore_error.__cause__, underlying_restore_error)
+        wrapper_notes = "\n".join(getattr(restore_error, "__notes__", ()))
+        self.assertIn("type=OSError", wrapper_notes)
+        self.assertIn(f"errno={errno.EIO} (EIO)", wrapper_notes)
+        self.assertIn("injected ordinary restore failure", wrapper_notes)
+        self.assertIn("injected restore source detail", wrapper_notes)
+
+        selected = project_journal._merge_fd_close_restore_error(
+            close_error,
+            restore_error,
+            context="test descriptor close",
+        )
+
+        self.assertIs(selected, close_error)
+        self.assertEqual(close_error.errno, errno.EIO)
+        notes = "\n".join(getattr(close_error, "__notes__", ()))
+        self.assertIn("type=UnsupportedPlatform", notes)
+        self.assertIn("type=OSError", notes)
+        self.assertIn(f"errno={errno.EIO} (EIO)", notes)
+        self.assertIn("injected ordinary restore failure", notes)
+        self.assertIn("injected restore source detail", notes)
+        self.assertLessEqual(
+            len(getattr(close_error, "__notes__", ())),
+            project_journal.MAX_DEFERRED_SIGNAL_REPORT_DETAILS,
+        )
+
     def init_repo(self, name: str = "repo") -> pathlib.Path:
         repo = self.root / name
         repo.mkdir()
@@ -2073,6 +2385,455 @@ class ProjectJournalTests(unittest.TestCase):
                 if directory.exists():
                     os.chmod(directory, 0o700)
                     shutil.rmtree(directory)
+            runtime.snapshot_owner.cleanup()
+
+    @unittest.skipUnless(os.name == "posix", "POSIX signal-mask contract")
+    def test_git_launch_source_close_preserves_close_error_over_pending_sigint(
+        self,
+    ) -> None:
+        runtime = self.make_fake_git_runtime("launch-close-error-pending-sigint")
+        actual_open_source = project_journal._open_bound_git_runtime_snapshot
+        actual_close = project_journal.os.close
+        actual_mkdtemp = tempfile.mkdtemp
+        source_fd: int | None = None
+        source_close_count = 0
+        launch_directories: list[pathlib.Path] = []
+        close_error = OSError(
+            errno.EIO,
+            "injected source close failure before pending SIGINT restore",
+        )
+
+        def capture_source(*args: object, **kwargs: object) -> int:
+            nonlocal source_fd
+            source_fd = actual_open_source(*args, **kwargs)
+            return source_fd
+
+        def close_then_fail_with_pending_sigint(fd: int) -> None:
+            nonlocal source_close_count
+            if fd == source_fd and source_close_count == 0:
+                source_close_count += 1
+                actual_close(fd)
+                os.kill(os.getpid(), signal.SIGINT)
+                raise close_error
+            actual_close(fd)
+
+        def capture_launch_directory(*args: object, **kwargs: object) -> str:
+            directory = actual_mkdtemp(*args, **kwargs)
+            candidate = pathlib.Path(directory)
+            if candidate.name.startswith("project-journal-git-launch-"):
+                launch_directories.append(candidate)
+            return directory
+
+        try:
+            with self.default_unblocked_sigint():
+                with mock.patch.object(
+                    project_journal,
+                    "_open_bound_git_runtime_snapshot",
+                    side_effect=capture_source,
+                ):
+                    with mock.patch.object(
+                        project_journal.tempfile,
+                        "mkdtemp",
+                        side_effect=capture_launch_directory,
+                    ):
+                        with mock.patch.object(
+                            project_journal.os,
+                            "close",
+                            side_effect=close_then_fail_with_pending_sigint,
+                        ):
+                            with self.assertRaises(
+                                project_journal.UnsupportedGitVersion,
+                            ) as raised:
+                                project_journal._prepare_git_runtime_launch(
+                                    runtime,
+                                    deadline=time.monotonic() + 5,
+                                    deadline_error="launch preparation timed out",
+                                )
+
+            self.assertIs(raised.exception.__cause__, close_error)
+            self.assertEqual(source_close_count, 1)
+            self.assertIsNotNone(source_fd)
+            assert source_fd is not None
+            with self.assertRaises(OSError) as closed:
+                os.fstat(source_fd)
+            self.assertEqual(closed.exception.errno, errno.EBADF)
+            notes = "\n".join(getattr(raised.exception, "__notes__", ()))
+            self.assertIn("type=KeyboardInterrupt", notes)
+            self.assertEqual(notes.count("type=KeyboardInterrupt"), 1)
+            self.assertEqual(len(launch_directories), 1)
+            self.assertFalse(launch_directories[0].exists())
+        finally:
+            for directory in launch_directories:
+                if directory.exists():
+                    os.chmod(directory, 0o700)
+                    shutil.rmtree(directory)
+            runtime.snapshot_owner.cleanup()
+
+    @unittest.skipUnless(os.name == "posix", "POSIX signal-mask contract")
+    def test_git_launch_source_dual_close_restore_failure_is_secondary_to_active_error(
+        self,
+    ) -> None:
+        runtime = self.make_fake_git_runtime(
+            "launch-active-error-close-error-pending-sigint"
+        )
+        actual_open_source = project_journal._open_bound_git_runtime_snapshot
+        actual_close = project_journal.os.close
+        actual_mkdtemp = tempfile.mkdtemp
+        actual_chmod = project_journal.os.chmod
+        source_fd: int | None = None
+        source_close_count = 0
+        launch_directories: list[pathlib.Path] = []
+        active_error = LegacyInterrupt(
+            "injected active launch preparation interruption"
+        )
+        close_error = OSError(
+            errno.EIO,
+            "injected secondary source close failure",
+        )
+        interrupted = False
+
+        def capture_source(*args: object, **kwargs: object) -> int:
+            nonlocal source_fd
+            source_fd = actual_open_source(*args, **kwargs)
+            return source_fd
+
+        def close_then_fail_with_pending_sigint(fd: int) -> None:
+            nonlocal source_close_count
+            if fd == source_fd and source_close_count == 0:
+                source_close_count += 1
+                actual_close(fd)
+                os.kill(os.getpid(), signal.SIGINT)
+                raise close_error
+            actual_close(fd)
+
+        def capture_launch_directory(*args: object, **kwargs: object) -> str:
+            directory = actual_mkdtemp(*args, **kwargs)
+            candidate = pathlib.Path(directory)
+            if candidate.name.startswith("project-journal-git-launch-"):
+                launch_directories.append(candidate)
+            return directory
+
+        def interrupt_initial_launch_chmod(
+            path: os.PathLike[str] | str,
+            mode: int,
+            *,
+            dir_fd: int | None = None,
+            follow_symlinks: bool = True,
+        ) -> None:
+            nonlocal interrupted
+            candidate = pathlib.Path(path)
+            if (
+                not interrupted
+                and mode == 0o700
+                and candidate.name.startswith("project-journal-git-launch-")
+            ):
+                interrupted = True
+                raise active_error
+            actual_chmod(
+                path,
+                mode,
+                dir_fd=dir_fd,
+                follow_symlinks=follow_symlinks,
+            )
+
+        try:
+            with self.default_unblocked_sigint():
+                with mock.patch.object(
+                    project_journal,
+                    "_open_bound_git_runtime_snapshot",
+                    side_effect=capture_source,
+                ):
+                    with mock.patch.object(
+                        project_journal.tempfile,
+                        "mkdtemp",
+                        side_effect=capture_launch_directory,
+                    ):
+                        with mock.patch.object(
+                            project_journal.os,
+                            "chmod",
+                            side_effect=interrupt_initial_launch_chmod,
+                        ):
+                            with mock.patch.object(
+                                project_journal.os,
+                                "close",
+                                side_effect=close_then_fail_with_pending_sigint,
+                            ):
+                                with self.assertRaises(LegacyInterrupt) as raised:
+                                    project_journal._prepare_git_runtime_launch(
+                                        runtime,
+                                        deadline=time.monotonic() + 5,
+                                        deadline_error=("launch preparation timed out"),
+                                    )
+
+            self.assertIs(raised.exception, active_error)
+            self.assertTrue(interrupted)
+            self.assertEqual(source_close_count, 1)
+            cleanup_errors = getattr(active_error, "cleanup_errors", ())
+            self.assertEqual(len(cleanup_errors), 1)
+            cleanup = cleanup_errors[0]
+            self.assertEqual(cleanup["error_type"], "OSError")
+            self.assertEqual(cleanup["errno"], errno.EIO)
+            self.assertEqual(cleanup["error_name"], "EIO")
+            self.assertIn(
+                "type=KeyboardInterrupt",
+                "\n".join(cleanup["details"]),
+            )
+            notes = "\n".join(getattr(active_error, "__notes__", ()))
+            self.assertIn("secondary source close failure", notes)
+            self.assertIn("type=KeyboardInterrupt", notes)
+            self.assertEqual(len(launch_directories), 1)
+            self.assertFalse(launch_directories[0].exists())
+        finally:
+            for directory in launch_directories:
+                if directory.exists():
+                    os.chmod(directory, 0o700)
+                    shutil.rmtree(directory)
+            runtime.snapshot_owner.cleanup()
+
+    @unittest.skipUnless(os.name == "posix", "POSIX signal-mask contract")
+    def test_git_launch_source_close_signal_fence_covers_handoff_phases(
+        self,
+    ) -> None:
+        prepare = project_journal._prepare_git_runtime_launch
+        target_lines = {
+            "before_signal_fence": self.exact_source_line(
+                prepare,
+                "signal_fence = _block_fd_close_signals()",
+            ),
+            "after_close_commit": self.exact_source_line(
+                prepare,
+                "os.close(fd)",
+            ),
+            "after_close_success": self.exact_source_line(
+                prepare,
+                "if close_committed:",
+            ),
+        }
+        actual_open_source = project_journal._open_bound_git_runtime_snapshot
+        actual_close = project_journal.os.close
+        actual_mkdtemp = tempfile.mkdtemp
+
+        for phase, target_line in target_lines.items():
+            with self.subTest(phase=phase):
+                runtime = self.make_fake_git_runtime(f"launch-sigint-{phase}")
+                source_identity: tuple[int, int] | None = None
+                source_close_count = 0
+                launch_directories: list[pathlib.Path] = []
+                injected = False
+
+                def capture_source(*args: object, **kwargs: object) -> int:
+                    nonlocal source_identity
+                    fd = actual_open_source(*args, **kwargs)
+                    source_stat = os.fstat(fd)
+                    source_identity = (source_stat.st_dev, source_stat.st_ino)
+                    return fd
+
+                def track_close(fd: int) -> None:
+                    nonlocal source_close_count
+                    try:
+                        descriptor_stat = os.fstat(fd)
+                    except OSError:
+                        descriptor_identity = None
+                    else:
+                        descriptor_identity = (
+                            descriptor_stat.st_dev,
+                            descriptor_stat.st_ino,
+                        )
+                    if descriptor_identity == source_identity:
+                        source_close_count += 1
+                    actual_close(fd)
+
+                def capture_launch_directory(
+                    *args: object,
+                    **kwargs: object,
+                ) -> str:
+                    directory = actual_mkdtemp(*args, **kwargs)
+                    candidate = pathlib.Path(directory)
+                    if candidate.name.startswith("project-journal-git-launch-"):
+                        launch_directories.append(candidate)
+                    return directory
+
+                def send_sigint_at_target(
+                    frame: object,
+                    event: str,
+                    _arg: object,
+                ) -> object:
+                    nonlocal injected
+                    code = getattr(frame, "f_code", None)
+                    if (
+                        not injected
+                        and event == "line"
+                        and getattr(code, "co_name", None) == "attempt_close"
+                        and getattr(code, "co_filename", None) == str(SCRIPT)
+                        and getattr(frame, "f_lineno", None) == target_line
+                    ):
+                        injected = True
+                        os.kill(os.getpid(), signal.SIGINT)
+                    return send_sigint_at_target
+
+                previous_trace = sys.gettrace()
+                try:
+                    with self.default_unblocked_sigint():
+                        with mock.patch.object(
+                            project_journal,
+                            "_open_bound_git_runtime_snapshot",
+                            side_effect=capture_source,
+                        ):
+                            with mock.patch.object(
+                                project_journal.tempfile,
+                                "mkdtemp",
+                                side_effect=capture_launch_directory,
+                            ):
+                                with mock.patch.object(
+                                    project_journal.os,
+                                    "close",
+                                    side_effect=track_close,
+                                ):
+                                    sys.settrace(send_sigint_at_target)
+                                    with self.assertRaises(KeyboardInterrupt):
+                                        prepare(
+                                            runtime,
+                                            deadline=time.monotonic() + 5,
+                                            deadline_error=(
+                                                "launch preparation timed out"
+                                            ),
+                                        )
+                finally:
+                    sys.settrace(previous_trace)
+                    for directory in launch_directories:
+                        if directory.exists():
+                            os.chmod(directory, 0o700)
+                            shutil.rmtree(directory)
+                    runtime.snapshot_owner.cleanup()
+
+                self.assertTrue(injected)
+                self.assertIsNotNone(source_identity)
+                self.assertEqual(source_close_count, 1)
+                self.assertTrue(launch_directories)
+                self.assertTrue(
+                    all(not directory.exists() for directory in launch_directories)
+                )
+
+    @unittest.skipUnless(os.name == "posix", "POSIX signal-mask contract")
+    def test_git_launch_source_close_signal_fence_does_not_close_reused_fd(
+        self,
+    ) -> None:
+        runtime = self.make_fake_git_runtime("launch-sigint-fd-reuse")
+        actual_open_source = project_journal._open_bound_git_runtime_snapshot
+        actual_close = project_journal.os.close
+        source_identity: tuple[int, int] | None = None
+        source_closed = False
+        reused_fd: int | None = None
+
+        def capture_source(*args: object, **kwargs: object) -> int:
+            nonlocal source_identity
+            fd = actual_open_source(*args, **kwargs)
+            source_stat = os.fstat(fd)
+            source_identity = (source_stat.st_dev, source_stat.st_ino)
+            return fd
+
+        def close_source_then_reuse(fd: int) -> None:
+            nonlocal reused_fd, source_closed
+            descriptor_stat = os.fstat(fd)
+            descriptor_identity = (
+                descriptor_stat.st_dev,
+                descriptor_stat.st_ino,
+            )
+            if descriptor_identity == source_identity and not source_closed:
+                source_closed = True
+                actual_close(fd)
+                replacement = os.open(os.devnull, os.O_RDONLY)
+                if replacement != fd:
+                    os.dup2(replacement, fd)
+                    actual_close(replacement)
+                reused_fd = fd
+                os.kill(os.getpid(), signal.SIGINT)
+                return
+            actual_close(fd)
+
+        try:
+            with self.default_unblocked_sigint():
+                with mock.patch.object(
+                    project_journal,
+                    "_open_bound_git_runtime_snapshot",
+                    side_effect=capture_source,
+                ):
+                    with mock.patch.object(
+                        project_journal.os,
+                        "close",
+                        side_effect=close_source_then_reuse,
+                    ):
+                        with self.assertRaises(KeyboardInterrupt):
+                            project_journal._prepare_git_runtime_launch(
+                                runtime,
+                                deadline=time.monotonic() + 5,
+                                deadline_error="launch preparation timed out",
+                            )
+
+            self.assertTrue(source_closed)
+            self.assertIsNotNone(reused_fd)
+            assert reused_fd is not None
+            os.fstat(reused_fd)
+        finally:
+            if reused_fd is not None:
+                try:
+                    actual_close(reused_fd)
+                except OSError:
+                    pass
+            runtime.snapshot_owner.cleanup()
+
+    def test_git_launch_source_close_reports_incomplete_preclose_drain(
+        self,
+    ) -> None:
+        runtime = self.make_fake_git_runtime("launch-preclose-drain-failure")
+        actual_open_source = project_journal._open_bound_git_runtime_snapshot
+        actual_close = project_journal.os.close
+        source_fd: int | None = None
+        first_interrupt = LegacyInterrupt("injected pre-close interruption")
+        drain_interrupt = LegacyInterrupt("injected pre-close drain interruption")
+
+        def capture_source(*args: object, **kwargs: object) -> int:
+            nonlocal source_fd
+            source_fd = actual_open_source(*args, **kwargs)
+            return source_fd
+
+        try:
+            with mock.patch.object(
+                project_journal,
+                "_open_bound_git_runtime_snapshot",
+                side_effect=capture_source,
+            ):
+                with mock.patch.object(
+                    project_journal,
+                    "_block_fd_close_signals",
+                    side_effect=[first_interrupt, drain_interrupt],
+                ):
+                    with self.assertRaises(LegacyInterrupt) as raised:
+                        project_journal._prepare_git_runtime_launch(
+                            runtime,
+                            deadline=time.monotonic() + 5,
+                            deadline_error="launch preparation timed out",
+                        )
+
+            self.assertIs(raised.exception, first_interrupt)
+            details = "\n".join(
+                [
+                    str(raised.exception),
+                    *getattr(raised.exception, "__notes__", ()),
+                ]
+            )
+            self.assertIn("source descriptor owner drain failed", details)
+            self.assertIn(str(drain_interrupt), details)
+            self.assertIn("source descriptor remains owned", details)
+            self.assertIsNotNone(source_fd)
+            assert source_fd is not None
+            os.fstat(source_fd)
+        finally:
+            if source_fd is not None:
+                try:
+                    actual_close(source_fd)
+                except OSError:
+                    pass
             runtime.snapshot_owner.cleanup()
 
     @unittest.skipUnless(os.name == "posix", "POSIX Git runtime contract")
@@ -4460,20 +5221,6 @@ class ProjectJournalTests(unittest.TestCase):
             return matches[0]
 
         target_lines = {
-            "before_close_call": (
-                owner_type._close_owned_fd,
-                exact_line_number(
-                    owner_type._close_owned_fd,
-                    "os.close(self._begin_close_attempt(fd))",
-                ),
-            ),
-            "after_close_before_retire": (
-                owner_type._close_owned_fd,
-                exact_line_number(
-                    owner_type._close_owned_fd,
-                    "self._owned.pop(fd, None)",
-                ),
-            ),
             "before_context_drain": (
                 owner_type.__exit__,
                 exact_line_number(
@@ -4493,7 +5240,7 @@ class ProjectJournalTests(unittest.TestCase):
                 owner_type.close_all,
                 exact_line_number(
                     owner_type.close_all,
-                    "fd, (context, close_attempted) = next(iter(self._owned.items()))",
+                    "for fd in tuple(self._owned):",
                 ),
             ),
         }
@@ -4616,6 +5363,492 @@ class ProjectJournalTests(unittest.TestCase):
                     cleanup_errors[0]["message"],
                 )
 
+    @unittest.skipUnless(os.name == "posix", "POSIX signal-mask contract")
+    def test_repository_resolution_owner_signal_fence_covers_handoff_phases(
+        self,
+    ) -> None:
+        owner_type = project_journal._RepositoryResolutionFdOwner
+        target_lines = {
+            "before_signal_fence": self.exact_source_line(
+                owner_type._close_owned_fd,
+                "signal_fence = _block_fd_close_signals()",
+            ),
+            "after_close_commit": self.exact_source_line(
+                owner_type._close_owned_fd,
+                "os.close(fd)",
+            ),
+            "after_close_success": self.exact_source_line(
+                owner_type._close_owned_fd,
+                "self._close_recovery_eligible = False",
+            ),
+        }
+        actual_close = project_journal.os.close
+        flags = project_journal._repository_initial_directory_open_flags(self.root)
+
+        for phase, target_line in target_lines.items():
+            with self.subTest(phase=phase):
+                owner = owner_type(self.root)
+                fd = owner.open(
+                    self.root,
+                    flags,
+                    cleanup_context=f"{phase} descriptor cleanup failed",
+                )
+                source_stat = os.fstat(fd)
+                source_identity = (source_stat.st_dev, source_stat.st_ino)
+                source_close_count = 0
+                injected = False
+
+                def track_close(candidate_fd: int) -> None:
+                    nonlocal source_close_count
+                    descriptor_stat = os.fstat(candidate_fd)
+                    descriptor_identity = (
+                        descriptor_stat.st_dev,
+                        descriptor_stat.st_ino,
+                    )
+                    if descriptor_identity == source_identity:
+                        source_close_count += 1
+                    actual_close(candidate_fd)
+
+                def send_sigint_at_target(
+                    frame: object,
+                    event: str,
+                    _arg: object,
+                ) -> object:
+                    nonlocal injected
+                    if (
+                        not injected
+                        and event == "line"
+                        and getattr(frame, "f_code", None)
+                        is owner_type._close_owned_fd.__code__
+                        and getattr(frame, "f_lineno", None) == target_line
+                    ):
+                        injected = True
+                        os.kill(os.getpid(), signal.SIGINT)
+                    return send_sigint_at_target
+
+                previous_trace = sys.gettrace()
+                try:
+                    with self.default_unblocked_sigint():
+                        with mock.patch.object(
+                            project_journal.os,
+                            "close",
+                            side_effect=track_close,
+                        ):
+                            sys.settrace(send_sigint_at_target)
+                            with self.assertRaises(KeyboardInterrupt) as raised:
+                                owner.close(
+                                    fd,
+                                    context=f"{phase} descriptor close failed",
+                                )
+                            sys.settrace(previous_trace)
+                            if phase == "before_signal_fence":
+                                self.assertEqual(owner.owned_fds, (fd,))
+                            owner.close_all(primary=raised.exception)
+                finally:
+                    sys.settrace(previous_trace)
+                    if owner.owned_fds:
+                        owner.close_all()
+
+                self.assertTrue(injected)
+                self.assertEqual(source_close_count, 1)
+                self.assertEqual(owner.owned_fds, ())
+
+    @unittest.skipUnless(os.name == "posix", "POSIX signal-mask contract")
+    def test_repository_resolution_owner_signal_fence_does_not_close_reused_fd(
+        self,
+    ) -> None:
+        owner = project_journal._RepositoryResolutionFdOwner(self.root)
+        flags = project_journal._repository_initial_directory_open_flags(self.root)
+        fd = owner.open(
+            self.root,
+            flags,
+            cleanup_context="reused descriptor cleanup failed",
+        )
+        source_stat = os.fstat(fd)
+        source_identity = (source_stat.st_dev, source_stat.st_ino)
+        actual_close = project_journal.os.close
+        source_closed = False
+        reused_fd: int | None = None
+
+        def close_source_then_reuse(candidate_fd: int) -> None:
+            nonlocal reused_fd, source_closed
+            descriptor_stat = os.fstat(candidate_fd)
+            descriptor_identity = (
+                descriptor_stat.st_dev,
+                descriptor_stat.st_ino,
+            )
+            if descriptor_identity == source_identity and not source_closed:
+                source_closed = True
+                actual_close(candidate_fd)
+                replacement = os.open(os.devnull, os.O_RDONLY)
+                if replacement != candidate_fd:
+                    os.dup2(replacement, candidate_fd)
+                    actual_close(replacement)
+                reused_fd = candidate_fd
+                os.kill(os.getpid(), signal.SIGINT)
+                return
+            actual_close(candidate_fd)
+
+        try:
+            with self.default_unblocked_sigint():
+                with mock.patch.object(
+                    project_journal.os,
+                    "close",
+                    side_effect=close_source_then_reuse,
+                ):
+                    with self.assertRaises(KeyboardInterrupt) as raised:
+                        owner.close(
+                            fd,
+                            context="reused descriptor close failed",
+                        )
+                    owner.close_all(primary=raised.exception)
+
+            self.assertTrue(source_closed)
+            self.assertEqual(owner.owned_fds, ())
+            self.assertIsNotNone(reused_fd)
+            assert reused_fd is not None
+            os.fstat(reused_fd)
+        finally:
+            if owner.owned_fds:
+                owner.close_all()
+            if reused_fd is not None:
+                try:
+                    actual_close(reused_fd)
+                except OSError:
+                    pass
+
+    @unittest.skipUnless(os.name == "posix", "POSIX signal-mask contract")
+    def test_repository_resolution_owner_preserves_close_error_over_pending_sigint(
+        self,
+    ) -> None:
+        owner = project_journal._RepositoryResolutionFdOwner(self.root)
+        flags = project_journal._repository_initial_directory_open_flags(self.root)
+        fd = owner.open(
+            self.root,
+            flags,
+            cleanup_context="dual failure descriptor cleanup failed",
+        )
+        actual_close = project_journal.os.close
+        close_count = 0
+        close_error = OSError(
+            errno.EIO,
+            "injected owner close failure before pending SIGINT restore",
+        )
+
+        def close_then_fail_with_pending_sigint(candidate_fd: int) -> None:
+            nonlocal close_count
+            self.assertEqual(candidate_fd, fd)
+            close_count += 1
+            actual_close(candidate_fd)
+            os.kill(os.getpid(), signal.SIGINT)
+            raise close_error
+
+        try:
+            with self.default_unblocked_sigint():
+                with mock.patch.object(
+                    project_journal.os,
+                    "close",
+                    side_effect=close_then_fail_with_pending_sigint,
+                ):
+                    with self.assertRaises(
+                        project_journal.RepositoryResolutionError,
+                    ) as raised:
+                        owner.close(
+                            fd,
+                            context="dual failure descriptor close failed",
+                        )
+
+            self.assertIs(raised.exception.__cause__, close_error)
+            self.assertEqual(raised.exception.errno, errno.EIO)
+            self.assertEqual(close_count, 1)
+            self.assertEqual(owner.owned_fds, ())
+            with self.assertRaises(OSError) as closed:
+                os.fstat(fd)
+            self.assertEqual(closed.exception.errno, errno.EBADF)
+            notes = "\n".join(getattr(raised.exception, "__notes__", ()))
+            self.assertIn("type=KeyboardInterrupt", notes)
+            self.assertEqual(notes.count("type=KeyboardInterrupt"), 1)
+        finally:
+            if owner.owned_fds:
+                owner.close_all()
+
+    @unittest.skipUnless(os.name == "posix", "POSIX signal-mask contract")
+    def test_repository_resolution_owner_dual_close_restore_failure_is_secondary_to_active_error(
+        self,
+    ) -> None:
+        owner = project_journal._RepositoryResolutionFdOwner(self.root)
+        flags = project_journal._repository_initial_directory_open_flags(self.root)
+        actual_close = project_journal.os.close
+        active_error = LegacyInterrupt(
+            "injected active repository-resolution interruption"
+        )
+        close_error = OSError(
+            errno.EIO,
+            "injected secondary owner close failure",
+        )
+        opened_fd: int | None = None
+        close_count = 0
+
+        def close_then_fail_with_pending_sigint(candidate_fd: int) -> None:
+            nonlocal close_count
+            self.assertEqual(candidate_fd, opened_fd)
+            close_count += 1
+            actual_close(candidate_fd)
+            os.kill(os.getpid(), signal.SIGINT)
+            raise close_error
+
+        try:
+            with self.default_unblocked_sigint():
+                with mock.patch.object(
+                    project_journal.os,
+                    "close",
+                    side_effect=close_then_fail_with_pending_sigint,
+                ):
+                    with self.assertRaises(LegacyInterrupt) as raised:
+                        with owner:
+                            opened_fd = owner.open(
+                                self.root,
+                                flags,
+                                cleanup_context=(
+                                    "active owner descriptor cleanup failed"
+                                ),
+                            )
+                            raise active_error
+
+            self.assertIs(raised.exception, active_error)
+            self.assertEqual(close_count, 1)
+            self.assertEqual(owner.owned_fds, ())
+            self.assertIsNotNone(opened_fd)
+            assert opened_fd is not None
+            with self.assertRaises(OSError) as closed:
+                os.fstat(opened_fd)
+            self.assertEqual(closed.exception.errno, errno.EBADF)
+            cleanup_errors = getattr(active_error, "cleanup_errors", ())
+            self.assertEqual(len(cleanup_errors), 1)
+            cleanup = cleanup_errors[0]
+            self.assertEqual(cleanup["error_type"], "OSError")
+            self.assertEqual(cleanup["errno"], errno.EIO)
+            self.assertEqual(cleanup["error_name"], "EIO")
+            self.assertIn(
+                "type=KeyboardInterrupt",
+                "\n".join(cleanup["details"]),
+            )
+            notes = "\n".join(getattr(active_error, "__notes__", ()))
+            self.assertIn("injected secondary owner close failure", notes)
+            self.assertIn("type=KeyboardInterrupt", notes)
+        finally:
+            if owner.owned_fds:
+                owner.close_all()
+
+    @unittest.skipUnless(os.name == "posix", "POSIX signal-mask contract")
+    def test_repository_resolution_owner_transient_mask_failure_uses_attempt_time_evidence(
+        self,
+    ) -> None:
+        owner = project_journal._RepositoryResolutionFdOwner(self.root)
+        flags = project_journal._repository_initial_directory_open_flags(self.root)
+        actual_block = project_journal._block_fd_close_signals
+        mask_failure = project_journal.UnsupportedPlatform(
+            "injected transient signal-mask acquisition failure"
+        )
+        block_calls = 0
+        opened_fd: int | None = None
+
+        def fail_once_then_block() -> project_journal._FdCloseSignalFence:
+            nonlocal block_calls
+            block_calls += 1
+            if block_calls == 1:
+                raise mask_failure
+            return actual_block()
+
+        with mock.patch.object(
+            project_journal,
+            "_block_fd_close_signals",
+            side_effect=fail_once_then_block,
+        ):
+            with self.assertRaises(
+                project_journal.RepositoryResolutionError,
+            ) as raised:
+                with owner:
+                    opened_fd = owner.open(
+                        self.root,
+                        flags,
+                        cleanup_context="transient mask descriptor cleanup failed",
+                    )
+
+        self.assertEqual(block_calls, 2)
+        self.assertIs(raised.exception.__cause__, mask_failure)
+        self.assertEqual(owner.owned_fds, ())
+        self.assertNotIn("descriptor remains owned", str(raised.exception))
+        self.assertIn(
+            "close could not begin during this cleanup attempt",
+            str(raised.exception),
+        )
+        self.assertNotIn(
+            "final context-exit drain incomplete",
+            "\n".join(getattr(raised.exception, "__notes__", ())),
+        )
+        self.assertIsNotNone(opened_fd)
+        assert opened_fd is not None
+        with self.assertRaises(OSError) as closed:
+            os.fstat(opened_fd)
+        self.assertEqual(closed.exception.errno, errno.EBADF)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX signal-mask contract")
+    def test_repository_resolution_owner_persistent_context_exit_records_final_boundary(
+        self,
+    ) -> None:
+        owner = project_journal._RepositoryResolutionFdOwner(self.root)
+        flags = project_journal._repository_initial_directory_open_flags(self.root)
+        failures: list[project_journal.UnsupportedPlatform] = []
+        opened_fd: int | None = None
+
+        def reject_signal_mask() -> project_journal._FdCloseSignalFence:
+            failure = project_journal.UnsupportedPlatform(
+                "injected persistent context-exit signal-mask failure"
+            )
+            failures.append(failure)
+            raise failure
+
+        try:
+            with mock.patch.object(
+                project_journal,
+                "_block_fd_close_signals",
+                side_effect=reject_signal_mask,
+            ):
+                with self.assertRaises(
+                    project_journal.RepositoryResolutionError,
+                ) as raised:
+                    with owner:
+                        opened_fd = owner.open(
+                            self.root,
+                            flags,
+                            cleanup_context=(
+                                "persistent context-exit descriptor cleanup failed"
+                            ),
+                        )
+
+            self.assertEqual(len(failures), 2)
+            self.assertIs(raised.exception.__cause__, failures[0])
+            self.assertIsNotNone(opened_fd)
+            assert opened_fd is not None
+            self.assertEqual(owner.owned_fds, (opened_fd,))
+            os.fstat(opened_fd)
+            notes = getattr(raised.exception, "__notes__", ())
+            final_boundary = (
+                "repository-resolution descriptor owner final context-exit drain "
+                "incomplete; 1 descriptors remained owned at that boundary"
+            )
+            self.assertEqual(notes.count(final_boundary), 1)
+        finally:
+            if owner.owned_fds:
+                owner.close_all()
+
+    def test_repository_resolution_owner_persistent_mask_failure_is_bounded(
+        self,
+    ) -> None:
+        owner = project_journal._RepositoryResolutionFdOwner(self.root)
+        flags = project_journal._repository_initial_directory_open_flags(self.root)
+        opened_fds = [
+            owner.open(
+                self.root,
+                flags,
+                cleanup_context=f"descriptor {index} cleanup failed",
+            )
+            for index in range(2)
+        ]
+        failures: list[project_journal.UnsupportedPlatform] = []
+
+        def reject_signal_mask() -> project_journal._FdCloseSignalFence:
+            failure = project_journal.UnsupportedPlatform(
+                "injected persistent signal-mask acquisition failure"
+            )
+            if not failures:
+                project_journal._add_exception_detail(
+                    failure,
+                    "injected bounded acquisition detail",
+                )
+            failures.append(failure)
+            raise failure
+
+        try:
+            with mock.patch.object(
+                project_journal,
+                "_block_fd_close_signals",
+                side_effect=reject_signal_mask,
+            ):
+                cleanup_error, cleanup_cause = owner.close_all()
+
+            self.assertEqual(len(failures), len(opened_fds))
+            self.assertIsNotNone(cleanup_error)
+            assert cleanup_error is not None
+            self.assertIs(cleanup_cause, failures[0])
+            self.assertEqual(
+                cleanup_error.resolution_reason,
+                "descriptor_close_failed",
+            )
+            self.assertNotIn("descriptor remains owned", str(cleanup_error))
+            self.assertIn(
+                "close could not begin during this cleanup attempt",
+                str(cleanup_error),
+            )
+            cleanup_notes = getattr(cleanup_error, "__notes__", ())
+            self.assertEqual(
+                sum(
+                    "injected bounded acquisition detail" in note
+                    for note in cleanup_notes
+                ),
+                1,
+            )
+            self.assertCountEqual(owner.owned_fds, opened_fds)
+            for fd in opened_fds:
+                os.fstat(fd)
+
+            owner.close_all(primary=cleanup_error)
+            self.assertEqual(owner.owned_fds, ())
+        finally:
+            if owner.owned_fds:
+                owner.close_all()
+
+    def test_repository_resolution_owner_mask_restore_failure_retires_fd(
+        self,
+    ) -> None:
+        owner = project_journal._RepositoryResolutionFdOwner(self.root)
+        flags = project_journal._repository_initial_directory_open_flags(self.root)
+        opened_fds = [
+            owner.open(
+                self.root,
+                flags,
+                cleanup_context=f"descriptor {index} cleanup failed",
+            )
+            for index in range(2)
+        ]
+        restore_failure = project_journal.UnsupportedPlatform(
+            "injected persistent signal-mask restoration failure"
+        )
+        signal_fence = mock.Mock(spec=project_journal._FdCloseSignalFence)
+        signal_fence.restore.side_effect = restore_failure
+
+        with mock.patch.object(
+            project_journal,
+            "_block_fd_close_signals",
+            return_value=signal_fence,
+        ):
+            cleanup_error, cleanup_cause = owner.close_all()
+
+        self.assertIsNotNone(cleanup_error)
+        assert cleanup_error is not None
+        self.assertIs(cleanup_cause, restore_failure)
+        self.assertEqual(
+            cleanup_error.resolution_reason,
+            "descriptor_close_failed",
+        )
+        self.assertEqual(signal_fence.restore.call_count, len(opened_fds))
+        self.assertEqual(owner.owned_fds, ())
+        for fd in opened_fds:
+            with self.assertRaises(OSError) as raised:
+                os.fstat(fd)
+            self.assertEqual(raised.exception.errno, errno.EBADF)
+
     def test_repository_resolution_owner_preserves_first_close_failure_across_drain_interrupt(
         self,
     ) -> None:
@@ -4626,9 +5859,7 @@ class ProjectJournalTests(unittest.TestCase):
             "before_cleanup_persist": (
                 "self._cleanup_failure = (cleanup_primary, cleanup_error)"
             ),
-            "after_cleanup_persist": (
-                "fd, (context, close_attempted) = next(iter(self._owned.items()))"
-            ),
+            "after_cleanup_persist": ("for fd in tuple(self._owned):"),
         }
         target_lines: dict[str, int] = {}
         for phase, target_source in target_sources.items():
@@ -4678,6 +5909,10 @@ class ProjectJournalTests(unittest.TestCase):
                         close_failure = OSError(
                             errno.EIO,
                             "injected first descriptor close failure",
+                        )
+                        project_journal._add_exception_detail(
+                            close_failure,
+                            "injected recovered close source detail",
                         )
                         raise close_failure
 
@@ -4744,6 +5979,18 @@ class ProjectJournalTests(unittest.TestCase):
                 self.assertCountEqual(close_calls, opened_fds)
                 self.assertEqual(len(close_calls), len(opened_fds))
                 self.assertEqual(owner.owned_fds, ())
+                notes = getattr(raised.exception, "__notes__", ())
+                self.assertEqual(
+                    sum(
+                        "injected recovered close source detail" in note
+                        for note in notes
+                    ),
+                    1,
+                )
+                self.assertLessEqual(
+                    len(notes),
+                    project_journal.MAX_DEFERRED_SIGNAL_REPORT_DETAILS,
+                )
                 self.assertEqual(len(raised.exception.cleanup_errors), 1)
                 self.assertIn(
                     str(drain_interrupt),

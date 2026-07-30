@@ -593,6 +593,111 @@ def _load_posix_signal_runtime() -> _PosixSignalRuntime:
     return runtime
 
 
+@dataclasses.dataclass(frozen=True)
+class _FdCloseSignalFence:
+    """Delay process-managed signal delivery until FD ownership is retired."""
+
+    pthread_sigmask: Callable[[int, set[int]], Any]
+    sig_setmask: int
+    previous_mask: set[int]
+
+    def restore(self) -> None:
+        try:
+            self.pthread_sigmask(self.sig_setmask, self.previous_mask)
+        except (OSError, ValueError) as exc:
+            failure = UnsupportedPlatform(
+                f"POSIX descriptor-close signal-mask restoration failed: {exc}"
+            )
+            _add_exception_details(
+                failure,
+                _exception_evidence_details(
+                    exc,
+                    context=(
+                        "descriptor-close signal-mask restoration underlying failure"
+                    ),
+                ),
+            )
+            raise failure from exc
+
+
+def _block_fd_close_signals() -> _FdCloseSignalFence:
+    """Fence signals whose handlers can interrupt the Python close handoff."""
+
+    if os.name != "posix":
+        raise UnsupportedPlatform(
+            "descriptor-close ownership requires POSIX signal masking"
+        )
+    pthread_sigmask = getattr(signal, "pthread_sigmask", None)
+    sig_block = getattr(signal, "SIG_BLOCK", None)
+    sig_setmask = getattr(signal, "SIG_SETMASK", None)
+    sigint = getattr(signal, "SIGINT", None)
+    if (
+        not callable(pthread_sigmask)
+        or not isinstance(sig_block, int)
+        or not isinstance(sig_setmask, int)
+        or not isinstance(sigint, int)
+    ):
+        raise UnsupportedPlatform(
+            "descriptor-close ownership requires pthread_sigmask and SIGINT"
+        )
+    close_signals = set(_termination_signals())
+    close_signals.add(sigint)
+    try:
+        entry_mask = {int(value) for value in pthread_sigmask(sig_block, set())}
+    except (OSError, ValueError) as exc:
+        failure = UnsupportedPlatform(
+            f"POSIX descriptor-close entry-mask query failed: {exc}"
+        )
+        _propagate_bounded_exception_notes(
+            failure,
+            exc,
+            context="descriptor-close entry-mask query",
+        )
+        raise failure from exc
+    try:
+        previous_mask = {
+            int(value) for value in pthread_sigmask(sig_block, close_signals)
+        }
+    except BaseException as exc:
+        rollback_error: BaseException | None = None
+        try:
+            pthread_sigmask(sig_setmask, entry_mask)
+        except BaseException as rollback_exc:
+            rollback_error = rollback_exc
+        if isinstance(exc, (OSError, ValueError)):
+            failure = UnsupportedPlatform(
+                f"POSIX descriptor-close signal-mask acquisition failed: {exc}"
+            )
+            if rollback_error is not None:
+                _add_exception_detail(
+                    failure,
+                    _bounded_signal_report_detail(
+                        "POSIX descriptor-close entry-mask rollback failed: "
+                        f"{rollback_error}; thread signal-mask state is unverified"
+                    ),
+                )
+            _propagate_bounded_exception_notes(
+                failure,
+                exc,
+                context="descriptor-close signal-mask acquisition",
+            )
+            raise failure from exc
+        if rollback_error is not None:
+            _add_exception_detail(
+                exc,
+                _bounded_signal_report_detail(
+                    "POSIX descriptor-close entry-mask rollback failed: "
+                    f"{rollback_error}; thread signal-mask state is unverified"
+                ),
+            )
+        raise
+    return _FdCloseSignalFence(
+        pthread_sigmask=pthread_sigmask,
+        sig_setmask=sig_setmask,
+        previous_mask=previous_mask,
+    )
+
+
 @dataclasses.dataclass
 class _DeferredTerminationState:
     """Record one terminal signal and defer propagation until cleanup finishes."""
@@ -925,22 +1030,24 @@ def _add_exception_details(
     error: BaseException,
     details: Iterable[object],
 ) -> None:
-    additions = [_bounded_signal_report_detail(detail) for detail in details]
-    if not additions:
-        return
+    existing = getattr(error, "__notes__", ())
+    existing_notes = (
+        [note for note in existing if isinstance(note, str)]
+        if isinstance(existing, (list, tuple))
+        else []
+    )
+    unique_existing = list(dict.fromkeys(existing_notes))
+    additions = list(
+        dict.fromkeys(_bounded_signal_report_detail(detail) for detail in details)
+    )
     if len(additions) > MAX_DEFERRED_SIGNAL_REPORT_DETAILS:
         additions = [
             *additions[: MAX_DEFERRED_SIGNAL_REPORT_DETAILS - 1],
             additions[-1],
         ]
-    existing = getattr(error, "__notes__", ())
-    notes = (
-        [note for note in existing if isinstance(note, str)]
-        if isinstance(existing, (list, tuple))
-        else []
-    )
+    additions = [detail for detail in additions if detail not in unique_existing]
     retained = max(0, MAX_DEFERRED_SIGNAL_REPORT_DETAILS - len(additions))
-    notes = [*notes[:retained], *additions]
+    notes = [*unique_existing[:retained], *additions]
     try:
         error.__notes__ = notes
         return
@@ -948,12 +1055,93 @@ def _add_exception_details(
         add_note = getattr(error, "add_note", None)
         if not callable(add_note):
             return
-    for detail in additions:
+    available = max(
+        0,
+        MAX_DEFERRED_SIGNAL_REPORT_DETAILS - len(existing_notes),
+    )
+    for detail in additions[:available]:
         add_note(detail)
 
 
 def _add_exception_detail(error: BaseException, detail: object) -> None:
     _add_exception_details(error, (detail,))
+
+
+def _propagate_bounded_exception_notes(
+    target: BaseException,
+    source: BaseException,
+    *,
+    context: str,
+) -> None:
+    prefix = f"{context}: "
+    existing = {
+        _bounded_signal_report_detail(note)
+        for note in getattr(target, "__notes__", ())
+        if isinstance(note, str)
+    }
+    source_notes = list(
+        dict.fromkeys(
+            note for note in getattr(source, "__notes__", ()) if isinstance(note, str)
+        )
+    )
+    if len(source_notes) > MAX_DEFERRED_SIGNAL_REPORT_DETAILS:
+        source_notes = [
+            *source_notes[: MAX_DEFERRED_SIGNAL_REPORT_DETAILS - 1],
+            source_notes[-1],
+        ]
+    additions: list[str] = []
+    for raw_note in source_notes:
+        note = _bounded_signal_report_detail(raw_note)
+        if not note.startswith(prefix):
+            note = _bounded_signal_report_detail(f"{prefix}{note}")
+        if note in existing or note in additions:
+            continue
+        additions.append(note)
+    _add_exception_details(target, additions)
+
+
+def _exception_evidence_details(
+    error: BaseException,
+    *,
+    context: str,
+) -> list[str]:
+    attributes = [f"type={type(error).__name__}"]
+    error_number = getattr(error, "errno", None)
+    if isinstance(error_number, int):
+        error_name = errno.errorcode.get(error_number)
+        errno_label = f"errno={error_number}"
+        if error_name is not None:
+            errno_label += f" ({error_name})"
+        attributes.append(errno_label)
+    message = _bounded_signal_report_detail(error)
+    if message:
+        attributes.append(f"message={message}")
+    details = [_bounded_signal_report_detail(f"{context}: {', '.join(attributes)}")]
+    details.extend(
+        _bounded_signal_report_detail(note)
+        for note in getattr(error, "__notes__", ())
+        if isinstance(note, str)
+    )
+    return details[:MAX_DEFERRED_SIGNAL_REPORT_DETAILS]
+
+
+def _merge_fd_close_restore_error(
+    close_error: BaseException | None,
+    restore_error: BaseException | None,
+    *,
+    context: str,
+) -> BaseException | None:
+    if close_error is None:
+        return restore_error
+    if restore_error is not None:
+        _add_exception_details(
+            close_error,
+            _exception_evidence_details(
+                restore_error,
+                context=f"{context} signal-mask restoration also failed",
+            ),
+        )
+    return close_error
 
 
 def _exception_details(
@@ -2012,22 +2200,83 @@ def _prepare_git_runtime_launch(
     def close_source(active_error: BaseException | None) -> None:
         nonlocal source_fd
 
-        if source_fd is None:
-            return
-        fd = source_fd
-        source_fd = None
+        def attempt_close() -> None:
+            nonlocal source_fd
+
+            if source_fd is None:
+                return
+            fd = source_fd
+            signal_fence = _block_fd_close_signals()
+            close_committed = False
+            close_error: BaseException | None = None
+            restore_error: BaseException | None = None
+            try:
+                # Once this state is committed, the selected process signals
+                # cannot run Python until the numeric FD has been retired.
+                close_committed = True
+                try:
+                    os.close(fd)
+                except BaseException as exc:
+                    close_error = exc
+            finally:
+                if close_committed:
+                    # POSIX close failure leaves descriptor reuse uncertain.
+                    # Retire before restoring a mask that may deliver SIGINT.
+                    source_fd = None
+                try:
+                    signal_fence.restore()
+                except BaseException as exc:
+                    restore_error = exc
+            selected_error = _merge_fd_close_restore_error(
+                close_error,
+                restore_error,
+                context="Git launch preparation source descriptor close",
+            )
+            if selected_error is not None:
+                raise selected_error.with_traceback(selected_error.__traceback__)
+
         try:
-            os.close(fd)
+            attempt_close()
         except BaseException as cleanup_error:
+            if source_fd is not None:
+                # The first exception happened before the close attempt was
+                # committed under the signal fence. Ownership is authoritative,
+                # so one drain attempt remains safe and cannot double-close.
+                try:
+                    attempt_close()
+                except BaseException as drain_error:
+                    _add_exception_detail(
+                        cleanup_error,
+                        _bounded_signal_report_detail(
+                            "Git launch preparation source descriptor owner "
+                            f"drain failed: {drain_error}"
+                        ),
+                    )
+            if source_fd is not None:
+                _add_exception_detail(
+                    cleanup_error,
+                    "Git launch preparation source descriptor remains owned "
+                    "after an interrupted pre-close drain",
+                )
             detail = _bounded_signal_report_detail(
                 "Git launch preparation source descriptor cleanup failed: "
                 f"{cleanup_error}"
             )
             if active_error is not None:
-                _add_exception_detail(active_error, detail)
+                _record_rollout_cleanup_error(
+                    active_error,
+                    context=("Git launch preparation source descriptor cleanup failed"),
+                    cleanup_error=cleanup_error,
+                )
                 return
             if isinstance(cleanup_error, Exception):
-                raise UnsupportedGitVersion(detail) from cleanup_error
+                wrapped = UnsupportedGitVersion(detail)
+                _propagate_bounded_exception_notes(
+                    wrapped,
+                    cleanup_error,
+                    context=("Git launch preparation source descriptor cleanup"),
+                )
+                raise wrapped from cleanup_error
             _add_exception_detail(cleanup_error, detail)
             raise
 
@@ -7910,6 +8159,7 @@ def _record_rollout_cleanup_error(
         message = message[:MAX_DISCOVERY_ERROR_DETAIL_CHARS] + "…[truncated]"
     evidence: dict[str, Any] = {
         "context": context,
+        "error_type": type(cleanup_error).__name__,
         "message": message,
     }
     error_number = getattr(cleanup_error, "errno", None)
@@ -9741,6 +9991,11 @@ class _RepositoryResolutionFdOwner:
                             None,
                         ),
                     )
+                    _propagate_bounded_exception_notes(
+                        recovered_primary,
+                        interrupted_close_error,
+                        context=("repository-resolution descriptor close recovery"),
+                    )
                     self._cleanup_failure = (
                         recovered_primary,
                         interrupted_close_error,
@@ -9757,6 +10012,7 @@ class _RepositoryResolutionFdOwner:
             if selected_primary is not None:
                 if cleanup_interrupt is selected_primary:
                     self.close_all(primary=selected_primary)
+                    self._record_final_context_exit_owned_state(selected_primary)
                     raise
                 _record_rollout_cleanup_error(
                     selected_primary,
@@ -9764,12 +10020,30 @@ class _RepositoryResolutionFdOwner:
                     cleanup_error=cleanup_interrupt,
                 )
                 self.close_all(primary=selected_primary)
+                self._record_final_context_exit_owned_state(selected_primary)
                 if active_error is None:
                     assert self._cleanup_failure is not None
                     raise selected_primary from self._cleanup_failure[1]
             else:
                 self.close_all(primary=cleanup_interrupt)
+                self._record_final_context_exit_owned_state(cleanup_interrupt)
                 raise
+        else:
+            if active_error is not None:
+                self._record_final_context_exit_owned_state(active_error)
+
+    def _record_final_context_exit_owned_state(
+        self,
+        primary: BaseException,
+    ) -> None:
+        if not self._owned:
+            return
+        _add_exception_detail(
+            primary,
+            "repository-resolution descriptor owner final context-exit drain "
+            f"incomplete; {len(self._owned)} descriptors remained owned at that "
+            "boundary",
+        )
 
     @property
     def owned_fds(self) -> tuple[int, ...]:
@@ -9803,7 +10077,7 @@ class _RepositoryResolutionFdOwner:
             raise
         return opened_fd
 
-    def _begin_close_attempt(self, fd: int) -> int:
+    def _commit_close_attempt_under_signal_fence(self, fd: int) -> None:
         if fd not in self._owned:
             raise AssertionError(f"repository-resolution descriptor {fd} is not owned")
         context, close_attempted = self._owned[fd]
@@ -9813,21 +10087,42 @@ class _RepositoryResolutionFdOwner:
             )
         self._close_ambient_error = sys.exc_info()[1]
         self._close_recovery_eligible = True
-        return self._owned.__setitem__(fd, (context, True)) or fd
+        self._owned[fd] = (context, True)
 
     def _close_owned_fd(self, fd: int) -> None:
+        signal_fence = _block_fd_close_signals()
+        close_committed = False
+        close_error: BaseException | None = None
+        restore_error: BaseException | None = None
         try:
-            os.close(self._begin_close_attempt(fd))
-        except BaseException:
-            raise
-        else:
-            self._close_recovery_eligible = False
+            # The owner transition and kernel close dispatch share one
+            # signal-fenced region. Before this commit the FD remains retryable;
+            # after it, POSIX close results are reuse-uncertain and never retried.
+            self._commit_close_attempt_under_signal_fence(fd)
+            close_committed = True
+            try:
+                os.close(fd)
+            except BaseException as exc:
+                close_error = exc
+            else:
+                self._close_recovery_eligible = False
+        except BaseException as exc:
+            close_error = exc
         finally:
-            # POSIX close failure leaves descriptor reuse uncertain. Never retry
-            # the same numeric descriptor after a close attempt.
-            owned_record = self._owned.get(fd)
-            if owned_record is not None and owned_record[1]:
+            if close_committed:
+                # Retire before restoring a mask that may deliver SIGINT.
                 self._owned.pop(fd, None)
+            try:
+                signal_fence.restore()
+            except BaseException as exc:
+                restore_error = exc
+        selected_error = _merge_fd_close_restore_error(
+            close_error,
+            restore_error,
+            context="repository-resolution descriptor close",
+        )
+        if selected_error is not None:
+            raise selected_error.with_traceback(selected_error.__traceback__)
 
     def close(self, fd: int, *, context: str) -> None:
         try:
@@ -9835,12 +10130,18 @@ class _RepositoryResolutionFdOwner:
         except BaseException as close_error:
             if not isinstance(close_error, Exception):
                 raise
-            raise RepositoryResolutionError(
+            wrapped = RepositoryResolutionError(
                 self.source_path,
                 f"{context}: {close_error}",
                 resolution_reason="descriptor_close_failed",
                 error_number=getattr(close_error, "errno", None),
-            ) from close_error
+            )
+            _propagate_bounded_exception_notes(
+                wrapped,
+                close_error,
+                context=context,
+            )
+            raise wrapped from close_error
 
     def close_all(
         self,
@@ -9854,8 +10155,15 @@ class _RepositoryResolutionFdOwner:
                 self._cleanup_failure[0] if self._cleanup_failure is not None else None
             )
         )
-        while self._owned:
-            fd, (context, close_attempted) = next(iter(self._owned.items()))
+        # One drain invocation visits each descriptor that it owned on entry at
+        # most once. A persistent signal-mask acquisition failure therefore
+        # remains explicit in `_owned` instead of spinning or falsely retiring
+        # an FD whose kernel close was never dispatched.
+        for fd in tuple(self._owned):
+            owned_state = self._owned.get(fd)
+            if owned_state is None:
+                continue
+            context, close_attempted = owned_state
             if close_attempted:
                 self._owned.pop(fd, None)
                 continue
@@ -9864,13 +10172,32 @@ class _RepositoryResolutionFdOwner:
             except BaseException as cleanup_error:
                 if selected_primary is None:
                     if not isinstance(cleanup_error, Exception):
-                        self.close_all(primary=cleanup_error)
+                        if self._owned.get(fd) == (context, False):
+                            _add_exception_detail(
+                                cleanup_error,
+                                _bounded_signal_report_detail(
+                                    f"{context}: close could not begin during this "
+                                    "cleanup attempt; ownership remained registered "
+                                    "at that attempt boundary"
+                                ),
+                            )
                         raise
+                    cleanup_detail = f"{context}: {cleanup_error}"
+                    if self._owned.get(fd) == (context, False):
+                        cleanup_detail = (
+                            f"{context}: close could not begin during this cleanup "
+                            f"attempt: {cleanup_error}"
+                        )
                     cleanup_primary = RepositoryResolutionError(
                         self.source_path,
-                        f"{context}: {cleanup_error}",
+                        cleanup_detail,
                         resolution_reason="descriptor_close_failed",
                         error_number=getattr(cleanup_error, "errno", None),
+                    )
+                    _propagate_bounded_exception_notes(
+                        cleanup_primary,
+                        cleanup_error,
+                        context=context,
                     )
                     self._cleanup_failure = (cleanup_primary, cleanup_error)
                     self._close_recovery_eligible = False
@@ -9880,6 +10207,26 @@ class _RepositoryResolutionFdOwner:
                         selected_primary,
                         context=context,
                         cleanup_error=cleanup_error,
+                    )
+                if (
+                    self._owned.get(fd) == (context, False)
+                    and self._cleanup_failure is None
+                ):
+                    incomplete_cleanup = RepositoryResolutionError(
+                        self.source_path,
+                        f"{context}: close could not begin during this cleanup "
+                        f"attempt: {cleanup_error}",
+                        resolution_reason="descriptor_close_failed",
+                        error_number=getattr(cleanup_error, "errno", None),
+                    )
+                    _propagate_bounded_exception_notes(
+                        incomplete_cleanup,
+                        cleanup_error,
+                        context=context,
+                    )
+                    self._cleanup_failure = (
+                        incomplete_cleanup,
+                        cleanup_error,
                     )
         if self._cleanup_failure is None:
             return None, None
