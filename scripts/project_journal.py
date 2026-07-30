@@ -118,12 +118,12 @@ MAX_LINUX_PROC_GROUP_SCAN_PIDS = 131_072
 MAX_LINUX_PROC_STAT_BYTES = 4096
 DARWIN_SA_NOCLDWAIT = 0x0020
 LINUX_SA_NOCLDWAIT = 0x00000002
-# Linux x86_64/AArch64 libc-private signal trampoline metadata.
+# Linux x86_64/AArch64 glibc-private signal trampoline metadata.
 LINUX_SA_RESTORER = 0x04000000
 LINUX_SIGSET_BYTES = 128
 LINUX_SIGACTION_REVIEWED_MULTIARCH = {
-    "aarch64": frozenset({"aarch64-linux-gnu", "aarch64-linux-musl"}),
-    "x86_64": frozenset({"x86_64-linux-gnu", "x86_64-linux-musl"}),
+    "aarch64": frozenset({"aarch64-linux-gnu"}),
+    "x86_64": frozenset({"x86_64-linux-gnu"}),
 }
 MINIMUM_GIT_VERSION = (2, 45, 0)
 GIT_VERSION_RE = re.compile(
@@ -4307,7 +4307,7 @@ class _LinuxSigset(ctypes.Structure):
 
 
 class _LinuxSigaction(ctypes.Structure):
-    """The libc struct sigaction layout for supported 64-bit Linux ABIs."""
+    """The glibc struct sigaction layout for supported 64-bit Linux ABIs."""
 
     _fields_ = (
         ("handler", ctypes.c_void_p),

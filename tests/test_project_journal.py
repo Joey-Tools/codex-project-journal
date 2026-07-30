@@ -8697,53 +8697,72 @@ class ProjectJournalTests(unittest.TestCase):
         project_journal,
         "_require_process_status_observation_support",
     )
-    def test_unreviewed_linux_multiarch_fails_before_popen_or_libc_call(
+    def test_unreviewed_and_musl_linux_multiarch_fail_before_native_operations(
         self,
         status_support: mock.Mock,
     ) -> None:
-        uname = mock.Mock(machine="x86_64")
-        implementation = mock.Mock(_multiarch="x86_64-linux-unknown")
-        with mock.patch.object(project_journal.sys, "platform", "linux"):
-            with mock.patch.object(
-                project_journal.sys,
-                "implementation",
-                implementation,
-            ):
-                with mock.patch.object(
-                    project_journal.signal,
-                    "getsignal",
-                    return_value=signal.SIG_DFL,
-                ):
+        rejected_abis = (
+            ("x86_64", "x86_64-linux-unknown"),
+            ("x86_64", "x86_64-linux-musl"),
+            ("aarch64", "aarch64-linux-musl"),
+        )
+        for machine, multiarch in rejected_abis:
+            with self.subTest(machine=machine, multiarch=multiarch):
+                uname = mock.Mock(machine=machine)
+                implementation = mock.Mock(_multiarch=multiarch)
+                with mock.patch.object(project_journal.sys, "platform", "linux"):
                     with mock.patch.object(
-                        project_journal.os,
-                        "uname",
-                        return_value=uname,
+                        project_journal.sys,
+                        "implementation",
+                        implementation,
                     ):
                         with mock.patch.object(
-                            project_journal.ctypes,
-                            "CDLL",
-                        ) as cdll:
+                            project_journal.signal,
+                            "getsignal",
+                            return_value=signal.SIG_DFL,
+                        ):
                             with mock.patch.object(
-                                project_journal.subprocess,
-                                "Popen",
-                            ) as popen:
-                                with self.assertRaises(
-                                    project_journal._WaitableSigchldUnavailable
-                                ) as raised:
-                                    self.capture_process(
-                                        [
-                                            sys.executable,
-                                            "-c",
-                                            "raise SystemExit(7)",
-                                        ],
-                                        timeout_seconds=5,
-                                        stdout_limit=1024,
-                                    )
+                                project_journal.os,
+                                "uname",
+                                return_value=uname,
+                            ):
+                                with mock.patch.object(
+                                    project_journal.ctypes,
+                                    "CDLL",
+                                ) as cdll:
+                                    with mock.patch.object(
+                                        project_journal.subprocess,
+                                        "Popen",
+                                    ) as popen:
+                                        with mock.patch.object(
+                                            project_journal.os,
+                                            "killpg",
+                                        ) as killpg:
+                                            with self.assertRaises(
+                                                project_journal._WaitableSigchldUnavailable
+                                            ) as raised:
+                                                self.capture_process(
+                                                    [
+                                                        sys.executable,
+                                                        "-c",
+                                                        "raise SystemExit(7)",
+                                                    ],
+                                                    timeout_seconds=5,
+                                                    stdout_limit=1024,
+                                                )
 
-        self.assertIn("no reviewed sigaction layout", str(raised.exception))
-        status_support.assert_called_once_with()
-        cdll.assert_not_called()
-        popen.assert_not_called()
+                self.assertIn(
+                    "no reviewed sigaction layout",
+                    str(raised.exception),
+                )
+                cdll.assert_not_called()
+                popen.assert_not_called()
+                killpg.assert_not_called()
+
+        self.assertEqual(
+            status_support.call_args_list,
+            [mock.call()] * len(rejected_abis),
+        )
 
     @unittest.skipUnless(os.name == "posix", "Linux SA_NOCLDWAIT contract")
     def test_linux_no_cldwait_after_spawn_loses_numeric_group_identity(
