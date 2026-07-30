@@ -1364,22 +1364,44 @@ class _GitRuntime:
     snapshot_owner: tempfile.TemporaryDirectory[str]
 
 
+@dataclasses.dataclass(frozen=True)
+class _GitLaunchPathEntry:
+    path: pathlib.Path
+    marker_identity: tuple[int, ...]
+    target_identity: tuple[int, int, int, int, int]
+
+
+@dataclasses.dataclass
+class _BoundGitLaunchDirectory:
+    path: pathlib.Path
+    fd: int
+    identity: tuple[int, int, int, int, int]
+    parent_fd: int | None
+    component: str | None
+    owner_private: bool
+    path_anchor: bool = False
+    path_anchor_entries: tuple[_GitLaunchPathEntry, ...] = ()
+
+
 @dataclasses.dataclass
 class _GitLaunchCopy:
     executable: pathlib.Path
     directory: pathlib.Path
     source_argv0: pathlib.Path
+    ancestors: tuple[_BoundGitLaunchDirectory, ...]
+    directory_identity: tuple[int, int, int, int, int] | None = None
+    executable_identity: tuple[int, ...] | None = None
     cleanup_safe: bool = dataclasses.field(default=False, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.directory_identity is None and self.ancestors:
+            self.directory_identity = self.ancestors[-1].identity
 
     def mark_cleanup_safe(self) -> None:
         self.cleanup_safe = True
 
     def cleanup(self) -> None:
-        try:
-            os.chmod(self.directory, 0o700)
-        except FileNotFoundError:
-            return
-        shutil.rmtree(self.directory)
+        _cleanup_bound_git_launch(self)
 
 
 def _report_git_launch_issue(
@@ -1406,10 +1428,712 @@ def _cleanup_git_launch_after_terminal(
     except BaseException as exc:
         _report_git_launch_issue(
             active_error,
-            f"{operation} launch-copy cleanup-incomplete at locator "
-            f"{launch.directory}: {exc}",
+            f"{operation} launch-copy cleanup-incomplete; "
+            f"{_git_launch_retention_evidence(launch)}: {exc}",
             cause=exc,
         )
+
+
+def _validate_git_launch_directory_stat(
+    path: pathlib.Path,
+    value: os.stat_result,
+    *,
+    owner_private: bool,
+) -> tuple[int, int, int, int, int]:
+    if not stat.S_ISDIR(value.st_mode):
+        raise OSError(f"Git launch path component is not a directory: {path}")
+    mode = stat.S_IMODE(value.st_mode)
+    if owner_private:
+        if value.st_uid != os.geteuid() or mode not in {0o500, 0o700}:
+            raise OSError(
+                f"command-private Git launch directory access policy changed: {path}"
+            )
+    else:
+        if value.st_uid not in {0, os.geteuid()}:
+            raise OSError(
+                "Git launch temporary path component is not owned by root or "
+                f"the current user: {path}"
+            )
+        if mode & 0o022 and not mode & stat.S_ISVTX:
+            raise OSError(
+                "Git launch temporary path component is group/world writable "
+                f"without the sticky bit: {path}"
+            )
+    return _directory_identity(value)
+
+
+def _git_launch_anchor_entry_identity(value: os.stat_result) -> tuple[int, ...]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        stat.S_IFMT(value.st_mode),
+        value.st_uid,
+        value.st_gid,
+        stat.S_IMODE(value.st_mode),
+    )
+
+
+def _inspect_git_launch_path_entry(path: pathlib.Path) -> _GitLaunchPathEntry:
+    marker = os.stat(path, follow_symlinks=False)
+    marker_identity = _git_launch_anchor_entry_identity(marker)
+    marker_type = stat.S_IFMT(marker.st_mode)
+    if marker.st_uid not in {0, os.geteuid()}:
+        raise OSError(
+            "Git launch lexical path entry is not owned by root or the current "
+            f"user: {path}"
+        )
+    if marker_type not in {stat.S_IFDIR, stat.S_IFLNK}:
+        raise OSError(
+            f"Git launch lexical path entry is not a directory or symlink: {path}"
+        )
+    flags = (
+        os.O_RDONLY
+        | _required_open_flag("O_DIRECTORY")
+        | getattr(os, "O_CLOEXEC", 0)
+        | _required_open_flag("O_NONBLOCK")
+    )
+    if marker_type == stat.S_IFDIR:
+        flags |= _required_open_flag("O_NOFOLLOW")
+    fd = os.open(path, flags)
+    active_error: BaseException | None = None
+    try:
+        target_identity = _validate_git_launch_directory_stat(
+            path,
+            os.fstat(fd),
+            owner_private=False,
+        )
+        linked_identity = _validate_git_launch_directory_stat(
+            path,
+            os.stat(path),
+            owner_private=False,
+        )
+        if target_identity != linked_identity:
+            raise OSError(
+                f"Git launch lexical path entry changed while being bound: {path}"
+            )
+        _reject_runtime_extended_acl(
+            fd,
+            path,
+            "Git launch lexical path entry",
+        )
+    except BaseException as exc:
+        active_error = exc
+        raise
+    finally:
+        _close_git_launch_descriptor(
+            fd,
+            active_error,
+            context="Git launch lexical path inspection",
+        )
+    return _GitLaunchPathEntry(
+        path=path,
+        marker_identity=marker_identity,
+        target_identity=target_identity,
+    )
+
+
+def _bind_git_launch_lexical_path(
+    root: pathlib.Path,
+) -> tuple[_GitLaunchPathEntry, ...]:
+    entries: list[_GitLaunchPathEntry] = []
+    current = pathlib.Path(os.sep)
+    entries.append(_inspect_git_launch_path_entry(current))
+    for component in root.parts[1:]:
+        current /= component
+        entries.append(_inspect_git_launch_path_entry(current))
+    return tuple(entries)
+
+
+def _revalidate_git_launch_lexical_path(
+    entries: tuple[_GitLaunchPathEntry, ...],
+) -> None:
+    if not entries:
+        raise OSError("Git launch lexical path binding is empty")
+    for expected in entries:
+        observed = _inspect_git_launch_path_entry(expected.path)
+        if (
+            observed.marker_identity != expected.marker_identity
+            or observed.target_identity != expected.target_identity
+        ):
+            raise OSError(f"Git launch lexical path entry changed: {expected.path}")
+
+
+def _close_git_launch_descriptor(
+    fd: int,
+    active_error: BaseException | None,
+    *,
+    context: str,
+) -> None:
+    try:
+        os.close(fd)
+    except BaseException as close_error:
+        details = _exception_evidence_details(
+            close_error,
+            context=f"{context} descriptor cleanup failed",
+        )
+        if active_error is not None:
+            _add_exception_details(active_error, details)
+            return
+        if not isinstance(close_error, Exception):
+            _add_exception_details(close_error, details)
+            raise
+        failure = OSError(details[0])
+        _add_exception_details(failure, details[1:])
+        raise failure from close_error
+
+
+def _close_bound_git_launch_directories(
+    ancestors: tuple[_BoundGitLaunchDirectory, ...],
+    active_error: BaseException | None,
+) -> None:
+    close_errors: list[BaseException] = []
+    for ancestor in reversed(ancestors):
+        if ancestor.fd < 0:
+            continue
+        fd = ancestor.fd
+        try:
+            os.close(fd)
+        except BaseException as exc:
+            close_errors.append(exc)
+        finally:
+            # POSIX leaves descriptor ownership uncertain after a close error.
+            # Retire the numeric value so cleanup cannot close a reused FD.
+            ancestor.fd = -1
+    if not close_errors:
+        return
+    details: list[str] = []
+    for index, close_error in enumerate(close_errors, start=1):
+        details.extend(
+            _exception_evidence_details(
+                close_error,
+                context=f"Git launch path descriptor cleanup {index} failed",
+            )
+        )
+    if active_error is not None:
+        _add_exception_details(active_error, details)
+        return
+    if not isinstance(close_errors[0], Exception):
+        _add_exception_details(close_errors[0], details)
+        raise close_errors[0].with_traceback(close_errors[0].__traceback__)
+    failure = UserError(details[0])
+    _add_exception_details(failure, details[1:])
+    raise failure from close_errors[0]
+
+
+def _git_launch_retention_evidence(launch: _GitLaunchCopy) -> str:
+    try:
+        _revalidate_bound_git_launch_directories(launch.ancestors)
+        if launch.executable_identity is not None:
+            leaf = launch.ancestors[-1]
+            linked = _validate_git_launch_executable_stat(
+                os.stat("git", dir_fd=leaf.fd, follow_symlinks=False)
+            )
+            if linked != launch.executable_identity:
+                raise OSError("command-private Git launch changed before retention")
+    except BaseException as exc:
+        identity: object = launch.directory_identity or "unavailable"
+        return _bounded_signal_report_detail(
+            "retained launch path is unverified; original path hint: "
+            f"{launch.directory}; directory identity: {identity}; "
+            f"path revalidation failed: {exc}"
+        )
+    return f"retained launch locator: {launch.directory}"
+
+
+def _revalidate_bound_git_launch_directories(
+    ancestors: tuple[_BoundGitLaunchDirectory, ...],
+    *,
+    include_leaf: bool = True,
+) -> None:
+    selected = ancestors if include_leaf else ancestors[:-1]
+    if not selected:
+        raise OSError("Git launch path descriptor chain is empty")
+    for index, ancestor in enumerate(selected):
+        if ancestor.fd < 0:
+            raise OSError("Git launch path descriptor ownership was already retired")
+        descriptor_identity = _validate_git_launch_directory_stat(
+            ancestor.path,
+            os.fstat(ancestor.fd),
+            owner_private=ancestor.owner_private,
+        )
+        linked_identity = descriptor_identity
+        if index == 0:
+            linked = os.stat(os.sep, follow_symlinks=False)
+            linked_identity = _validate_git_launch_directory_stat(
+                pathlib.Path(os.sep),
+                linked,
+                owner_private=False,
+            )
+        elif ancestor.component is not None:
+            parent = selected[index - 1]
+            if ancestor.parent_fd != parent.fd or parent.fd < 0:
+                raise OSError("Git launch path descriptor chain is inconsistent")
+            linked = os.stat(
+                ancestor.component,
+                dir_fd=parent.fd,
+                follow_symlinks=False,
+            )
+            linked_identity = _validate_git_launch_directory_stat(
+                ancestor.path,
+                linked,
+                owner_private=ancestor.owner_private,
+            )
+        else:
+            parent = selected[index - 1]
+            rebound_parent_fd = os.open(
+                "..",
+                os.O_RDONLY
+                | _required_open_flag("O_DIRECTORY")
+                | getattr(os, "O_CLOEXEC", 0)
+                | _required_open_flag("O_NOFOLLOW")
+                | _required_open_flag("O_NONBLOCK"),
+                dir_fd=ancestor.fd,
+            )
+            active_error: BaseException | None = None
+            try:
+                rebound_parent_identity = _validate_git_launch_directory_stat(
+                    parent.path,
+                    os.fstat(rebound_parent_fd),
+                    owner_private=parent.owner_private,
+                )
+            except BaseException as exc:
+                active_error = exc
+                raise
+            finally:
+                _close_git_launch_descriptor(
+                    rebound_parent_fd,
+                    active_error,
+                    context="Git launch parent relationship revalidation",
+                )
+            if rebound_parent_identity != parent.identity:
+                raise OSError(
+                    f"Git launch path parent relationship changed: {ancestor.path}"
+                )
+        if ancestor.path_anchor:
+            _revalidate_git_launch_lexical_path(ancestor.path_anchor_entries)
+            anchored_identity = _validate_git_launch_directory_stat(
+                ancestor.path,
+                os.stat(ancestor.path),
+                owner_private=ancestor.owner_private,
+            )
+            if anchored_identity != ancestor.identity:
+                raise OSError(
+                    "Git launch anchored path identity or access policy changed: "
+                    f"{ancestor.path}"
+                )
+        if (
+            descriptor_identity != ancestor.identity
+            or linked_identity != ancestor.identity
+        ):
+            raise OSError(
+                "Git launch path component identity or access policy changed: "
+                f"{ancestor.path}"
+            )
+        if index != 0:
+            _reject_runtime_extended_acl(
+                ancestor.fd,
+                ancestor.path,
+                "Git launch path component",
+            )
+
+
+def _bind_git_launch_temp_root(
+    root: pathlib.Path,
+) -> tuple[_BoundGitLaunchDirectory, ...]:
+    if (
+        not root.is_absolute()
+        or root.anchor != os.sep
+        or len(root.parts) - 1 > MAX_DISCOVERY_CWD_COMPONENTS
+    ):
+        raise OSError(f"Git launch temporary root is not a bounded POSIX path: {root}")
+    flags = (
+        os.O_RDONLY
+        | _required_open_flag("O_DIRECTORY")
+        | getattr(os, "O_CLOEXEC", 0)
+        | _required_open_flag("O_NOFOLLOW")
+        | _required_open_flag("O_NONBLOCK")
+    )
+    bottom_up: list[_BoundGitLaunchDirectory] = []
+    try:
+        anchor_entries = _bind_git_launch_lexical_path(root)
+        temporary_fd = os.open(
+            root,
+            flags & ~_required_open_flag("O_NOFOLLOW"),
+        )
+        temporary_active_error: BaseException | None = None
+        try:
+            temporary_identity = _validate_git_launch_directory_stat(
+                root,
+                os.fstat(temporary_fd),
+                owner_private=False,
+            )
+            linked_identity = _validate_git_launch_directory_stat(
+                root,
+                os.stat(root),
+                owner_private=False,
+            )
+            if temporary_identity != linked_identity:
+                raise OSError(
+                    "Git launch temporary root changed while it was being bound"
+                )
+            _reject_runtime_extended_acl(
+                temporary_fd,
+                root,
+                "Git launch temporary root",
+            )
+        except BaseException as exc:
+            temporary_active_error = exc
+            raise
+        finally:
+            if temporary_active_error is not None:
+                _close_git_launch_descriptor(
+                    temporary_fd,
+                    temporary_active_error,
+                    context="Git launch temporary root binding",
+                )
+        bottom_up.append(
+            _BoundGitLaunchDirectory(
+                path=root,
+                fd=temporary_fd,
+                identity=temporary_identity,
+                parent_fd=None,
+                component=None,
+                owner_private=False,
+                path_anchor=True,
+                path_anchor_entries=anchor_entries,
+            )
+        )
+        reached_filesystem_root = False
+        for level in range(MAX_DISCOVERY_CWD_COMPONENTS + 1):
+            current = bottom_up[-1]
+            parent_fd = os.open("..", flags, dir_fd=current.fd)
+            parent_active_error: BaseException | None = None
+            try:
+                parent_identity = _validate_git_launch_directory_stat(
+                    pathlib.Path(f"<git-launch-parent-{level}>"),
+                    os.fstat(parent_fd),
+                    owner_private=False,
+                )
+            except BaseException as exc:
+                parent_active_error = exc
+                raise
+            finally:
+                if parent_active_error is not None:
+                    _close_git_launch_descriptor(
+                        parent_fd,
+                        parent_active_error,
+                        context="Git launch ancestor binding",
+                    )
+            if (
+                parent_identity[0] == current.identity[0]
+                and parent_identity[1] == current.identity[1]
+            ):
+                _close_git_launch_descriptor(
+                    parent_fd,
+                    None,
+                    context="Git launch filesystem-root probe",
+                )
+                current.path = pathlib.Path(os.sep)
+                current.path_anchor = True
+                current.path_anchor_entries = (
+                    _inspect_git_launch_path_entry(pathlib.Path(os.sep)),
+                )
+                reached_filesystem_root = True
+                break
+            parent_path = pathlib.Path(f"<git-launch-parent-{level}>")
+            try:
+                _reject_runtime_extended_acl(
+                    parent_fd,
+                    parent_path,
+                    "Git launch temporary path component",
+                )
+            except BaseException as exc:
+                _close_git_launch_descriptor(
+                    parent_fd,
+                    exc,
+                    context="Git launch ancestor ACL binding",
+                )
+                raise
+            bottom_up.append(
+                _BoundGitLaunchDirectory(
+                    path=parent_path,
+                    fd=parent_fd,
+                    identity=parent_identity,
+                    parent_fd=None,
+                    component=None,
+                    owner_private=False,
+                )
+            )
+        if not reached_filesystem_root:
+            raise OSError(
+                "Git launch temporary root ancestry exceeds "
+                f"{MAX_DISCOVERY_CWD_COMPONENTS + 1} levels"
+            )
+        ordered = list(reversed(bottom_up))
+        for index in range(1, len(ordered)):
+            ordered[index].parent_fd = ordered[index - 1].fd
+        binding = tuple(ordered)
+        _revalidate_bound_git_launch_directories(binding)
+        return binding
+    except BaseException as exc:
+        _close_bound_git_launch_directories(tuple(bottom_up), exc)
+        raise
+
+
+def _bind_git_launch_directory(
+    root_binding: tuple[_BoundGitLaunchDirectory, ...],
+    directory: pathlib.Path,
+) -> tuple[_BoundGitLaunchDirectory, ...]:
+    if not root_binding:
+        raise OSError("Git launch temporary root binding is empty")
+    root = root_binding[-1]
+    if (
+        directory.parent != root.path
+        or directory.name in {"", ".", ".."}
+        or os.sep in directory.name
+    ):
+        raise OSError(
+            "temporary directory creation returned a path outside the bound "
+            f"Git launch root: {directory}"
+        )
+    _revalidate_bound_git_launch_directories(root_binding)
+    flags = (
+        os.O_RDONLY
+        | _required_open_flag("O_DIRECTORY")
+        | getattr(os, "O_CLOEXEC", 0)
+        | _required_open_flag("O_NOFOLLOW")
+        | _required_open_flag("O_NONBLOCK")
+    )
+    child_fd = os.open(directory.name, flags, dir_fd=root.fd)
+    child_active_error: BaseException | None = None
+    try:
+        initial_descriptor_identity = _validate_git_launch_directory_stat(
+            directory,
+            os.fstat(child_fd),
+            owner_private=True,
+        )
+        initial_linked_identity = _validate_git_launch_directory_stat(
+            directory,
+            os.stat(
+                directory.name,
+                dir_fd=root.fd,
+                follow_symlinks=False,
+            ),
+            owner_private=True,
+        )
+        if initial_descriptor_identity != initial_linked_identity:
+            raise OSError(
+                "command-private Git launch directory changed while being bound"
+            )
+        _reject_runtime_extended_acl(
+            child_fd,
+            directory,
+            "command-private Git launch directory",
+        )
+    except BaseException as exc:
+        child_active_error = exc
+        raise
+    finally:
+        if child_active_error is not None:
+            _close_git_launch_descriptor(
+                child_fd,
+                child_active_error,
+                context="command-private Git launch directory binding",
+            )
+    child = _BoundGitLaunchDirectory(
+        path=directory,
+        fd=child_fd,
+        identity=initial_descriptor_identity,
+        parent_fd=root.fd,
+        component=directory.name,
+        owner_private=True,
+    )
+    binding = (
+        *root_binding,
+        child,
+    )
+    try:
+        os.fchmod(child_fd, 0o700)
+        child.identity = _validate_git_launch_directory_stat(
+            directory,
+            os.fstat(child_fd),
+            owner_private=True,
+        )
+        _revalidate_bound_git_launch_directories(binding)
+    except BaseException as exc:
+        partial = _GitLaunchCopy(
+            executable=directory / "git",
+            directory=directory,
+            source_argv0=pathlib.Path("git"),
+            ancestors=binding,
+        )
+        try:
+            _cleanup_bound_git_launch(partial)
+        except BaseException as cleanup_error:
+            _add_exception_details(
+                exc,
+                _exception_evidence_details(
+                    cleanup_error,
+                    context=(
+                        "command-private Git launch directory binding cleanup failed"
+                    ),
+                ),
+            )
+        raise
+    return binding
+
+
+def _git_launch_executable_identity(value: os.stat_result) -> tuple[int, ...]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        stat.S_IFMT(value.st_mode),
+        value.st_uid,
+        value.st_gid,
+        stat.S_IMODE(value.st_mode),
+        value.st_size,
+        value.st_nlink,
+    )
+
+
+def _validate_git_launch_executable_stat(
+    value: os.stat_result,
+) -> tuple[int, ...]:
+    if (
+        not stat.S_ISREG(value.st_mode)
+        or value.st_uid != os.geteuid()
+        or stat.S_IMODE(value.st_mode) != 0o500
+        or value.st_nlink != 1
+    ):
+        raise OSError("command-private Git launch access policy changed")
+    return _git_launch_executable_identity(value)
+
+
+def _revalidate_git_launch_for_exec(
+    launch: _GitLaunchCopy,
+    *,
+    deadline: float,
+    deadline_error: str,
+) -> None:
+    _check_deadline(deadline, deadline_error)
+    _revalidate_bound_git_launch_directories(launch.ancestors)
+    if launch.executable_identity is None:
+        raise OSError("command-private Git launch identity is unavailable")
+    leaf = launch.ancestors[-1]
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | _required_open_flag("O_NOFOLLOW")
+        | _required_open_flag("O_NONBLOCK")
+    )
+    fd = os.open("git", flags, dir_fd=leaf.fd)
+    active_error: BaseException | None = None
+    try:
+        descriptor_identity = _validate_git_launch_executable_stat(os.fstat(fd))
+        linked_identity = _validate_git_launch_executable_stat(
+            os.stat("git", dir_fd=leaf.fd, follow_symlinks=False)
+        )
+        _reject_runtime_extended_acl(
+            fd,
+            launch.executable,
+            "command-private Git launch",
+        )
+        if (
+            descriptor_identity != launch.executable_identity
+            or linked_identity != launch.executable_identity
+        ):
+            raise OSError(
+                "command-private Git launch identity or access policy changed"
+            )
+        _check_deadline(deadline, deadline_error)
+    except BaseException as exc:
+        active_error = exc
+        raise
+    finally:
+        _close_git_launch_descriptor(
+            fd,
+            active_error,
+            context="Git launch executable revalidation",
+        )
+    _revalidate_bound_git_launch_directories(launch.ancestors)
+    _check_deadline(deadline, deadline_error)
+
+
+def _cleanup_bound_git_launch(launch: _GitLaunchCopy) -> None:
+    active_error: BaseException | None = None
+    try:
+        if not launch.ancestors:
+            raise OSError("Git launch path descriptor chain is unavailable")
+        _revalidate_bound_git_launch_directories(launch.ancestors)
+        leaf = launch.ancestors[-1]
+        parent = launch.ancestors[-2]
+        try:
+            linked = os.stat("git", dir_fd=leaf.fd, follow_symlinks=False)
+        except FileNotFoundError:
+            if launch.executable_identity is not None:
+                raise OSError("command-private Git launch disappeared before cleanup")
+        else:
+            if launch.executable_identity is None:
+                if (
+                    not stat.S_ISREG(linked.st_mode)
+                    or linked.st_uid != os.geteuid()
+                    or stat.S_IMODE(linked.st_mode) & 0o022
+                    or linked.st_nlink != 1
+                ):
+                    raise OSError(
+                        "unverified command-private Git launch entry is unsafe "
+                        "to remove"
+                    )
+            else:
+                identity = _validate_git_launch_executable_stat(linked)
+                if identity != launch.executable_identity:
+                    raise OSError("command-private Git launch changed before cleanup")
+        os.fchmod(leaf.fd, 0o700)
+        leaf.identity = _validate_git_launch_directory_stat(
+            leaf.path,
+            os.fstat(leaf.fd),
+            owner_private=True,
+        )
+        _revalidate_bound_git_launch_directories(launch.ancestors)
+        try:
+            os.unlink("git", dir_fd=leaf.fd)
+        except FileNotFoundError:
+            if launch.executable_identity is not None:
+                raise OSError("command-private Git launch disappeared during cleanup")
+        os.fsync(leaf.fd)
+        try:
+            os.stat("git", dir_fd=leaf.fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise OSError("command-private Git launch still exists after cleanup")
+        _revalidate_bound_git_launch_directories(launch.ancestors)
+        assert leaf.component is not None
+        os.rmdir(leaf.component, dir_fd=parent.fd)
+        os.fsync(parent.fd)
+        try:
+            os.stat(leaf.component, dir_fd=parent.fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise OSError(
+                "command-private Git launch directory still exists after cleanup"
+            )
+        _validate_git_launch_directory_stat(
+            pathlib.Path("<unlinked-git-launch-directory>"),
+            os.fstat(leaf.fd),
+            owner_private=True,
+        )
+        _revalidate_bound_git_launch_directories(
+            launch.ancestors,
+            include_leaf=False,
+        )
+    except BaseException as exc:
+        active_error = exc
+        raise
+    finally:
+        _close_bound_git_launch_directories(launch.ancestors, active_error)
+        launch.ancestors = ()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1937,7 +2661,23 @@ def _secure_read_regular_path(
             raise UserError(f"{label} content changed while being read: {path}")
         return first
     finally:
-        os.close(fd)
+        active_error = sys.exc_info()[1]
+        try:
+            os.close(fd)
+        except BaseException as close_error:
+            details = _exception_evidence_details(
+                close_error,
+                context=f"{label} descriptor cleanup failed",
+            )
+            if active_error is not None:
+                _add_exception_details(active_error, details)
+            elif isinstance(close_error, Exception):
+                wrapped = UserError(details[0])
+                _add_exception_details(wrapped, details[1:])
+                raise wrapped from close_error
+            else:
+                _add_exception_details(close_error, details)
+                raise
 
 
 def _hash_open_file(
@@ -2183,19 +2923,28 @@ def _prepare_git_runtime_launch(
 ) -> _GitLaunchCopy:
     source_fd: int | None = None
     directory: pathlib.Path | None = None
+    root_binding: tuple[_BoundGitLaunchDirectory, ...] = ()
+    launch: _GitLaunchCopy | None = None
 
     def cleanup_owner(active_error: BaseException) -> None:
-        if directory is None:
+        nonlocal root_binding
+
+        if launch is not None:
+            _cleanup_git_launch_after_terminal(
+                launch,
+                "Git launch preparation",
+                active_error,
+            )
             return
-        _cleanup_git_launch_after_terminal(
-            _GitLaunchCopy(
-                executable=directory / "git",
-                directory=directory,
-                source_argv0=runtime.source_executable,
-            ),
-            "Git launch preparation",
-            active_error,
-        )
+        if root_binding:
+            _close_bound_git_launch_directories(root_binding, active_error)
+            root_binding = ()
+        if directory is not None and directory.exists():
+            _add_exception_detail(
+                active_error,
+                "Git launch preparation could not bind its created directory; "
+                f"retained path is unverified: {directory}",
+            )
 
     def close_source(active_error: BaseException | None) -> None:
         nonlocal source_fd
@@ -2287,40 +3036,28 @@ def _prepare_git_runtime_launch(
             deadline_error=deadline_error,
         )
         _check_deadline(deadline, deadline_error)
-        directory = pathlib.Path(tempfile.mkdtemp(prefix="project-journal-git-launch-"))
-        os.chmod(directory, 0o700)
-        _check_deadline(deadline, deadline_error)
-        directory_stat = os.stat(directory, follow_symlinks=False)
-        _check_deadline(deadline, deadline_error)
-        if (
-            not stat.S_ISDIR(directory_stat.st_mode)
-            or directory_stat.st_uid != os.geteuid()
-            or stat.S_IMODE(directory_stat.st_mode) != 0o700
-        ):
-            raise OSError("command-private Git launch directory is not owner-private")
-        directory_flags = (
-            os.O_RDONLY
-            | getattr(os, "O_DIRECTORY", 0)
-            | getattr(os, "O_CLOEXEC", 0)
-            | _required_open_flag("O_NOFOLLOW")
-            | _required_open_flag("O_NONBLOCK")
+        temporary_root = _lexical_absolute_path(
+            pathlib.Path(tempfile.gettempdir()),
         )
-        directory_fd = os.open(directory, directory_flags)
-        try:
-            if _directory_identity(os.fstat(directory_fd)) != _directory_identity(
-                directory_stat
-            ):
-                raise OSError("command-private Git launch directory binding changed")
-            _reject_runtime_extended_acl(
-                directory_fd,
-                directory,
-                "command-private Git launch directory",
-            )
-        finally:
-            os.close(directory_fd)
+        root_binding = _bind_git_launch_temp_root(temporary_root)
         _check_deadline(deadline, deadline_error)
-
+        directory = pathlib.Path(
+            tempfile.mkdtemp(
+                prefix="project-journal-git-launch-",
+                dir=temporary_root,
+            )
+        )
+        ancestors = _bind_git_launch_directory(root_binding, directory)
+        root_binding = ()
         executable = directory / "git"
+        launch = _GitLaunchCopy(
+            executable=executable,
+            directory=directory,
+            source_argv0=runtime.source_executable,
+            ancestors=ancestors,
+        )
+        _check_deadline(deadline, deadline_error)
+        leaf = launch.ancestors[-1]
         flags = (
             os.O_WRONLY
             | os.O_CREAT
@@ -2329,9 +3066,10 @@ def _prepare_git_runtime_launch(
             | _required_open_flag("O_NOFOLLOW")
             | _required_open_flag("O_NONBLOCK")
         )
-        destination_fd = os.open(executable, flags, 0o600)
+        destination_fd = os.open("git", flags, 0o600, dir_fd=leaf.fd)
         digest = hashlib.sha256()
         copied = 0
+        destination_active_error: BaseException | None = None
         try:
             os.lseek(source_fd, 0, os.SEEK_SET)
             while True:
@@ -2370,8 +3108,15 @@ def _prepare_git_runtime_launch(
             )
             _check_deadline(deadline, deadline_error)
             destination_written_stat = os.fstat(destination_fd)
+        except BaseException as exc:
+            destination_active_error = exc
+            raise
         finally:
-            os.close(destination_fd)
+            _close_git_launch_descriptor(
+                destination_fd,
+                destination_active_error,
+                context="command-private Git launch creation",
+            )
 
         _revalidate_open_git_runtime_snapshot(
             runtime,
@@ -2385,41 +3130,14 @@ def _prepare_git_runtime_launch(
             deadline_error=deadline_error,
         )
         _check_deadline(deadline, deadline_error)
-        os.chmod(directory, 0o500)
+        os.fchmod(leaf.fd, 0o500)
         _check_deadline(deadline, deadline_error)
-        locked_directory_stat = os.stat(directory, follow_symlinks=False)
-        _check_deadline(deadline, deadline_error)
-        if (
-            not stat.S_ISDIR(locked_directory_stat.st_mode)
-            or locked_directory_stat.st_dev != directory_stat.st_dev
-            or locked_directory_stat.st_ino != directory_stat.st_ino
-        ):
-            raise OSError("command-private Git launch directory identity changed")
-        if (
-            locked_directory_stat.st_uid != os.geteuid()
-            or locked_directory_stat.st_gid != directory_stat.st_gid
-            or stat.S_IMODE(locked_directory_stat.st_mode) != 0o500
-        ):
-            raise OSError("command-private Git launch directory access policy changed")
-        locked_directory_fd = os.open(directory, directory_flags)
-        try:
-            if (
-                locked_directory_stat.st_dev,
-                locked_directory_stat.st_ino,
-                locked_directory_stat.st_uid,
-                locked_directory_stat.st_gid,
-                stat.S_IMODE(locked_directory_stat.st_mode),
-            ) != _directory_identity(os.fstat(locked_directory_fd)):
-                raise OSError(
-                    "command-private Git launch directory binding changed after lock"
-                )
-            _reject_runtime_extended_acl(
-                locked_directory_fd,
-                directory,
-                "command-private Git launch directory",
-            )
-        finally:
-            os.close(locked_directory_fd)
+        leaf.identity = _validate_git_launch_directory_stat(
+            directory,
+            os.fstat(leaf.fd),
+            owner_private=True,
+        )
+        _revalidate_bound_git_launch_directories(launch.ancestors)
         _check_deadline(deadline, deadline_error)
 
         read_flags = (
@@ -2429,7 +3147,8 @@ def _prepare_git_runtime_launch(
             | _required_open_flag("O_NONBLOCK")
         )
         _check_deadline(deadline, deadline_error)
-        destination_read_fd = os.open(executable, read_flags)
+        destination_read_fd = os.open("git", read_flags, dir_fd=leaf.fd)
+        destination_read_active_error: BaseException | None = None
         try:
             expected_dev = destination_written_stat.st_dev
             expected_ino = destination_written_stat.st_ino
@@ -2461,7 +3180,8 @@ def _prepare_git_runtime_launch(
             destination_before = os.fstat(destination_read_fd)
             _check_deadline(deadline, deadline_error)
             destination_path_before = os.stat(
-                executable,
+                "git",
+                dir_fd=leaf.fd,
                 follow_symlinks=False,
             )
             validate_destination_stats(
@@ -2484,7 +3204,8 @@ def _prepare_git_runtime_launch(
             destination_after = os.fstat(destination_read_fd)
             _check_deadline(deadline, deadline_error)
             destination_path_after = os.stat(
-                executable,
+                "git",
+                dir_fd=leaf.fd,
                 follow_symlinks=False,
             )
             _check_deadline(deadline, deadline_error)
@@ -2503,14 +3224,19 @@ def _prepare_git_runtime_launch(
                 raise OSError(
                     "command-private Git launch content changed after directory lock"
                 )
+            launch.executable_identity = _git_launch_executable_identity(
+                destination_after
+            )
+        except BaseException as exc:
+            destination_read_active_error = exc
+            raise
         finally:
-            os.close(destination_read_fd)
-
-        launch = _GitLaunchCopy(
-            executable=executable,
-            directory=directory,
-            source_argv0=runtime.source_executable,
-        )
+            _close_git_launch_descriptor(
+                destination_read_fd,
+                destination_read_active_error,
+                context="command-private Git launch verification",
+            )
+        _revalidate_bound_git_launch_directories(launch.ancestors)
     except OSError as exc:
         error = UnsupportedGitVersion(
             f"failed to bind Git execution to verified bytes: {exc}"
@@ -2527,6 +3253,7 @@ def _prepare_git_runtime_launch(
     except BaseException as exc:
         cleanup_owner(exc)
         raise
+    assert launch is not None
     return launch
 
 
@@ -3291,6 +4018,24 @@ def _close_selector(selector: selectors.BaseSelector) -> None:
         selector.close()
     except OSError:
         pass
+
+
+def _close_process_streams(process: subprocess.Popen[bytes]) -> list[str]:
+    issues: list[str] = []
+    for name in ("stdin", "stdout", "stderr"):
+        stream = getattr(process, name, None)
+        if stream is None or stream.closed:
+            continue
+        try:
+            stream.close()
+        except BaseException as exc:
+            issues.extend(
+                _exception_evidence_details(
+                    exc,
+                    context=f"failed to close direct-child {name}",
+                )
+            )
+    return issues
 
 
 def _settle_direct_child_after_identity_loss(
@@ -4093,8 +4838,8 @@ def _capture_bounded_process(
             else:
                 _report_git_launch_issue(
                     active_error,
-                    f"{operation} lifecycle state is unverified; retained "
-                    f"launch locator: {launch.directory}",
+                    f"{operation} lifecycle state is unverified; "
+                    f"{_git_launch_retention_evidence(launch)}",
                 )
 
 
@@ -4153,6 +4898,12 @@ def _capture_bounded_process_with_launch(
                 [str(launch.source_argv0), *argv[1:]] if launch is not None else argv
             )
             _require_waitable_sigchld_semantics()
+            if launch is not None:
+                _revalidate_git_launch_for_exec(
+                    launch,
+                    deadline=operation_deadline,
+                    deadline_error=timeout_error,
+                )
             process = subprocess.Popen(
                 child_argv,
                 executable=(str(launch.executable) if launch is not None else None),
@@ -4164,18 +4915,30 @@ def _capture_bounded_process_with_launch(
                 stderr=subprocess.PIPE,
                 start_new_session=os.name == "posix",
             )
+            if launch is not None:
+                _revalidate_git_launch_for_exec(
+                    launch,
+                    deadline=operation_deadline,
+                    deadline_error=timeout_error,
+                )
             _require_waitable_sigchld_semantics(after_spawn=True)
             _register_process_status_observer(process)
         except OSError as exc:
-            _close_selector(selector)
-            selector_open = False
-            error = UserError(f"failed to start {operation}: {exc}")
-            if launch is not None:
+            if process is None:
+                _close_selector(selector)
+                selector_open = False
+                error = UserError(f"failed to start {operation}: {exc}")
+            else:
+                error = UserError(
+                    f"{operation} post-start launch validation failed: {exc}"
+                )
+            if launch is not None and process is None:
                 launch.mark_cleanup_safe()
             raise error from exc
         except BaseException:
-            _close_selector(selector)
-            selector_open = False
+            if process is None:
+                _close_selector(selector)
+                selector_open = False
             raise
 
         assert process is not None
@@ -4478,6 +5241,7 @@ def _capture_bounded_process_with_launch(
         elif selector_open:
             _close_selector(selector)
             selector_open = False
+        cleanup_details.extend(_close_process_streams(process))
         if cleanup_error is not None:
             cleanup_details.append(
                 f"{operation} cleanup-incomplete: {cleanup_error}",

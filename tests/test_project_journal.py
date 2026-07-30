@@ -1643,16 +1643,16 @@ class ProjectJournalTests(unittest.TestCase):
             candidate = pathlib.Path(path)
             if (
                 not replacement_attempted
-                and candidate.name == "git"
-                and candidate.parent.name.startswith("project-journal-git-launch-")
+                and candidate == pathlib.Path("git")
+                and dir_fd is not None
                 and (flags & os.O_ACCMODE) == os.O_RDONLY
             ):
                 replacement_attempted = True
                 self.assertTrue(flags & project_journal.os.O_NONBLOCK)
                 self.assertTrue(flags & project_journal.os.O_NOFOLLOW)
-                self.assertEqual(candidate.parent.stat().st_mode & 0o777, 0o500)
+                self.assertEqual(os.fstat(dir_fd).st_mode & 0o777, 0o500)
                 with self.assertRaises(PermissionError):
-                    os.replace(attacker, candidate)
+                    os.replace(attacker, "git", dst_dir_fd=dir_fd)
             return actual_open(path, flags, mode, dir_fd=dir_fd)
 
         try:
@@ -1685,7 +1685,7 @@ class ProjectJournalTests(unittest.TestCase):
         self,
     ) -> None:
         runtime = self.make_fake_git_runtime("launch-prelock-replacement")
-        actual_chmod = os.chmod
+        actual_fchmod = os.fchmod
         attacker = self.root / "launch-prelock-attacker"
         attacker.write_text(
             "#!/bin/sh\nprintf 'attacker-executed\\n'\n",
@@ -1695,32 +1695,19 @@ class ProjectJournalTests(unittest.TestCase):
         replaced = False
 
         def replace_launch_before_directory_lock(
-            path: os.PathLike[str] | str,
+            fd: int,
             mode: int,
-            *,
-            dir_fd: int | None = None,
-            follow_symlinks: bool = True,
         ) -> None:
             nonlocal replaced
-            candidate = pathlib.Path(path)
-            if (
-                not replaced
-                and mode == 0o500
-                and candidate.name.startswith("project-journal-git-launch-")
-            ):
-                os.replace(attacker, candidate / "git")
+            if not replaced and mode == 0o500 and stat.S_ISDIR(os.fstat(fd).st_mode):
+                os.replace(attacker, "git", dst_dir_fd=fd)
                 replaced = True
-            actual_chmod(
-                path,
-                mode,
-                dir_fd=dir_fd,
-                follow_symlinks=follow_symlinks,
-            )
+            actual_fchmod(fd, mode)
 
         try:
             with mock.patch.object(
                 project_journal.os,
-                "chmod",
+                "fchmod",
                 side_effect=replace_launch_before_directory_lock,
             ):
                 with mock.patch.object(project_journal.subprocess, "Popen") as popen:
@@ -1744,6 +1731,246 @@ class ProjectJournalTests(unittest.TestCase):
             self.assertTrue(replaced)
             popen.assert_not_called()
         finally:
+            runtime.snapshot_owner.cleanup()
+
+    def test_git_launch_rejects_unsticky_world_writable_temporary_root(
+        self,
+    ) -> None:
+        runtime = self.make_fake_git_runtime("launch-unsafe-temporary-root")
+        temporary_root = self.root / "unsafe-temporary-root"
+        temporary_root.mkdir()
+        temporary_root.chmod(0o777)
+
+        try:
+            with mock.patch.object(
+                project_journal.tempfile,
+                "gettempdir",
+                return_value=str(temporary_root),
+            ):
+                with mock.patch.object(project_journal.subprocess, "Popen") as popen:
+                    with self.assertRaisesRegex(
+                        project_journal.UnsupportedGitVersion,
+                        "group/world writable without the sticky bit",
+                    ):
+                        project_journal._capture_bounded_process(
+                            [str(runtime.executable), "probe"],
+                            env={"PATH": os.environ.get("PATH", "")},
+                            verified_runtime=runtime,
+                            timeout_seconds=2,
+                            stdout_limit=1024,
+                            stderr_limit=1024,
+                            stdout_overflow_error="stdout overflow",
+                            stderr_overflow_error="stderr overflow",
+                            timeout_error="launch timed out",
+                            operation="unsafe-root Git launch",
+                        )
+
+            popen.assert_not_called()
+            self.assertEqual(list(temporary_root.iterdir()), [])
+        finally:
+            temporary_root.chmod(0o700)
+            runtime.snapshot_owner.cleanup()
+
+    def test_git_launch_rejects_foreign_owned_sticky_temporary_root(
+        self,
+    ) -> None:
+        runtime = self.make_fake_git_runtime("launch-foreign-temporary-root")
+        temporary_root = self.root / "foreign-temporary-root"
+        temporary_root.mkdir()
+        temporary_root.chmod(0o1777)
+        actual_fstat = os.fstat
+        root_identity = (
+            temporary_root.stat().st_dev,
+            temporary_root.stat().st_ino,
+        )
+
+        def foreign_root_owner(fd: int) -> os.stat_result:
+            value = actual_fstat(fd)
+            if (value.st_dev, value.st_ino) == root_identity:
+                return stat_with_uid(value, os.geteuid() + 1)
+            return value
+
+        try:
+            with mock.patch.object(
+                project_journal.tempfile,
+                "gettempdir",
+                return_value=str(temporary_root),
+            ):
+                with mock.patch.object(
+                    project_journal.os,
+                    "fstat",
+                    side_effect=foreign_root_owner,
+                ):
+                    with mock.patch.object(
+                        project_journal.subprocess, "Popen"
+                    ) as popen:
+                        with self.assertRaisesRegex(
+                            project_journal.UnsupportedGitVersion,
+                            "not owned by root or the current user",
+                        ):
+                            project_journal._capture_bounded_process(
+                                [str(runtime.executable), "probe"],
+                                env={"PATH": os.environ.get("PATH", "")},
+                                verified_runtime=runtime,
+                                timeout_seconds=2,
+                                stdout_limit=1024,
+                                stderr_limit=1024,
+                                stdout_overflow_error="stdout overflow",
+                                stderr_overflow_error="stderr overflow",
+                                timeout_error="launch timed out",
+                                operation="foreign-root Git launch",
+                            )
+
+            popen.assert_not_called()
+            self.assertEqual(list(temporary_root.iterdir()), [])
+        finally:
+            temporary_root.chmod(0o700)
+            runtime.snapshot_owner.cleanup()
+
+    def test_git_launch_rejects_foreign_owned_lexical_symlink_component(
+        self,
+    ) -> None:
+        runtime = self.make_fake_git_runtime("launch-foreign-lexical-link")
+        target = self.root / "lexical-target"
+        temporary_root = target / "temporary-root"
+        target.mkdir(mode=0o700)
+        temporary_root.mkdir(mode=0o700)
+        link = self.root / "lexical-link"
+        link.symlink_to(target, target_is_directory=True)
+        selected_root = link / temporary_root.name
+        actual_stat = os.stat
+
+        def foreign_link_owner(
+            path: os.PathLike[str] | str | int,
+            *,
+            dir_fd: int | None = None,
+            follow_symlinks: bool = True,
+        ) -> os.stat_result:
+            value = actual_stat(
+                path,
+                dir_fd=dir_fd,
+                follow_symlinks=follow_symlinks,
+            )
+            if (
+                dir_fd is None
+                and not follow_symlinks
+                and isinstance(path, (str, os.PathLike))
+                and pathlib.Path(path) == link
+            ):
+                return stat_with_uid(value, os.geteuid() + 1)
+            return value
+
+        try:
+            with mock.patch.object(
+                project_journal.tempfile,
+                "gettempdir",
+                return_value=str(selected_root),
+            ):
+                with mock.patch.object(
+                    project_journal.os,
+                    "stat",
+                    side_effect=foreign_link_owner,
+                ):
+                    with mock.patch.object(
+                        project_journal.subprocess, "Popen"
+                    ) as popen:
+                        with self.assertRaisesRegex(
+                            project_journal.UnsupportedGitVersion,
+                            "lexical path entry is not owned by root or the current user",
+                        ):
+                            project_journal._capture_bounded_process(
+                                [str(runtime.executable), "probe"],
+                                env={"PATH": os.environ.get("PATH", "")},
+                                verified_runtime=runtime,
+                                timeout_seconds=2,
+                                stdout_limit=1024,
+                                stderr_limit=1024,
+                                stdout_overflow_error="stdout overflow",
+                                stderr_overflow_error="stderr overflow",
+                                timeout_error="launch timed out",
+                                operation="foreign-link Git launch",
+                            )
+
+            popen.assert_not_called()
+            self.assertEqual(list(temporary_root.iterdir()), [])
+        finally:
+            runtime.snapshot_owner.cleanup()
+
+    def test_git_launch_rejects_temporary_parent_replacement_before_exec(
+        self,
+    ) -> None:
+        runtime = self.make_fake_git_runtime("launch-parent-replacement")
+        temporary_root = self.root / "temporary-root"
+        displaced_root = self.root / "displaced-temporary-root"
+        temporary_root.mkdir(mode=0o700)
+        actual_revalidate = project_journal._revalidate_git_launch_for_exec
+        replaced = False
+
+        def replace_parent_before_exec(
+            launch: object,
+            *,
+            deadline: float,
+            deadline_error: str,
+        ) -> None:
+            nonlocal replaced
+            if not replaced:
+                os.replace(temporary_root, displaced_root)
+                temporary_root.mkdir(mode=0o700)
+                replaced = True
+            actual_revalidate(
+                launch,
+                deadline=deadline,
+                deadline_error=deadline_error,
+            )
+
+        try:
+            with mock.patch.object(
+                project_journal.tempfile,
+                "gettempdir",
+                return_value=str(temporary_root),
+            ):
+                with mock.patch.object(
+                    project_journal,
+                    "_revalidate_git_launch_for_exec",
+                    side_effect=replace_parent_before_exec,
+                ):
+                    with mock.patch.object(
+                        project_journal.subprocess,
+                        "Popen",
+                    ) as popen:
+                        with self.assertRaisesRegex(
+                            project_journal.UserError,
+                            "Git launch lexical path entry changed",
+                        ) as raised:
+                            project_journal._capture_bounded_process(
+                                [str(runtime.executable), "probe"],
+                                env={"PATH": os.environ.get("PATH", "")},
+                                verified_runtime=runtime,
+                                timeout_seconds=2,
+                                stdout_limit=1024,
+                                stderr_limit=1024,
+                                stdout_overflow_error="stdout overflow",
+                                stderr_overflow_error="stderr overflow",
+                                timeout_error="launch timed out",
+                                operation="parent-replaced Git launch",
+                            )
+
+            self.assertTrue(replaced)
+            popen.assert_not_called()
+            notes = "\n".join(getattr(raised.exception, "__notes__", ()))
+            self.assertIn("launch-copy cleanup-incomplete", notes)
+            self.assertIn("retained launch path is unverified", notes)
+            self.assertIn("directory identity:", notes)
+            self.assertNotIn("retained launch locator:", notes)
+            self.assertTrue(any(displaced_root.glob("project-journal-git-launch-*")))
+        finally:
+            for root in (temporary_root, displaced_root):
+                if root.exists():
+                    for directory in root.glob("project-journal-git-launch-*"):
+                        directory.chmod(0o700)
+                        shutil.rmtree(directory)
+                    root.chmod(0o700)
+                    root.rmdir()
             runtime.snapshot_owner.cleanup()
 
     def test_git_launch_rejects_fifo_before_binding_without_starting_process(
@@ -1913,6 +2140,120 @@ class ProjectJournalTests(unittest.TestCase):
             runtime.snapshot_owner.cleanup()
 
     @unittest.skipUnless(os.name == "posix", "POSIX process-group contract")
+    def test_git_launch_post_start_revalidation_retains_on_incomplete_cleanup(
+        self,
+    ) -> None:
+        runtime = self.make_fake_git_runtime("launch-post-start-revalidation")
+        actual_revalidate = project_journal._revalidate_git_launch_for_exec
+        actual_cleanup = project_journal._terminate_process_group_and_reap
+        actual_popen = subprocess.Popen
+        revalidation_count = 0
+        observed_launch: pathlib.Path | None = None
+        spawned: list[subprocess.Popen[bytes]] = []
+
+        def fail_post_start_revalidation(
+            launch: project_journal._GitLaunchCopy,
+            *,
+            deadline: float,
+            deadline_error: str,
+        ) -> None:
+            nonlocal revalidation_count
+            revalidation_count += 1
+            if revalidation_count == 2:
+                raise OSError("simulated post-start launch drift")
+            actual_revalidate(
+                launch,
+                deadline=deadline,
+                deadline_error=deadline_error,
+            )
+
+        def capture_launch(
+            argv: list[str],
+            *args: object,
+            **kwargs: object,
+        ) -> subprocess.Popen[bytes]:
+            nonlocal observed_launch
+            observed_launch = pathlib.Path(str(kwargs["executable"]))
+            process = actual_popen(argv, *args, **kwargs)
+            spawned.append(process)
+            return process
+
+        def cleanup_then_report(
+            process: subprocess.Popen[bytes],
+            selector: object,
+            ownership: project_journal._ProcessOwnership,
+            known_returncode: int | None = None,
+        ) -> str:
+            actual_error = actual_cleanup(
+                process,
+                selector,
+                ownership,
+                known_returncode=known_returncode,
+            )
+            details = [
+                detail
+                for detail in (
+                    actual_error,
+                    "simulated unverified post-start cleanup",
+                )
+                if detail
+            ]
+            return "; ".join(details)
+
+        try:
+            with mock.patch.object(
+                project_journal,
+                "_revalidate_git_launch_for_exec",
+                side_effect=fail_post_start_revalidation,
+            ):
+                with mock.patch.object(
+                    project_journal.subprocess,
+                    "Popen",
+                    side_effect=capture_launch,
+                ):
+                    with mock.patch.object(
+                        project_journal,
+                        "_terminate_process_group_and_reap",
+                        side_effect=cleanup_then_report,
+                    ):
+                        with self.assertRaises(project_journal.UserError) as raised:
+                            project_journal._capture_bounded_process(
+                                [str(runtime.executable), "probe"],
+                                env={"PATH": os.environ.get("PATH", "")},
+                                verified_runtime=runtime,
+                                timeout_seconds=2,
+                                stdout_limit=1024,
+                                stderr_limit=1024,
+                                stdout_overflow_error="stdout overflow",
+                                stderr_overflow_error="stderr overflow",
+                                timeout_error="launch timed out",
+                                operation="post-start-drift Git launch",
+                            )
+
+            details = "\n".join(
+                [
+                    str(raised.exception),
+                    *getattr(raised.exception, "__notes__", ()),
+                ]
+            )
+            self.assertEqual(revalidation_count, 2)
+            self.assertIn("post-start launch validation failed", details)
+            self.assertNotIn("failed to start post-start-drift", details)
+            self.assertIn("simulated unverified post-start cleanup", details)
+            self.assertIn("retained launch locator", details)
+            self.assertIsNotNone(observed_launch)
+            assert observed_launch is not None
+            self.assertTrue(observed_launch.exists())
+        finally:
+            for process in spawned:
+                if process.poll() is None:
+                    process.wait(timeout=5)
+            if observed_launch is not None and observed_launch.parent.exists():
+                os.chmod(observed_launch.parent, 0o700)
+                shutil.rmtree(observed_launch.parent)
+            runtime.snapshot_owner.cleanup()
+
+    @unittest.skipUnless(os.name == "posix", "POSIX process-group contract")
     def test_git_launch_is_retained_after_process_identity_loss(self) -> None:
         runtime = self.make_fake_git_runtime("launch-identity-loss")
         actual_popen = subprocess.Popen
@@ -2028,7 +2369,8 @@ class ProjectJournalTests(unittest.TestCase):
             )
             self.assertEqual(raised_error.args, original_args)
             notes = "\n".join(getattr(raised_error, "__notes__", ()))
-            self.assertIn("launch-copy cleanup-incomplete at locator", notes)
+            self.assertIn("launch-copy cleanup-incomplete", notes)
+            self.assertIn("retained launch path is unverified", notes)
             self.assertIn("simulated launch cleanup failure", notes)
             traceback_names: list[str] = []
             traceback = raised_error.__traceback__
@@ -2039,6 +2381,96 @@ class ProjectJournalTests(unittest.TestCase):
             self.assertNotIn("_report_git_launch_issue", traceback_names)
         finally:
             runtime.snapshot_owner.cleanup()
+
+    def test_git_launch_descriptor_close_preserves_active_primary(self) -> None:
+        primary = LegacyInterrupt("simulated launch validation primary")
+        close_error = OSError(errno.EIO, "simulated launch descriptor close failure")
+
+        with mock.patch.object(
+            project_journal.os,
+            "close",
+            side_effect=close_error,
+        ):
+            try:
+                try:
+                    raise primary
+                finally:
+                    project_journal._close_git_launch_descriptor(
+                        8123,
+                        sys.exc_info()[1],
+                        context="injected Git launch revalidation",
+                    )
+            except LegacyInterrupt as raised:
+                observed = raised
+            else:
+                self.fail("expected the active launch validation primary")
+
+        self.assertIs(observed, primary)
+        details = "\n".join(getattr(observed, "__notes__", ()))
+        self.assertIn("Git launch revalidation descriptor cleanup failed", details)
+        self.assertIn("simulated launch descriptor close failure", details)
+
+    def test_git_launch_descriptor_close_only_baseexception_remains_exact(
+        self,
+    ) -> None:
+        close_error = LegacyInterrupt(
+            "simulated close-only launch descriptor interruption"
+        )
+
+        with mock.patch.object(
+            project_journal.os,
+            "close",
+            side_effect=close_error,
+        ):
+            try:
+                project_journal._close_git_launch_descriptor(
+                    8124,
+                    None,
+                    context="injected Git launch revalidation",
+                )
+            except LegacyInterrupt as raised:
+                observed = raised
+            else:
+                self.fail("expected the close-only descriptor interruption")
+
+        self.assertIs(observed, close_error)
+        details = "\n".join(getattr(observed, "__notes__", ()))
+        self.assertIn("Git launch revalidation descriptor cleanup failed", details)
+
+    def test_git_launch_directory_close_only_baseexception_remains_exact(
+        self,
+    ) -> None:
+        close_error = LegacyInterrupt(
+            "simulated bound launch directory close interruption"
+        )
+        ancestor = project_journal._BoundGitLaunchDirectory(
+            path=self.root,
+            fd=8125,
+            identity=(1, 2, os.geteuid(), os.getegid(), 0o700),
+            parent_fd=None,
+            component=None,
+            owner_private=True,
+        )
+
+        with mock.patch.object(
+            project_journal.os,
+            "close",
+            side_effect=close_error,
+        ):
+            try:
+                project_journal._close_bound_git_launch_directories(
+                    (ancestor,),
+                    None,
+                )
+            except LegacyInterrupt as raised:
+                observed = raised
+            else:
+                self.fail("expected the bound-directory close interruption")
+
+        self.assertIs(observed, close_error)
+        self.assertEqual(ancestor.fd, -1)
+        details = "\n".join(getattr(observed, "__notes__", ()))
+        self.assertIn("Git launch path descriptor cleanup 1 failed", details)
 
     def test_git_snapshot_binding_close_failure_preserves_active_error(
         self,
@@ -2281,7 +2713,7 @@ class ProjectJournalTests(unittest.TestCase):
         actual_open_source = project_journal._open_bound_git_runtime_snapshot
         actual_close = project_journal.os.close
         actual_mkdtemp = tempfile.mkdtemp
-        actual_chmod = project_journal.os.chmod
+        actual_fchmod = project_journal.os.fchmod
         source_fd: int | None = None
         source_close_failed = False
         interrupted = False
@@ -2314,27 +2746,14 @@ class ProjectJournalTests(unittest.TestCase):
             return directory
 
         def interrupt_initial_launch_chmod(
-            path: os.PathLike[str] | str,
+            fd: int,
             mode: int,
-            *,
-            dir_fd: int | None = None,
-            follow_symlinks: bool = True,
         ) -> None:
             nonlocal interrupted
-            candidate = pathlib.Path(path)
-            if (
-                not interrupted
-                and mode == 0o700
-                and candidate.name.startswith("project-journal-git-launch-")
-            ):
+            if not interrupted and mode == 0o700 and stat.S_ISDIR(os.fstat(fd).st_mode):
                 interrupted = True
                 raise original_error
-            actual_chmod(
-                path,
-                mode,
-                dir_fd=dir_fd,
-                follow_symlinks=follow_symlinks,
-            )
+            actual_fchmod(fd, mode)
 
         try:
             with mock.patch.object(
@@ -2349,7 +2768,7 @@ class ProjectJournalTests(unittest.TestCase):
                 ):
                     with mock.patch.object(
                         project_journal.os,
-                        "chmod",
+                        "fchmod",
                         side_effect=interrupt_initial_launch_chmod,
                     ):
                         with mock.patch.object(
@@ -2479,7 +2898,7 @@ class ProjectJournalTests(unittest.TestCase):
         actual_open_source = project_journal._open_bound_git_runtime_snapshot
         actual_close = project_journal.os.close
         actual_mkdtemp = tempfile.mkdtemp
-        actual_chmod = project_journal.os.chmod
+        actual_fchmod = project_journal.os.fchmod
         source_fd: int | None = None
         source_close_count = 0
         launch_directories: list[pathlib.Path] = []
@@ -2514,27 +2933,14 @@ class ProjectJournalTests(unittest.TestCase):
             return directory
 
         def interrupt_initial_launch_chmod(
-            path: os.PathLike[str] | str,
+            fd: int,
             mode: int,
-            *,
-            dir_fd: int | None = None,
-            follow_symlinks: bool = True,
         ) -> None:
             nonlocal interrupted
-            candidate = pathlib.Path(path)
-            if (
-                not interrupted
-                and mode == 0o700
-                and candidate.name.startswith("project-journal-git-launch-")
-            ):
+            if not interrupted and mode == 0o700 and stat.S_ISDIR(os.fstat(fd).st_mode):
                 interrupted = True
                 raise active_error
-            actual_chmod(
-                path,
-                mode,
-                dir_fd=dir_fd,
-                follow_symlinks=follow_symlinks,
-            )
+            actual_fchmod(fd, mode)
 
         try:
             with self.default_unblocked_sigint():
@@ -2550,7 +2956,7 @@ class ProjectJournalTests(unittest.TestCase):
                     ):
                         with mock.patch.object(
                             project_journal.os,
-                            "chmod",
+                            "fchmod",
                             side_effect=interrupt_initial_launch_chmod,
                         ):
                             with mock.patch.object(
@@ -11575,11 +11981,43 @@ class ProjectJournalTests(unittest.TestCase):
             skill,
         )
         self.assertIn(
+            "Require every lexical directory or symlink marker, followed target, and descriptor-bound ancestor to be owned by root or the current user",
+            skill,
+        )
+        self.assertIn(
+            "reject every group/world-writable non-sticky directory",
+            skill,
+        )
+        self.assertIn(
+            "one lexical absolute endpoint without synchronous path canonicalization",
+            skill,
+        )
+        self.assertIn(
+            "immediately before and after `Popen`",
+            skill,
+        )
+        self.assertIn(
+            "A post-start mismatch enters the ordinary process-group/reap state machine",
+            skill,
+        )
+        self.assertIn(
+            "labels the original path as unverified",
+            skill,
+        )
+        self.assertIn(
+            "do not claim to stop a malicious same-UID replacement after the last pre-exec check",
+            skill,
+        )
+        self.assertIn(
+            "close-only ordinary failure becomes a `UserError`",
+            skill,
+        )
+        self.assertIn(
             "repeats descriptor/path identity, access, size, and digest validation",
             skill,
         )
         self.assertIn(
-            "an unverified terminal retains and reports the locator",
+            "an unverified terminal reports a locator only after path revalidation",
             skill,
         )
         self.assertIn(
@@ -11802,11 +12240,43 @@ class ProjectJournalTests(unittest.TestCase):
             readme,
         )
         self.assertIn(
+            "Every lexical directory or symlink marker, followed target, and descriptor-bound ancestor must be owned by root or the current user",
+            readme,
+        )
+        self.assertIn(
+            "group/world-writable non-sticky directories and extended ACLs are rejected",
+            readme,
+        )
+        self.assertIn(
+            "binds one lexical absolute temporary-root endpoint without synchronous path canonicalization",
+            readme,
+        )
+        self.assertIn(
+            "immediately before and after `Popen`",
+            readme,
+        )
+        self.assertIn(
+            "A post-start mismatch enters process-group/reap cleanup",
+            readme,
+        )
+        self.assertIn(
+            "unverified original path hint rather than a false locator",
+            readme,
+        )
+        self.assertIn(
+            "do not claim to prevent a malicious same-UID replacement after the final pre-exec check",
+            readme,
+        )
+        self.assertIn(
+            "close-only ordinary failure is wrapped as `UserError`",
+            readme,
+        )
+        self.assertIn(
             "locks the launch directory against ordinary replacement",
             readme,
         )
         self.assertIn(
-            "retains and reports its locator",
+            "reports a locator only after path revalidation",
             readme,
         )
         self.assertIn("byte, record, and stderr bounds", readme)
@@ -15314,6 +15784,90 @@ class ProjectJournalTests(unittest.TestCase):
 
         self.assertTrue(changed)
         self.assertEqual(snapshot, content)
+
+    def test_secure_read_preserves_primary_error_over_descriptor_close_failure(
+        self,
+    ) -> None:
+        config = self.root / "global-config-primary-close"
+        config.write_text("[core]\n", encoding="utf-8")
+        actual_close = project_journal.os.close
+        primary = LegacyInterrupt("injected secure-read primary")
+        close_error = OSError(errno.EIO, "injected secure-read close failure")
+        close_failed = False
+        raised_error: LegacyInterrupt | None = None
+        traceback_names: list[str] = []
+
+        def fail_read(_fd: int) -> os.stat_result:
+            raise primary
+
+        def close_then_fail(fd: int) -> None:
+            nonlocal close_failed
+            actual_close(fd)
+            if not close_failed:
+                close_failed = True
+                raise close_error
+
+        with mock.patch.object(
+            project_journal.os,
+            "fstat",
+            side_effect=fail_read,
+        ):
+            with mock.patch.object(
+                project_journal.os,
+                "close",
+                side_effect=close_then_fail,
+            ):
+                try:
+                    project_journal._secure_read_regular_path(
+                        config,
+                        label="test config",
+                        byte_limit=1024,
+                    )
+                except LegacyInterrupt as raised:
+                    raised_error = raised
+                    traceback_names = self.exception_traceback_names(raised)
+                else:
+                    self.fail("expected secure-read primary error")
+
+        self.assertIs(raised_error, primary)
+        self.assertTrue(close_failed)
+        notes = "\n".join(getattr(primary, "__notes__", ()))
+        self.assertIn("test config descriptor cleanup failed", notes)
+        self.assertIn("type=OSError", notes)
+        self.assertIn("errno=5 (EIO)", notes)
+        self.assertIn("injected secure-read close failure", notes)
+        self.assertIn("fail_read", traceback_names)
+
+    def test_secure_read_wraps_descriptor_close_only_failure(self) -> None:
+        config = self.root / "global-config-close-only"
+        content = b"[core]\n"
+        config.write_bytes(content)
+        actual_close = project_journal.os.close
+        close_error = OSError(errno.EIO, "injected close-only failure")
+
+        def close_then_fail(fd: int) -> None:
+            actual_close(fd)
+            raise close_error
+
+        with mock.patch.object(
+            project_journal.os,
+            "close",
+            side_effect=close_then_fail,
+        ):
+            with self.assertRaises(project_journal.UserError) as raised:
+                project_journal._secure_read_regular_path(
+                    config,
+                    label="test config",
+                    byte_limit=1024,
+                )
+
+        self.assertIs(raised.exception.__cause__, close_error)
+        self.assertIn(
+            "test config descriptor cleanup failed",
+            str(raised.exception),
+        )
+        self.assertIn("type=OSError", str(raised.exception))
+        self.assertIn("errno=5 (EIO)", str(raised.exception))
 
     def test_install_hooks_refuses_actual_system_hooks_path_until_local_override(
         self,
