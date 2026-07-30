@@ -2917,6 +2917,77 @@ class ProjectJournalTests(unittest.TestCase):
         finally:
             runtime.snapshot_owner.cleanup()
 
+    def test_git_runtime_directory_revalidation_close_failure_preserves_active_error(
+        self,
+    ) -> None:
+        runtime = self.make_fake_git_runtime("directory-revalidation-close-error")
+        actual_close = project_journal.os.close
+        directory_fd: int | None = None
+        directory_close_failed = False
+        original_error = LegacyInterrupt(
+            "simulated Git runtime directory revalidation interruption",
+        )
+        original_args = original_error.args
+
+        def interrupt_acl(
+            fd: int,
+            path: pathlib.Path,
+            subject: str,
+        ) -> None:
+            nonlocal directory_fd
+            del path, subject
+            directory_fd = fd
+            raise original_error
+
+        def close_directory_then_fail(fd: int) -> None:
+            nonlocal directory_close_failed
+            if fd == directory_fd and not directory_close_failed:
+                directory_close_failed = True
+                actual_close(fd)
+                raise OSError(
+                    errno.EIO,
+                    "simulated Git runtime directory close failure",
+                )
+            actual_close(fd)
+
+        try:
+            with mock.patch.object(
+                project_journal,
+                "_reject_runtime_extended_acl",
+                side_effect=interrupt_acl,
+            ):
+                with mock.patch.object(
+                    project_journal.os,
+                    "close",
+                    side_effect=close_directory_then_fail,
+                ):
+                    try:
+                        project_journal._revalidate_git_runtime_directory(
+                            runtime,
+                            deadline=time.monotonic() + 5,
+                        )
+                    except LegacyInterrupt as exc:
+                        raised_error = exc
+                    else:
+                        self.fail(
+                            "expected Git runtime directory revalidation interruption"
+                        )
+
+            self.assertIs(raised_error, original_error)
+            self.assertEqual(raised_error.args, original_args)
+            self.assertTrue(directory_close_failed)
+            notes = "\n".join(getattr(raised_error, "__notes__", ()))
+            self.assertIn("directory descriptor cleanup failed", notes)
+            self.assertIn("Git runtime directory close failure", notes)
+            traceback_names = self.exception_traceback_names(raised_error)
+            self.assertIn("interrupt_acl", traceback_names)
+            self.assertNotIn(
+                "_close_git_runtime_snapshot_descriptor_preserving_error",
+                traceback_names,
+            )
+        finally:
+            runtime.snapshot_owner.cleanup()
+
     def test_git_snapshot_verification_close_failure_preserves_active_error(
         self,
     ) -> None:

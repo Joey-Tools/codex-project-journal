@@ -2783,6 +2783,7 @@ def _revalidate_git_runtime_directory(
     )
     _check_deadline(deadline, deadline_error)
     directory_fd = os.open(runtime.executable.parent, directory_flags)
+    operation_error: BaseException | None = None
     try:
         _check_deadline(deadline, deadline_error)
         descriptor_stat = os.fstat(directory_fd)
@@ -2800,8 +2801,16 @@ def _revalidate_git_runtime_directory(
                 "owner-private Git snapshot directory access policy changed "
                 "during ACL inspection"
             )
+    except BaseException as error:
+        operation_error = error
+        raise
     finally:
-        os.close(directory_fd)
+        _close_git_runtime_snapshot_descriptor_preserving_error(
+            directory_fd,
+            operation_error,
+            context="Git runtime snapshot directory revalidation",
+            descriptor="directory",
+        )
 
 
 def _revalidate_open_git_runtime_snapshot(
