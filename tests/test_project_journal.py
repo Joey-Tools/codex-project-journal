@@ -5450,6 +5450,125 @@ class ProjectJournalTests(unittest.TestCase):
             "Git repository resolution",
         )
 
+    @unittest.skipUnless(os.name == "posix", "POSIX raw path byte contract")
+    def test_git_path_record_preserves_non_utf8_bytes_and_whitespace(self) -> None:
+        raw_path = b"/tmp/repo-\xff \n"
+        if os.fsencode(os.fsdecode(raw_path)) != raw_path:
+            self.skipTest("filesystem encoding does not preserve raw path bytes")
+
+        parsed = project_journal._parse_git_path_record(
+            os.fsdecode(raw_path),
+            "test Git path",
+        )
+
+        self.assertEqual(os.fsencode(parsed), raw_path[:-1])
+        for malformed in ("", "path", "\n", "path\0\n"):
+            with self.subTest(malformed=malformed):
+                with self.assertRaisesRegex(
+                    project_journal.UserError,
+                    "malformed path framing",
+                ):
+                    project_journal._parse_git_path_record(
+                        malformed,
+                        "test Git path",
+                    )
+
+    @unittest.skipUnless(os.name == "posix", "POSIX raw path byte contract")
+    def test_non_utf8_repo_does_not_alias_replacement_character_sibling(
+        self,
+    ) -> None:
+        root_bytes = os.fsencode(self.root)
+        raw_repo_bytes = root_bytes + b"/repo-\xff"
+        raw_repo = pathlib.Path(os.fsdecode(raw_repo_bytes))
+        if os.fsencode(raw_repo) != raw_repo_bytes:
+            self.skipTest("filesystem encoding does not preserve raw path bytes")
+        replacement_repo = self.init_repo("repo-\ufffd")
+        raw_git_path_bytes = raw_repo_bytes + b"/.git/hooks"
+        completed = [
+            subprocess.CompletedProcess([], 0, raw_repo_bytes + b"\n", b""),
+            subprocess.CompletedProcess([], 0, raw_git_path_bytes + b"\n", b""),
+            subprocess.CompletedProcess([], 0, raw_repo_bytes + b"/.git\n", b""),
+        ]
+
+        with mock.patch.object(
+            project_journal,
+            "_capture_bounded_process",
+            side_effect=completed,
+        ):
+            resolved = project_journal._resolve_repo(str(raw_repo))
+            git_path = project_journal._git_path(raw_repo, "hooks")
+            common_dir = project_journal._git_common_directory(raw_repo)
+
+        self.assertEqual(os.fsencode(resolved), raw_repo_bytes)
+        self.assertEqual(os.fsencode(git_path), raw_git_path_bytes)
+        self.assertEqual(os.fsencode(common_dir), raw_repo_bytes + b"/.git")
+        self.assertNotEqual(resolved, replacement_repo.resolve())
+        self.assertNotEqual(git_path, replacement_repo / ".git/hooks")
+        self.assertNotEqual(common_dir, replacement_repo / ".git")
+
+    @unittest.skipUnless(
+        sys.platform.startswith("linux"),
+        "Linux filesystem raw path integration",
+    )
+    def test_non_utf8_repo_generate_and_hooks_use_exact_raw_path(self) -> None:
+        raw_name = os.fsdecode(b"repo-\xff")
+        if os.fsencode(raw_name) != b"repo-\xff":
+            self.skipTest("filesystem encoding does not preserve raw path bytes")
+        raw_repo = self.init_repo(raw_name)
+        replacement_repo = self.init_repo("repo-\ufffd")
+        self.write_journal(
+            raw_repo,
+            "docs/project_journal/2026/07/2026-07-30-raw-path-a1b2c3.md",
+            entry_id="20260730-a1b2c3",
+            title="Raw Path",
+            status="active",
+            updated="2026-07-30",
+        )
+        child_env = {
+            "PATH": os.environ.get("PATH", ""),
+            "HOME": str(self.home),
+            "GIT_CONFIG_NOSYSTEM": "1",
+        }
+
+        resolved = project_journal._resolve_repo(str(raw_repo))
+        generated = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPT),
+                "generate",
+                "--repo",
+                str(raw_repo),
+                "--output",
+                "docs/project_journal/INDEX.md",
+                "--ensure-exclude",
+            ],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=child_env,
+        )
+        installed = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPT),
+                "install-hooks",
+                "--repo",
+                str(raw_repo),
+            ],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=child_env,
+        )
+
+        self.assertEqual(os.fsencode(resolved), os.fsencode(raw_repo.resolve()))
+        self.assertEqual(generated.returncode, 0, generated.stderr)
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        self.assertTrue((raw_repo / "docs/project_journal/INDEX.md").is_file())
+        self.assertTrue((raw_repo / ".git/hooks/post-merge").is_file())
+        self.assertFalse((replacement_repo / "docs/project_journal/INDEX.md").exists())
+        self.assertFalse((replacement_repo / ".git/hooks/post-merge").exists())
+
     def test_repo_resolution_avoids_synchronous_path_canonicalization(self) -> None:
         repo = self.init_repo().resolve()
 

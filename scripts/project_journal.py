@@ -3401,9 +3401,29 @@ def _run_git(
     return subprocess.CompletedProcess(
         command,
         result.returncode,
-        result.stdout.decode("utf-8", errors="replace"),
+        os.fsdecode(result.stdout),
         result.stderr.decode("utf-8", errors="replace"),
     )
+
+
+def _git_result_detail(
+    result: subprocess.CompletedProcess[str],
+    fallback: str,
+) -> str:
+    return (
+        _utf8_safe_display(result.stderr).strip()
+        or _utf8_safe_display(result.stdout).strip()
+        or fallback
+    )
+
+
+def _parse_git_path_record(output: str, label: str) -> str:
+    if not output.endswith("\n"):
+        raise UserError(f"{label} returned malformed path framing")
+    path = output[:-1]
+    if not path or "\0" in path:
+        raise UserError(f"{label} returned malformed path framing")
+    return path
 
 
 def _resolve_repo(
@@ -3427,11 +3447,16 @@ def _resolve_repo(
         operation="Git repository resolution",
     )
     if result.returncode != 0:
-        detail = (
-            result.stderr.strip() or result.stdout.strip() or "not a git repository"
-        )
+        detail = _git_result_detail(result, "not a git repository")
         raise UserError(f"{candidate} is not a git repository: {detail}")
-    return _lexical_absolute_path(pathlib.Path(result.stdout.strip()))
+    return _lexical_absolute_path(
+        pathlib.Path(
+            _parse_git_path_record(
+                result.stdout,
+                "Git repository resolution",
+            )
+        )
+    )
 
 
 def _git_path(
@@ -3452,11 +3477,14 @@ def _git_path(
     )
     _check_deadline(deadline, deadline_error)
     if result.returncode != 0:
-        detail = (
-            result.stderr.strip() or result.stdout.strip() or "git path lookup failed"
-        )
+        detail = _git_result_detail(result, "git path lookup failed")
         raise UserError(f"failed to resolve git path {rel!r}: {detail}")
-    path = pathlib.Path(result.stdout.strip())
+    path = pathlib.Path(
+        _parse_git_path_record(
+            result.stdout,
+            f"Git path lookup for {rel!r}",
+        )
+    )
     if not path.is_absolute():
         path = repo / path
     return path
@@ -6610,15 +6638,19 @@ def _git_common_directory(
         operation="Git common-directory lookup",
     )
     _check_deadline(deadline, deadline_error)
-    if common_dir.returncode != 0 or not common_dir.stdout.strip():
-        detail = (
-            common_dir.stderr.strip()
-            or common_dir.stdout.strip()
-            or "Git common directory lookup failed"
+    if common_dir.returncode != 0:
+        detail = _git_result_detail(
+            common_dir,
+            "Git common directory lookup failed",
         )
         raise UserError(f"failed to resolve Git common directory: {detail}")
     return _lexical_absolute_path(
-        pathlib.Path(common_dir.stdout.strip()),
+        pathlib.Path(
+            _parse_git_path_record(
+                common_dir.stdout,
+                "Git common-directory lookup",
+            )
+        ),
         base=repo,
     )
 
@@ -10554,8 +10586,13 @@ def _is_relative_to(path: pathlib.Path, parent: pathlib.Path) -> bool:
     return True
 
 
-def _git_output_path(repo: pathlib.Path, raw_path: str) -> pathlib.Path:
-    path = pathlib.Path(raw_path.strip())
+def _git_output_path(
+    repo: pathlib.Path,
+    raw_path: str,
+    *,
+    label: str,
+) -> pathlib.Path:
+    path = pathlib.Path(_parse_git_path_record(raw_path, label))
     return _lexical_absolute_path(path, base=repo)
 
 
@@ -10587,8 +10624,16 @@ def _source_root_from_linked_worktree(
     if git_dir.returncode != 0 or common_dir.returncode != 0:
         return None
 
-    git_dir_path = _git_output_path(repo, git_dir.stdout)
-    common_dir_path = _git_output_path(repo, common_dir.stdout)
+    git_dir_path = _git_output_path(
+        repo,
+        git_dir.stdout,
+        label="Git directory lookup",
+    )
+    common_dir_path = _git_output_path(
+        repo,
+        common_dir.stdout,
+        label="Git common-directory lookup",
+    )
     if git_dir_path == common_dir_path:
         return None
 
@@ -11271,10 +11316,9 @@ def _repo_root_for_existing_path(
         )
         return None
     if result.returncode != 0:
-        detail = (
-            result.stderr.strip()
-            or result.stdout.strip()
-            or "Git rev-parse returned a nonzero status"
+        detail = _git_result_detail(
+            result,
+            "Git rev-parse returned a nonzero status",
         )
         _classify_failed_git_resolution(
             path,
@@ -11284,7 +11328,14 @@ def _repo_root_for_existing_path(
             deadline=deadline,
         )
         return None
-    return _lexical_absolute_path(pathlib.Path(result.stdout.strip()))
+    return _lexical_absolute_path(
+        pathlib.Path(
+            _parse_git_path_record(
+                result.stdout,
+                "Git repository discovery",
+            )
+        )
+    )
 
 
 def _repo_root_for_path(

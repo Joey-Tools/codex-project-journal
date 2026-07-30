@@ -222,3 +222,16 @@ superseded_by:
   supported runtimes. Final exact-state suites passed all 383 tests:
   Python 3.13.0 completed in 923.861 seconds with 3 platform skips, and Xcode
   Python 3.9.6 completed in 949.927 seconds with 4 platform skips.
+- The fresh whole-range review of signed head
+  `c7402e2ec3817f0ad8ea938566f1fddf18e3b333` found that decoding Git pathname
+  output with UTF-8 replacement could collapse distinct non-UTF-8 byte names
+  onto the same `U+FFFD` spelling. Git pathname records now use
+  `os.fsdecode()` and an exact one-newline framing parser without generic
+  whitespace stripping, while stderr remains a bounded diagnostic rendering.
+  Unit coverage preserves raw path bytes, rejects malformed framing, and
+  proves that a non-UTF-8 repository cannot alias a real `U+FFFD` sibling.
+  A real raw-byte repository/install-hooks integration test is Linux-only
+  because the macOS filesystem rejects creation of the invalid byte name.
+- Final exact-state suites after the pathname-identity repair passed all 386
+  tests: Python 3.13.0 completed in 965.031 seconds with 4 platform skips, and
+  Xcode Python 3.9.6 completed in 994.701 seconds with 5 platform skips.
