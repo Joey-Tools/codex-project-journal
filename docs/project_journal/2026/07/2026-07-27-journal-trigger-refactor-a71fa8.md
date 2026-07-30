@@ -235,3 +235,36 @@ superseded_by:
 - Final exact-state suites after the pathname-identity repair passed all 386
   tests: Python 3.13.0 completed in 965.031 seconds with 4 platform skips, and
   Xcode Python 3.9.6 completed in 994.701 seconds with 5 platform skips.
+- The fresh whole-range review of signed head `9104327` found two remaining
+  P2 boundaries. Installed hooks no longer depend exclusively on the pinned
+  Python/helper chain for terminal diagnostics: under `umask 077` they bind
+  separate log/status descriptors in a `mktemp` directory, unlink both names
+  and remove the directory before helper launch, retain at most 64 KiB while
+  draining the producer, and emit the captured bytes to stderr when persistent
+  append cannot start or fails. The hook still returns zero, uses only
+  non-recursive cleanup, and explicitly does not claim protection from a
+  malicious same-UID replacement before descriptor binding.
+- `adoption-status` and JSON `discover-repos` now share one recursive
+  UTF-8-safe serialization boundary. Filesystem surrogate escapes in
+  repository paths, linked-worktree source paths, and nested cleanup evidence
+  become literal `backslashreplace` display text before `ensure_ascii=False`
+  serialization, while valid schema keys and machine reason codes remain
+  unchanged. Strict UTF-8 sinks therefore cannot raise or emit non-UTF-8 JSON.
+- The final focused selection passed all 19 tests in both supported runtimes:
+  Python 3.13.0 completed in 42.901 seconds and Xcode Python 3.9.6 completed in
+  45.007 seconds. It covers missing helper scripts and interpreters, append
+  dispatch failure, Git preflight failure, the 64 KiB ceiling, anonymous
+  temporary cleanup, closed-stderr `SIGPIPE`/exit-zero behavior, POSIX shell
+  syntax, strict JSON sinks, nested errors, and non-UTF-8 linked-worktree
+  mapping, plus existing hook success/failure paths.
+  Ruff check/format, dual-runtime `py_compile`, generated-hook `bash -n` and
+  `shellcheck`, installed skill validation, project-journal validation, and
+  `git diff --check` passed. The parent workstream retains ownership of the
+  final full-suite rerun.
+- The parent-owned final exact-state suites passed all 396 tests in both
+  supported runtimes: Python 3.13.0 completed in 1140.769 seconds with 4
+  platform skips, and Xcode Python 3.9.6 completed in 1162.014 seconds with 5
+  platform skips. Ruff check/format, dual-runtime `py_compile`, generated-hook
+  `/bin/sh -n`, `bash -n`, and ShellCheck validation, the installed skill
+  validator, project-journal validation, and `git diff --check` passed against
+  the same frozen implementation.

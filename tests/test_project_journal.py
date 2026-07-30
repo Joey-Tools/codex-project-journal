@@ -435,6 +435,39 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         return json.loads(result.stdout)
 
+    def run_hook_body(
+        self,
+        repo: pathlib.Path,
+        body: str,
+        *,
+        env: dict[str, str] | None = None,
+        timeout_seconds: float = 5,
+    ) -> tuple[subprocess.CompletedProcess[str], pathlib.Path]:
+        hook = self.root / "project-journal-test-hook"
+        hook.write_text(body, encoding="utf-8")
+        hook.chmod(0o700)
+        hook_tmp = self.root / "hook-tmp"
+        hook_tmp.mkdir()
+        hook_env = {
+            "PATH": os.environ.get("PATH", ""),
+            "HOME": str(self.home),
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "TMPDIR": str(hook_tmp),
+        }
+        if env is not None:
+            hook_env.update(env)
+        result = subprocess.run(
+            [str(hook)],
+            cwd=repo,
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=hook_env,
+            timeout=timeout_seconds,
+        )
+        return result, hook_tmp
+
     def capture_process(
         self,
         argv: list[str],
@@ -8227,6 +8260,201 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertIn("\\udcff", decoded)
         self.assertEqual(json.loads(decoded), rows)
 
+    def test_adoption_json_recursively_renders_non_utf8_repo_for_strict_sink(
+        self,
+    ) -> None:
+        undecodable_byte = os.fsdecode(b"\xff")
+        repo = pathlib.Path(f"/repo-{undecodable_byte}")
+        adoption = {
+            "tracked_journal_adopted": False,
+            "tracked_non_generated_journal_count": 0,
+            "valid_tracked_journal_count": 0,
+            "diagnostic": {
+                "code": "adoption_check_complete",
+                "cleanup_errors": [
+                    {
+                        "error_type": "OSError",
+                        "message": f"cleanup-{undecodable_byte}",
+                    }
+                ],
+            },
+        }
+        raw_stdout = io.BytesIO()
+        strict_stdout = io.TextIOWrapper(
+            raw_stdout,
+            encoding="utf-8",
+            errors="strict",
+        )
+        args = mock.Mock(repo=str(repo))
+
+        with (
+            mock.patch.object(project_journal, "_resolve_repo", return_value=repo),
+            mock.patch.object(
+                project_journal,
+                "_tracked_journal_adoption",
+                return_value=adoption,
+            ),
+            mock.patch.object(project_journal.sys, "stdout", strict_stdout),
+        ):
+            project_journal.command_adoption_status(args)
+            strict_stdout.flush()
+
+        decoded = raw_stdout.getvalue().decode("utf-8", errors="strict")
+        rendered = json.loads(decoded)
+        self.assertEqual(rendered["repo"], "/repo-\\udcff")
+        self.assertEqual(
+            rendered["diagnostic"]["code"],
+            "adoption_check_complete",
+        )
+        self.assertEqual(
+            rendered["diagnostic"]["cleanup_errors"][0]["error_type"],
+            "OSError",
+        )
+        self.assertEqual(
+            rendered["diagnostic"]["cleanup_errors"][0]["message"],
+            "cleanup-\\udcff",
+        )
+        self.assertNotIn(undecodable_byte, decoded)
+
+    def test_discovery_json_recursively_renders_non_utf8_nested_cleanup_fields(
+        self,
+    ) -> None:
+        undecodable_byte = os.fsdecode(b"\xff")
+        rows = [
+            {
+                "repo": f"/repo-{undecodable_byte}",
+                "adoption_status": "inconclusive",
+                "adoption_error": {
+                    "code": "repository_resolution_failed",
+                    "resolution_reason": "marker_unreadable",
+                    "cleanup_errors": [
+                        {
+                            "context": f"cleanup-{undecodable_byte}",
+                            "details": [
+                                f"detail-{undecodable_byte}",
+                                {"nested": f"value-{undecodable_byte}"},
+                            ],
+                        }
+                    ],
+                },
+            }
+        ]
+        raw_stdout = io.BytesIO()
+        strict_stdout = io.TextIOWrapper(
+            raw_stdout,
+            encoding="utf-8",
+            errors="strict",
+        )
+        args = mock.Mock(
+            codex_home=str(self.root),
+            since_days=1,
+            json_output=True,
+        )
+
+        with (
+            mock.patch.object(project_journal, "_discover_repos", return_value=rows),
+            mock.patch.object(project_journal.sys, "stdout", strict_stdout),
+        ):
+            project_journal.command_discover_repos(args)
+            strict_stdout.flush()
+
+        decoded = raw_stdout.getvalue().decode("utf-8", errors="strict")
+        rendered = json.loads(decoded)
+        error = rendered[0]["adoption_error"]
+        self.assertEqual(error["code"], "repository_resolution_failed")
+        self.assertEqual(error["resolution_reason"], "marker_unreadable")
+        self.assertEqual(rendered[0]["repo"], "/repo-\\udcff")
+        self.assertEqual(
+            error["cleanup_errors"][0]["context"],
+            "cleanup-\\udcff",
+        )
+        self.assertEqual(
+            error["cleanup_errors"][0]["details"],
+            ["detail-\\udcff", {"nested": "value-\\udcff"}],
+        )
+        self.assertNotIn(undecodable_byte, decoded)
+
+    def test_discovery_json_renders_non_utf8_linked_worktree_source_root(
+        self,
+    ) -> None:
+        undecodable_byte = os.fsdecode(b"\xff")
+        codex_home = self.root / "codex-home"
+        worktree = codex_home / "worktrees/c122/repo"
+        source = pathlib.Path(f"/source-{undecodable_byte}")
+        git_dir = worktree / ".git/worktrees/repo"
+        common_dir = source / ".git"
+
+        def existing_root(
+            path: pathlib.Path,
+            *,
+            deadline: float | None = None,
+        ) -> pathlib.Path | None:
+            del deadline
+            if path == worktree:
+                return worktree
+            if path == source:
+                return source
+            self.fail(f"unexpected repository root probe: {path!r}")
+
+        def git_lookup(
+            repo: pathlib.Path,
+            *args: str,
+            **_kwargs: object,
+        ) -> subprocess.CompletedProcess[str]:
+            self.assertEqual(repo, worktree)
+            if args == ("rev-parse", "--git-dir"):
+                output = f"{git_dir}\n"
+            elif args == ("rev-parse", "--git-common-dir"):
+                output = f"{common_dir}\n"
+            else:
+                self.fail(f"unexpected Git lookup: {args!r}")
+            return subprocess.CompletedProcess([], 0, output, "")
+
+        with (
+            mock.patch.object(
+                project_journal,
+                "_repo_root_for_existing_path",
+                side_effect=existing_root,
+            ),
+            mock.patch.object(project_journal, "_run_git", side_effect=git_lookup),
+        ):
+            mapped = project_journal._repo_root_for_path(
+                str(worktree),
+                codex_home=codex_home,
+                deadline=time.monotonic() + 1,
+            )
+
+        self.assertEqual(mapped, source)
+        raw_stdout = io.BytesIO()
+        strict_stdout = io.TextIOWrapper(
+            raw_stdout,
+            encoding="utf-8",
+            errors="strict",
+        )
+        args = mock.Mock(
+            codex_home=str(codex_home),
+            since_days=1,
+            json_output=True,
+        )
+        rows = [
+            {
+                "repo": str(mapped),
+                "adoption_status": "unadopted",
+                "adoption_error": None,
+            }
+        ]
+        with (
+            mock.patch.object(project_journal, "_discover_repos", return_value=rows),
+            mock.patch.object(project_journal.sys, "stdout", strict_stdout),
+        ):
+            project_journal.command_discover_repos(args)
+            strict_stdout.flush()
+
+        decoded = raw_stdout.getvalue().decode("utf-8", errors="strict")
+        rendered = json.loads(decoded)
+        self.assertEqual(rendered[0]["repo"], "/source-\\udcff")
+        self.assertEqual(rendered[0]["adoption_status"], "unadopted")
+
     def test_discovery_json_output_writes_non_utf8_hooks_path_error_to_strict_sink(
         self,
     ) -> None:
@@ -13299,6 +13527,229 @@ class ProjectJournalTests(unittest.TestCase):
         log = repo / ".git/project-journal-index.log"
         self.assertTrue(log.exists())
         self.assertIn("invalid status", log.read_text(encoding="utf-8"))
+
+    def test_hook_missing_helper_script_reports_bounded_stderr_and_cleans_buffer(
+        self,
+    ) -> None:
+        repo = self.init_repo()
+        missing_script = self.root / "removed-project-journal.py"
+        original_script = shlex.quote(str(SCRIPT))
+        replacement_script = shlex.quote(str(missing_script))
+        body = project_journal._hook_body()
+        self.assertEqual(body.count(original_script), 4)
+        body = body.replace(original_script, replacement_script)
+
+        result, hook_tmp = self.run_hook_body(repo, body)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "index refresh and persistent diagnostic append failed",
+            result.stderr,
+        )
+        self.assertIn(str(missing_script), result.stderr)
+        self.assertIn("end bounded diagnostic", result.stderr)
+        self.assertLessEqual(
+            len(result.stderr.encode("utf-8")),
+            project_journal.MAX_HOOK_DIAGNOSTIC_BYTES + 2048,
+        )
+        self.assertEqual(list(hook_tmp.iterdir()), [])
+        self.assertFalse((repo / ".git/project-journal-index.log").exists())
+
+    def test_hook_missing_interpreter_reports_bounded_stderr_and_cleans_buffer(
+        self,
+    ) -> None:
+        repo = self.init_repo()
+        missing_python = self.root / "removed-python"
+        original_python = shlex.quote(sys.executable)
+        replacement_python = shlex.quote(str(missing_python))
+        body = project_journal._hook_body()
+        self.assertEqual(body.count(original_python), 4)
+        body = body.replace(original_python, replacement_python)
+
+        result, hook_tmp = self.run_hook_body(repo, body)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "index refresh and persistent diagnostic append failed",
+            result.stderr,
+        )
+        self.assertIn(str(missing_python), result.stderr)
+        self.assertIn("end bounded diagnostic", result.stderr)
+        self.assertLessEqual(
+            len(result.stderr.encode("utf-8")),
+            project_journal.MAX_HOOK_DIAGNOSTIC_BYTES + 2048,
+        )
+        self.assertEqual(list(hook_tmp.iterdir()), [])
+        self.assertFalse((repo / ".git/project-journal-index.log").exists())
+
+    def test_hook_append_dispatch_failure_reports_original_generate_error(
+        self,
+    ) -> None:
+        repo = self.init_repo()
+        journal = self.write_journal(
+            repo,
+            "docs/project_journal/2026/05/2026-05-05-alpha-a1b2c3.md",
+            entry_id="20260505-a1b2c3",
+            title="Alpha Work",
+            status="active",
+            updated="2026-05-05",
+        )
+        journal.write_text(
+            journal.read_text(encoding="utf-8").replace(
+                "status: active",
+                "status: invalid",
+            ),
+            encoding="utf-8",
+        )
+        body = project_journal._hook_body().replace(
+            "_append-hook-log --repo",
+            "_append-hook-log-unavailable --repo",
+        )
+
+        result, hook_tmp = self.run_hook_body(repo, body)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "index refresh and persistent diagnostic append failed",
+            result.stderr,
+        )
+        self.assertIn("invalid status", result.stderr)
+        self.assertIn("end bounded diagnostic", result.stderr)
+        self.assertEqual(list(hook_tmp.iterdir()), [])
+        self.assertFalse((repo / ".git/project-journal-index.log").exists())
+
+    def test_hook_git_preflight_failure_reports_stderr_and_cleans_buffer(
+        self,
+    ) -> None:
+        repo = self.init_repo()
+        fake_bin = self.root / "fake-bin"
+        fake_bin.mkdir()
+        fake_git = fake_bin / "git"
+        fake_git.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        fake_git.chmod(0o700)
+        inherited_path = os.environ.get("PATH", "")
+        body = project_journal._hook_body()
+
+        result, hook_tmp = self.run_hook_body(
+            repo,
+            body,
+            env={"PATH": f"{fake_bin}{os.pathsep}{inherited_path}"},
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "index refresh and persistent diagnostic append failed",
+            result.stderr,
+        )
+        self.assertIn(
+            "selected Git executable bytes identify a script wrapper",
+            result.stderr,
+        )
+        self.assertIn("end bounded diagnostic", result.stderr)
+        self.assertLessEqual(
+            len(result.stderr.encode("utf-8")),
+            project_journal.MAX_HOOK_DIAGNOSTIC_BYTES + 2048,
+        )
+        self.assertEqual(list(hook_tmp.iterdir()), [])
+        self.assertFalse((repo / ".git/project-journal-index.log").exists())
+
+    def test_hook_terminal_diagnostic_is_hard_bounded(self) -> None:
+        repo = self.init_repo()
+        self.assertEqual(
+            project_journal.MAX_HOOK_DIAGNOSTIC_BYTES
+            % project_journal.HOOK_DIAGNOSTIC_COPY_BLOCK_BYTES,
+            0,
+        )
+        fake_python = self.root / "noisy-python"
+        fake_python.write_text(
+            textwrap.dedent(
+                """\
+                #!/bin/sh
+                if [ "$2" = "generate" ]; then
+                  block=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+                  count=0
+                  while [ "$count" -lt 4096 ]; do
+                    printf '%s' "$block"
+                    count=$((count + 1))
+                  done
+                  exit 1
+                fi
+                exit 1
+                """
+            ),
+            encoding="utf-8",
+        )
+        fake_python.chmod(0o700)
+        original_python = shlex.quote(sys.executable)
+        body = project_journal._hook_body()
+        self.assertEqual(body.count(original_python), 4)
+        body = body.replace(original_python, shlex.quote(str(fake_python)))
+
+        result, hook_tmp = self.run_hook_body(repo, body)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "index refresh and persistent diagnostic append failed",
+            result.stderr,
+        )
+        self.assertIn("end bounded diagnostic", result.stderr)
+        self.assertLessEqual(
+            len(result.stderr.encode("utf-8")),
+            project_journal.MAX_HOOK_DIAGNOSTIC_BYTES + 2048,
+        )
+        self.assertEqual(list(hook_tmp.iterdir()), [])
+        self.assertFalse((repo / ".git/project-journal-index.log").exists())
+
+    def test_hook_body_has_valid_posix_shell_syntax(self) -> None:
+        result = subprocess.run(
+            ["/bin/sh", "-n"],
+            check=False,
+            text=True,
+            input=project_journal._hook_body(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_hook_closed_stderr_cannot_override_zero_exit_or_temp_cleanup(
+        self,
+    ) -> None:
+        repo = self.init_repo()
+        missing_python = self.root / "removed-python"
+        body = project_journal._hook_body().replace(
+            shlex.quote(sys.executable),
+            shlex.quote(str(missing_python)),
+        )
+        hook = self.root / "closed-stderr-hook"
+        hook.write_text(body, encoding="utf-8")
+        hook.chmod(0o700)
+        hook_tmp = self.root / "closed-stderr-tmp"
+        hook_tmp.mkdir()
+        read_fd, write_fd = os.pipe()
+        os.close(read_fd)
+        try:
+            result = subprocess.run(
+                [str(hook)],
+                cwd=repo,
+                check=False,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=write_fd,
+                env={
+                    "PATH": os.environ.get("PATH", ""),
+                    "HOME": str(self.home),
+                    "GIT_CONFIG_NOSYSTEM": "1",
+                    "TMPDIR": str(hook_tmp),
+                },
+                timeout=5,
+            )
+        finally:
+            os.close(write_fd)
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(list(hook_tmp.iterdir()), [])
+        self.assertFalse((repo / ".git/project-journal-index.log").exists())
 
     def test_installed_hook_ignores_ambient_git_repo_redirection(self) -> None:
         repo = self.init_repo("victim")

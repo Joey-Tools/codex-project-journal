@@ -80,6 +80,8 @@ MAX_GIT_VERSION_OUTPUT_BYTES = 4096
 MAX_GLOBAL_GIT_CONFIG_OUTPUT_BYTES = 16 * 1024
 MAX_GLOBAL_GIT_CONFIG_SOURCE_BYTES = 1024 * 1024
 MAX_EXISTING_HOOK_BYTES = 1024 * 1024
+MAX_HOOK_DIAGNOSTIC_BYTES = 64 * 1024
+HOOK_DIAGNOSTIC_COPY_BLOCK_BYTES = 4096
 MAX_DISCOVERY_EXCLUDE_BYTES = 1024 * 1024
 MAX_DISCOVERY_HOOK_BYTES = MAX_EXISTING_HOOK_BYTES
 MAX_HOOK_RECOVERY_PATH_SCAN_ENTRIES = 4096
@@ -2295,6 +2297,19 @@ def _utf8_safe_json_value(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_utf8_safe_json_value(item) for item in value]
     return value
+
+
+def _utf8_safe_json_document(value: Any) -> str:
+    """Serialize only the helper's already-bounded CLI status documents."""
+
+    rendered = json.dumps(
+        _utf8_safe_json_value(value),
+        ensure_ascii=False,
+        indent=2,
+        sort_keys=True,
+    )
+    rendered.encode("utf-8", errors="strict")
+    return rendered
 
 
 def _bounded_journal_path_label(path: str | bytes) -> str:
@@ -6557,7 +6572,7 @@ def command_adoption_status(args: argparse.Namespace) -> int:
         "repo": str(repo),
         **_tracked_journal_adoption(repo, deadline=deadline),
     }
-    print(json.dumps(status, ensure_ascii=False, indent=2, sort_keys=True))
+    print(_utf8_safe_json_document(status))
     return 0
 
 
@@ -6576,6 +6591,7 @@ def command_append_hook_log(args: argparse.Namespace) -> int:
 def _hook_body() -> str:
     python_exe = shlex.quote(sys.executable)
     script_path = shlex.quote(str(pathlib.Path(__file__).resolve()))
+    diagnostic_blocks = MAX_HOOK_DIAGNOSTIC_BYTES // HOOK_DIAGNOSTIC_COPY_BLOCK_BYTES
     return f"""#!/bin/sh
 {HOOK_BEGIN}
 hook_name=${{0##*/}}
@@ -6592,18 +6608,79 @@ if [ -z "$repo" ]; then
   exit 0
 fi
 
-tmp_log=$(mktemp "${{TMPDIR:-/tmp}}/project-journal-index.XXXXXX" 2>/dev/null)
+tmp_dir=$(umask 077 && mktemp -d "${{TMPDIR:-/tmp}}/project-journal-index.XXXXXX" 2>/dev/null)
+tmp_log=
+tmp_status=
 
-if [ -n "$tmp_log" ]; then
-  if ! {{
-    date -u '+%Y-%m-%dT%H:%M:%SZ'
-    {python_exe} {script_path} generate --repo "$repo" --output {DEFAULT_INDEX.as_posix()} --ensure-exclude
-  }} > "$tmp_log" 2>&1; then
-    {python_exe} {script_path} _append-hook-log --repo "$repo" < "$tmp_log" 2>/dev/null || true
+if [ -n "$tmp_dir" ] && [ -d "$tmp_dir" ] && [ ! -L "$tmp_dir" ]; then
+  tmp_log=$tmp_dir/log
+  tmp_status=$tmp_dir/status
+  if (
+    umask 077 &&
+    set -C &&
+    : > "$tmp_log" &&
+    : > "$tmp_status"
+  ) 2>/dev/null && (
+    [ -f "$tmp_log" ] || exit 125
+    [ ! -L "$tmp_log" ] || exit 125
+    [ -f "$tmp_status" ] || exit 125
+    [ ! -L "$tmp_status" ] || exit 125
+    exec 3< "$tmp_log" || exit 125
+    exec 5< "$tmp_log" || exit 125
+    exec 4>> "$tmp_log" || exit 125
+    exec 6< "$tmp_status" || exit 125
+    exec 7> "$tmp_status" || exit 125
+    rm -f -- "$tmp_log" "$tmp_status" || exit 125
+    rmdir "$tmp_dir" || exit 125
+    {{
+      {{
+        date -u '+%Y-%m-%dT%H:%M:%SZ'
+        {python_exe} {script_path} generate --repo "$repo" --output {DEFAULT_INDEX.as_posix()} --ensure-exclude
+        generation_status=$?
+        printf '%s\n' "$generation_status" >&7
+      }} 2>&1
+    }} | {{
+      LC_ALL=C dd bs={HOOK_DIAGNOSTIC_COPY_BLOCK_BYTES} count={diagnostic_blocks} >&4 2>/dev/null
+      cat >/dev/null
+    }}
+    exec 4>&-
+    exec 7>&-
+    if ! IFS= read -r generation_status <&6; then
+      generation_status=125
+    fi
+    case "$generation_status" in
+      ''|*[!0-9]*) generation_status=125 ;;
+    esac
+    if [ "$generation_status" -ne 0 ]; then
+      if ! {python_exe} {script_path} _append-hook-log --repo "$repo" <&3 2>/dev/null; then
+        trap '' PIPE
+        printf '%s\n' \
+          'project-journal: index refresh and persistent diagnostic append failed; bounded diagnostic follows' >&2 || true
+        LC_ALL=C dd bs={HOOK_DIAGNOSTIC_COPY_BLOCK_BYTES} count={diagnostic_blocks} <&5 >&2 2>/dev/null || true
+        printf '%s\n' 'project-journal: end bounded diagnostic' >&2 || true
+      fi
+    fi
+    exec 3<&-
+    exec 5<&-
+    exec 6<&-
+    exit 0
+  ); then
+    :
+  else
+    [ -n "$tmp_log" ] && rm -f -- "$tmp_log" "$tmp_status" 2>/dev/null || true
+    [ -n "$tmp_dir" ] && rmdir "$tmp_dir" 2>/dev/null || true
+    if ! {python_exe} {script_path} generate --repo "$repo" --output {DEFAULT_INDEX.as_posix()} --ensure-exclude >/dev/null 2>&1; then
+      trap '' PIPE
+      printf '%s\n' \
+        'project-journal: index refresh failed and no secure diagnostic buffer was available' >&2 || true
+    fi
   fi
-  rm -f "$tmp_log"
 else
-  {python_exe} {script_path} generate --repo "$repo" --output {DEFAULT_INDEX.as_posix()} --ensure-exclude >/dev/null 2>&1 || true
+  if ! {python_exe} {script_path} generate --repo "$repo" --output {DEFAULT_INDEX.as_posix()} --ensure-exclude >/dev/null 2>&1; then
+    trap '' PIPE
+    printf '%s\n' \
+      'project-journal: index refresh failed and no secure diagnostic buffer was available' >&2 || true
+  fi
 fi
 
 exit 0
@@ -12228,7 +12305,7 @@ def command_discover_repos(args: argparse.Namespace) -> int:
     codex_home = pathlib.Path(args.codex_home).expanduser().resolve()
     rows = _discover_repos(codex_home, args.since_days)
     if args.json_output:
-        print(json.dumps(rows, ensure_ascii=False, indent=2, sort_keys=True))
+        print(_utf8_safe_json_document(rows))
         return 0
     for row in rows:
         repo_label = row["repo"] or row.get("candidate_cwd") or "<unresolved>"
