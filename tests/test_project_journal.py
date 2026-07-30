@@ -2502,6 +2502,259 @@ class ProjectJournalTests(unittest.TestCase):
         finally:
             runtime.snapshot_owner.cleanup()
 
+    def test_git_launch_cleanup_does_not_consume_ambient_exception(self) -> None:
+        ambient = RuntimeError("unrelated outer exception")
+        cleanup_error = project_journal.UserError(
+            "injected ambient Git launch cleanup failure"
+        )
+        launch = mock.Mock(cleanup_safe=True)
+        completed = subprocess.CompletedProcess(
+            ["/bound/git", "probe"],
+            0,
+            b"ok\n",
+            b"",
+        )
+
+        def cleanup_or_preserve(
+            _launch: object,
+            _operation: str,
+            active_error: BaseException | None,
+        ) -> None:
+            if active_error is not None:
+                project_journal._add_exception_detail(
+                    active_error,
+                    str(cleanup_error),
+                )
+                return
+            raise cleanup_error
+
+        try:
+            raise ambient
+        except RuntimeError:
+            with (
+                mock.patch.object(
+                    project_journal,
+                    "_prepare_git_runtime_launch",
+                    return_value=launch,
+                ),
+                mock.patch.object(
+                    project_journal,
+                    "_capture_bounded_process_with_launch",
+                    return_value=completed,
+                ),
+                mock.patch.object(
+                    project_journal,
+                    "_cleanup_git_launch_after_terminal",
+                    side_effect=cleanup_or_preserve,
+                ),
+                self.assertRaises(project_journal.UserError) as raised,
+            ):
+                project_journal._capture_bounded_process(
+                    ["/bound/git", "probe"],
+                    env={},
+                    verified_runtime=mock.sentinel.runtime,
+                    timeout_seconds=2,
+                    stdout_limit=1024,
+                    stderr_limit=1024,
+                    stdout_overflow_error="stdout overflow",
+                    stderr_overflow_error="stderr overflow",
+                    timeout_error="launch timed out",
+                    operation="ambient Git launch",
+                )
+
+        self.assertIs(raised.exception, cleanup_error)
+        self.assertEqual(getattr(ambient, "__notes__", ()), ())
+
+    @unittest.skipUnless(os.name == "posix", "POSIX process-status contract")
+    def test_process_observer_close_does_not_consume_ambient_exception(
+        self,
+    ) -> None:
+        ambient = RuntimeError("unrelated outer exception")
+        observer_error = "injected ambient process observer close failure"
+
+        try:
+            raise ambient
+        except RuntimeError:
+            with (
+                mock.patch.object(
+                    project_journal,
+                    "_close_process_status_observer",
+                    return_value=observer_error,
+                ),
+                self.assertRaisesRegex(
+                    project_journal.UserError,
+                    observer_error,
+                ),
+            ):
+                self.capture_process(
+                    [sys.executable, "-c", "pass"],
+                    timeout_seconds=2,
+                    stdout_limit=1024,
+                )
+
+        self.assertEqual(getattr(ambient, "__notes__", ()), ())
+
+    @unittest.skipUnless(os.name == "posix", "POSIX process-status contract")
+    def test_identity_settlement_failure_receives_observer_cleanup_evidence(
+        self,
+    ) -> None:
+        settlement_error = LegacyInterrupt("injected identity-settlement interruption")
+        observer_error = "injected observer close failure after settlement"
+        actual_popen = project_journal.subprocess.Popen
+        spawned: list[subprocess.Popen[bytes]] = []
+
+        def capture_process(
+            argv: list[str],
+            *args: object,
+            **kwargs: object,
+        ) -> subprocess.Popen[bytes]:
+            process = actual_popen(argv, *args, **kwargs)
+            spawned.append(process)
+            return process
+
+        try:
+            with (
+                mock.patch.object(
+                    project_journal.subprocess,
+                    "Popen",
+                    side_effect=capture_process,
+                ),
+                mock.patch.object(
+                    project_journal,
+                    "_wait_for_process_status_without_reaping",
+                    side_effect=project_journal._ProcessIdentityLost(
+                        "injected process identity loss"
+                    ),
+                ),
+                mock.patch.object(
+                    project_journal,
+                    "_settle_direct_child_after_identity_loss",
+                    side_effect=settlement_error,
+                ),
+                mock.patch.object(
+                    project_journal,
+                    "_close_process_status_observer",
+                    return_value=observer_error,
+                ),
+                self.assertRaises(LegacyInterrupt) as raised,
+            ):
+                self.capture_process(
+                    [sys.executable, "-c", "pass"],
+                    timeout_seconds=2,
+                    stdout_limit=1024,
+                )
+        finally:
+            for process in spawned:
+                process.wait(timeout=5)
+
+        self.assertIs(raised.exception, settlement_error)
+        self.assertIn(
+            observer_error,
+            "\n".join(getattr(settlement_error, "__notes__", ())),
+        )
+
+    @unittest.skipUnless(os.name == "posix", "POSIX process-status contract")
+    def test_generic_cleanup_handler_failure_receives_observer_evidence(
+        self,
+    ) -> None:
+        primary = LegacyInterrupt("injected process action interruption")
+        handler_error = LegacyInterrupt("injected stream cleanup interruption")
+        observer_error = "injected observer close failure after handler"
+
+        def reject_stdout(_chunk: bytes) -> None:
+            raise primary
+
+        with (
+            mock.patch.object(
+                project_journal,
+                "_close_process_streams",
+                side_effect=handler_error,
+            ),
+            mock.patch.object(
+                project_journal,
+                "_close_process_status_observer",
+                return_value=observer_error,
+            ),
+            self.assertRaises(LegacyInterrupt) as raised,
+        ):
+            self.capture_process(
+                [sys.executable, "-c", "print('output')"],
+                timeout_seconds=2,
+                stdout_limit=1024,
+                stdout_feed=reject_stdout,
+            )
+
+        self.assertIs(raised.exception, handler_error)
+        self.assertIn(
+            observer_error,
+            "\n".join(getattr(handler_error, "__notes__", ())),
+        )
+        self.assertEqual(getattr(primary, "__notes__", ()), ())
+
+    @unittest.skipUnless(os.name == "posix", "POSIX process-status contract")
+    def test_observer_cleanup_baseexception_does_not_consume_ambient_exception(
+        self,
+    ) -> None:
+        ambient = RuntimeError("unrelated outer exception")
+        observer_error = LegacyInterrupt(
+            "injected process observer cleanup interruption"
+        )
+
+        try:
+            raise ambient
+        except RuntimeError:
+            with (
+                mock.patch.object(
+                    project_journal,
+                    "_close_process_status_observer",
+                    side_effect=observer_error,
+                ),
+                self.assertRaises(LegacyInterrupt) as raised,
+            ):
+                self.capture_process(
+                    [sys.executable, "-c", "pass"],
+                    timeout_seconds=2,
+                    stdout_limit=1024,
+                )
+
+        self.assertIs(raised.exception, observer_error)
+        self.assertEqual(getattr(ambient, "__notes__", ()), ())
+
+    @unittest.skipUnless(os.name == "posix", "POSIX process-status contract")
+    def test_observer_cleanup_baseexception_preserves_process_primary(
+        self,
+    ) -> None:
+        primary = LegacyInterrupt("injected process primary interruption")
+        observer_error = OSError(
+            errno.EIO,
+            "injected process observer cleanup failure",
+        )
+
+        def reject_stdout(_chunk: bytes) -> None:
+            raise primary
+
+        with (
+            mock.patch.object(
+                project_journal,
+                "_close_process_status_observer",
+                side_effect=observer_error,
+            ),
+            self.assertRaises(LegacyInterrupt) as raised,
+        ):
+            self.capture_process(
+                [sys.executable, "-c", "print('output')"],
+                timeout_seconds=2,
+                stdout_limit=1024,
+                stdout_feed=reject_stdout,
+            )
+
+        self.assertIs(raised.exception, primary)
+        notes = "\n".join(getattr(primary, "__notes__", ()))
+        self.assertIn("process-status observer cleanup failed", notes)
+        self.assertIn("type=OSError", notes)
+        self.assertIn("errno=5 (EIO)", notes)
+        self.assertIn(str(observer_error), notes)
+
     def test_git_launch_descriptor_close_preserves_active_primary(self) -> None:
         primary = LegacyInterrupt("simulated launch validation primary")
         close_error = OSError(errno.EIO, "simulated launch descriptor close failure")
@@ -16166,6 +16419,44 @@ class ProjectJournalTests(unittest.TestCase):
         )
         self.assertIn("type=OSError", str(raised.exception))
         self.assertIn("errno=5 (EIO)", str(raised.exception))
+
+    def test_secure_read_does_not_consume_ambient_exception(self) -> None:
+        config = self.root / "global-config-ambient-close"
+        config.write_text("[core]\n", encoding="utf-8")
+        ambient = RuntimeError("unrelated outer exception")
+        close_error = OSError(
+            errno.EIO,
+            "injected secure-read ambient close failure",
+        )
+        actual_close = project_journal.os.close
+
+        def close_then_fail(fd: int) -> None:
+            actual_close(fd)
+            raise close_error
+
+        try:
+            raise ambient
+        except RuntimeError:
+            with (
+                mock.patch.object(
+                    project_journal.os,
+                    "close",
+                    side_effect=close_then_fail,
+                ),
+                self.assertRaises(project_journal.UserError) as raised,
+            ):
+                project_journal._secure_read_regular_path(
+                    config,
+                    label="test config",
+                    byte_limit=1024,
+                )
+
+        self.assertIs(raised.exception.__cause__, close_error)
+        self.assertIn(
+            "test config descriptor cleanup failed",
+            str(raised.exception),
+        )
+        self.assertEqual(getattr(ambient, "__notes__", ()), ())
 
     def test_install_hooks_refuses_actual_system_hooks_path_until_local_override(
         self,

@@ -188,3 +188,24 @@ superseded_by:
 - Follow-up strict-output repair applies the same UTF-8 display boundary recursively to every serialized discovery-error value, including rollout source paths, repository marker paths, and nested cleanup evidence, while leaving valid machine reason codes byte-for-byte unchanged. Focused strict-sink coverage includes a non-UTF-8 rollout source with an `invalid_json` terminal error and nested non-UTF-8 cleanup fields; the 11-test discovery/error selection passed in both supported runtimes. Final exact-state suites passed all 367 tests: Python 3.13.0 completed in 936.197 seconds with 3 platform skips, and Xcode Python 3.9.6 completed in 959.650 seconds with 4 platform skips. Ruff check/format verification, dual-runtime compilation, project-journal validation, and `git diff --check` also passed.
 - Descriptor-close precedence follow-up routes generated-index marker inspection plus discovery auxiliary bind/read/existence cleanup through one bounded evidence helper. An active read, deadline, replacement, or semantic-limit exception remains the exact primary with its machine code and limit fields intact; an ordinary close-only failure is wrapped in the matching generated-index or discovery-auxiliary domain error, while a close-only non-`Exception` `BaseException` remains exact. Each cleanup region records only an exception raised by its own operation body, so an unrelated outer exception cannot absorb a close failure or receive its evidence. Eight focused regressions passed in both supported runtimes. Final exact-state suites passed all 375 tests: Python 3.13.0 completed in 816.596 seconds with 3 platform skips, and Xcode Python 3.9.6 completed in 836.294 seconds with 4 platform skips.
 - A fresh whole-range review identified that the admitted musl multiarch values do not share the reviewed glibc `struct sigaction` layout. Musl now fails closed before loading libc, starting `Popen`, or issuing `killpg`; the reviewed native layout remains limited to 64-bit glibc x86_64/AArch64 until a separate musl layout and real-runtime proof are available. The focused ABI rejection selection passed in both supported runtimes. Final exact-state suites again passed all 375 tests: Python 3.13.0 completed in 1015.694 seconds with 3 platform skips, and Xcode Python 3.9.6 completed in 1034.613 seconds with 4 platform skips.
+- A fresh whole-range review of signed head `335fc9e` found three remaining
+  cleanup regions that still treated an unrelated outer `sys.exc_info()`
+  value as though it came from the current secure-read or process operation.
+  Secure reads and outer Git-launch cleanup now record only an exception raised
+  by their own operation body. Process supervision separately records whether
+  its own body entered an exception handler and, only in that case, binds
+  observer cleanup evidence to the exception actually propagating through the
+  terminal `finally`. A narrow follow-up audit caught and closed the deeper
+  handler-failure case: identity settlement or generic cleanup may itself
+  replace the original exception, and observer cleanup must attach to that
+  final replacement rather than the stale original. Observer cleanup that
+  itself raises a `BaseException` is also exact on an otherwise-successful
+  operation and becomes bounded evidence without replacing an active primary.
+  Seven new ambient, handler-failure, and observer-error regressions plus four
+  existing primary/close/identity regressions passed under both supported
+  runtimes, and the independent implementation audit returned clean. Final
+  exact-state suites passed all 382 tests: Python 3.13.0 completed in 867.351
+  seconds with 3 platform skips, and Xcode Python 3.9.6 completed in 891.611
+  seconds with 4 platform skips. Ruff lint/format, dual-runtime compilation,
+  installed OpenAI skill validation, project-journal validation, and
+  `git diff --check` passed.

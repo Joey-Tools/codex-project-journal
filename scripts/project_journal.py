@@ -2647,6 +2647,7 @@ def _secure_read_regular_path(
         )
         raise UserError(f"failed to open {label} {path}: {detail}") from exc
 
+    operation_error: BaseException | None = None
     try:
         _check_deadline(deadline, deadline_error)
         before = os.fstat(fd)
@@ -2708,24 +2709,16 @@ def _secure_read_regular_path(
         if first != second:
             raise UserError(f"{label} content changed while being read: {path}")
         return first
+    except BaseException as error:
+        operation_error = error
+        raise
     finally:
-        active_error = sys.exc_info()[1]
-        try:
-            os.close(fd)
-        except BaseException as close_error:
-            details = _exception_evidence_details(
-                close_error,
-                context=f"{label} descriptor cleanup failed",
-            )
-            if active_error is not None:
-                _add_exception_details(active_error, details)
-            elif isinstance(close_error, Exception):
-                wrapped = UserError(details[0])
-                _add_exception_details(wrapped, details[1:])
-                raise wrapped from close_error
-            else:
-                _add_exception_details(close_error, details)
-                raise
+        _close_descriptor_preserving_error(
+            fd,
+            active_error=operation_error,
+            context=f"{label} descriptor cleanup failed",
+            wrap_close_error=lambda message, _error_number: UserError(message),
+        )
 
 
 def _hash_open_file(
@@ -4852,6 +4845,7 @@ def _capture_bounded_process(
     if operation_deadline <= started_at:
         raise UserError(timeout_error)
     launch: _GitLaunchCopy | None = None
+    operation_error: BaseException | None = None
     try:
         if verified_runtime is not None:
             launch = _prepare_git_runtime_launch(
@@ -4874,18 +4868,20 @@ def _capture_bounded_process(
             timeout_error=timeout_error,
             operation=operation,
         )
+    except BaseException as error:
+        operation_error = error
+        raise
     finally:
         if launch is not None:
-            active_error = sys.exc_info()[1]
             if launch.cleanup_safe:
                 _cleanup_git_launch_after_terminal(
                     launch,
                     operation,
-                    active_error,
+                    operation_error,
                 )
             else:
                 _report_git_launch_issue(
-                    active_error,
+                    operation_error,
                     f"{operation} lifecycle state is unverified; "
                     f"{_git_launch_retention_evidence(launch)}",
                 )
@@ -4939,6 +4935,7 @@ def _capture_bounded_process_with_launch(
             launch.mark_cleanup_safe()
         raise
 
+    operation_failed = False
     try:
         try:
             _check_deadline(operation_deadline, timeout_error)
@@ -5167,6 +5164,7 @@ def _capture_bounded_process_with_launch(
             _close_selector(selector)
             selector_open = False
     except _ProcessIdentityLost as exc:
+        operation_failed = True
         ownership.abandon_incomplete()
         if selector_open:
             _close_selector(selector)
@@ -5183,6 +5181,7 @@ def _capture_bounded_process_with_launch(
         _add_exception_detail(error, settlement)
         raise error from exc
     except BaseException as exc:
+        operation_failed = True
         if process is None:
             if selector_open:
                 _close_selector(selector)
@@ -5298,11 +5297,23 @@ def _capture_bounded_process_with_launch(
             _add_exception_details(exc, cleanup_details)
         raise
     finally:
+        active_error = sys.exc_info()[1] if operation_failed else None
         if launch is not None and ownership.state == "released":
             launch.mark_cleanup_safe()
-        observer_close_error = _close_process_status_observer(process)
+        try:
+            observer_close_error = _close_process_status_observer(process)
+        except BaseException as observer_error:
+            if active_error is None:
+                raise
+            _add_exception_details(
+                active_error,
+                _exception_evidence_details(
+                    observer_error,
+                    context=f"{operation} process-status observer cleanup failed",
+                ),
+            )
+            observer_close_error = None
         if observer_close_error is not None:
-            active_error = sys.exc_info()[1]
             if active_error is None:
                 raise UserError(observer_close_error)
             _add_exception_detail(active_error, observer_close_error)
