@@ -9507,7 +9507,7 @@ def _install_hook(
                     getattr(exc, "__notes__", ()),
                 )
                 raise wrapped from exc
-            raise UserError(message) from exc
+            raise _wrap_user_error_preserving_details(message, exc) from exc
         raise
     except BaseException as exc:
         if commit_state.absent_rename_may_have_committed:

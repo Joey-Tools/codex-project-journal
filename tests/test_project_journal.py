@@ -16570,6 +16570,67 @@ class ProjectJournalTests(unittest.TestCase):
         )
         self.assertTrue((repo / ".githooks/post-merge").exists())
 
+    def test_post_commit_generic_user_error_wrapper_preserves_notes(self) -> None:
+        repo = self.init_repo("repo-post-commit-generic-notes").resolve()
+        configured = run_git(
+            repo,
+            "config",
+            "--local",
+            "core.hooksPath",
+            ".githooks",
+        )
+        self.assertEqual(configured.returncode, 0, configured.stderr)
+        binding = project_journal._preflight_hook_targets(repo)
+        target = binding.targets[0]
+        actual_snapshot = project_journal._snapshot_hook_target
+        note = (
+            "hook target inspection descriptor cleanup failed: "
+            "type=OSError, errno=5 (EIO), message=injected close failure"
+        )
+        source = project_journal.UserError(
+            "injected generic post-commit target inspection failure"
+        )
+        project_journal._add_exception_detail(source, note)
+        target_snapshot_count = 0
+        final_snapshot_failed = False
+
+        def fail_final_installed_snapshot(
+            selected_binding: project_journal._HookDirectoryBinding,
+            name: str,
+        ) -> tuple[project_journal._HookTargetSnapshot, bytes | None]:
+            nonlocal final_snapshot_failed, target_snapshot_count
+            if name == target.name:
+                target_snapshot_count += 1
+                if target_snapshot_count == 3:
+                    final_snapshot_failed = True
+                    raise source
+            return actual_snapshot(selected_binding, name)
+
+        try:
+            with mock.patch.object(
+                project_journal,
+                "_snapshot_hook_target",
+                side_effect=fail_final_installed_snapshot,
+            ):
+                with self.assertRaises(project_journal.UserError) as raised:
+                    project_journal._install_hook(
+                        binding,
+                        target,
+                    )
+        finally:
+            project_journal._close_hook_binding(binding)
+
+        self.assertTrue(final_snapshot_failed)
+        self.assertGreaterEqual(target_snapshot_count, 3)
+        self.assertIs(raised.exception.__cause__, source)
+        self.assertEqual(getattr(raised.exception, "__notes__", ()), [note])
+        self.assertIn("hook target installation committed", str(raised.exception))
+        self.assertIn(
+            "installed-target verification is incomplete",
+            str(raised.exception),
+        )
+        self.assertTrue((repo / ".githooks/post-merge").exists())
+
     def test_effective_destination_drift_before_commit_cleans_staged_hook(
         self,
     ) -> None:

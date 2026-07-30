@@ -538,3 +538,40 @@ superseded_by:
   `py_compile`, the installed Joey/OpenAI skill validator, both runtimes'
   project journal validation, and `git diff --check`. The two task-scoped
   bytecode caches were removed with the protected cleanup helper.
+- Signed head `f2f501d` passed exact-secret admission with complete temporary
+  cleanup, was pushed to PR #5, and passed Linux Python 3.14.6 CI in 78
+  seconds. A new fully paginated request-ledger race close again proved zero
+  GitHub Codex requests on that head and no unresolved historical request.
+- The next independently materialized fresh-context, strictly read-only
+  whole-range named-single review found one P2 and passed terminal guard
+  validation: the generic post-commit `UserError` wrapper replaced its source
+  exception without copying bounded `__notes__`. A final installed-target
+  inspection failure could therefore lose descriptor-close evidence that was
+  visible only on the source error.
+- The generic committed-target branch now uses the same
+  `_wrap_user_error_preserving_details()` path as the OSError branches. The
+  wrapper remains a `UserError`, preserves its source as `__cause__`, and
+  copies bounded source notes while retaining committed-target recovery
+  context.
+- The first new integration assertion correctly reached the generic
+  post-commit wrapper but overbound the total target-snapshot count: recovery
+  evidence performs a fourth read after the injected third final-verification
+  failure. The regression now proves the exact third-call injection with an
+  explicit flag while allowing that subsequent bounded evidence probe.
+- Three exact wrapper-note regressions passed in both supported runtimes:
+  Python 3.13.0 completed in 5.813 seconds and Xcode Python 3.9.6 in 5.773
+  seconds. The complete five-test `post_commit` subset passed in 63.214 and
+  63.679 seconds respectively. Ruff check/format and `git diff --check`
+  passed.
+- An independent read-only audit rechecked every committed-target OSError,
+  generic Exception, special effective-destination, and BaseException branch,
+  plus the real integration injection boundary. It returned `No findings.`
+- Final exact-state full suites passed all 432 tests in both supported local
+  runtimes: Python 3.13.0 completed in 964.951 seconds with 4 platform skips,
+  and Xcode Python 3.9.6 completed in 985.234 seconds with 5 platform skips.
+  A bounded follow-up inventory found no retained recent
+  `project-journal-git-launch-*` directory.
+- Final post-evidence verification passed Ruff check/format, both runtimes'
+  `py_compile`, the installed Joey/OpenAI skill validator, both runtimes'
+  project journal validation, and `git diff --check`. The two task-scoped
+  bytecode caches were removed with the protected cleanup helper.
