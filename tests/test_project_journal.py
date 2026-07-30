@@ -8786,6 +8786,37 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("superseded_by target", result.stderr)
 
+    def test_hook_commit_state_verified_phase_is_terminal(self) -> None:
+        state = project_journal._HookCommitState()
+
+        self.assertEqual(state.phase, "staged-cleanup-safe")
+        self.assertFalse(state.installed_target_committed)
+        state.mark_installed_target_committed("displaced-hook cleanup")
+        self.assertTrue(state.installed_target_committed)
+        self.assertEqual(state.pending_step, "displaced-hook cleanup")
+        state.mark_temporary_consumed()
+        self.assertEqual(state.pending_step, "directory durability")
+        state.mark_directory_durable()
+        self.assertEqual(state.pending_step, "final installed-target verification")
+        state.mark_installed_target_verified()
+        self.assertEqual(
+            state.pending_step,
+            "final effective hook destination verification",
+        )
+
+        state.mark_verified()
+
+        self.assertEqual(state.phase, "verified")
+        self.assertIsNone(state.pending_step)
+        self.assertFalse(state.installed_target_committed)
+        self.assertFalse(state.absent_rename_may_have_committed)
+        self.assertFalse(state.must_preserve_temporary)
+        state.mark_temporary_consumed()
+        state.mark_directory_durable()
+        state.mark_installed_target_verified()
+        self.assertEqual(state.phase, "verified")
+        self.assertIsNone(state.pending_step)
+
     def test_install_hooks_is_idempotent_and_hook_does_not_block(self) -> None:
         repo = self.init_repo()
         self.write_journal(
@@ -10848,6 +10879,73 @@ class ProjectJournalTests(unittest.TestCase):
                     notes,
                 )
                 self.assertNotIn("recovery locator", notes)
+
+    def test_install_hooks_final_verified_window_propagates_deferred_signal_cleanly(
+        self,
+    ) -> None:
+        signums = tuple(
+            getattr(project_journal.signal, name)
+            for name in ("SIGHUP", "SIGTERM", "SIGQUIT")
+            if hasattr(project_journal.signal, name)
+        )
+        for signum in signums:
+            with self.subTest(signal=project_journal._signal_name(signum)):
+                repo = self.init_repo(
+                    "repo-final-verified-"
+                    + project_journal._signal_name(signum).lower()
+                )
+                configured = run_git(
+                    repo,
+                    "config",
+                    "--local",
+                    "core.hooksPath",
+                    ".githooks",
+                )
+                self.assertEqual(configured.returncode, 0, configured.stderr)
+                actual_mark_verified = project_journal._HookCommitState.mark_verified
+                verified_state: project_journal._HookCommitState | None = None
+                interruption = project_journal._DeferredTermination(signum)
+
+                def mark_verified_and_arm(
+                    commit_state: project_journal._HookCommitState,
+                ) -> None:
+                    nonlocal verified_state
+                    actual_mark_verified(commit_state)
+                    verified_state = commit_state
+
+                def interrupt_after_verified() -> None:
+                    if verified_state is not None:
+                        raise interruption
+
+                args = mock.Mock(repo=str(repo))
+                with mock.patch.object(
+                    project_journal._HookCommitState,
+                    "mark_verified",
+                    autospec=True,
+                    side_effect=mark_verified_and_arm,
+                ):
+                    with mock.patch.object(
+                        project_journal,
+                        "_raise_if_termination_pending",
+                        side_effect=interrupt_after_verified,
+                    ):
+                        with self.assertRaises(
+                            project_journal._DeferredTermination
+                        ) as raised:
+                            project_journal.command_install_hooks(args)
+
+                self.assertIs(raised.exception, interruption)
+                self.assertIsNotNone(verified_state)
+                self.assertEqual(verified_state.phase, "verified")
+                self.assertIsNone(verified_state.pending_step)
+                self.assertFalse(verified_state.installed_target_committed)
+                notes = "\n".join(getattr(raised.exception, "__notes__", ()))
+                self.assertNotIn("incomplete", notes)
+                self.assertNotIn("recovery", notes)
+                self.assertIn(
+                    project_journal.HOOK_BEGIN,
+                    (repo / ".githooks/post-merge").read_text(encoding="utf-8"),
+                )
 
     def test_hook_target_fifo_is_rejected_without_blocking(self) -> None:
         repo = self.init_repo()

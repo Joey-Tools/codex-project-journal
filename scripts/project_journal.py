@@ -1282,6 +1282,7 @@ class _HookCommitState:
 
     def mark_verified(self) -> None:
         if self.installed_target_committed:
+            self.phase = "verified"
             self.pending_step = None
 
 
