@@ -375,3 +375,61 @@ superseded_by:
   supported runtimes: Python 3.13.0 completed in 1004.673 seconds with 4
   platform skips, and Xcode Python 3.9.6 completed in 1028.254 seconds with 5
   platform skips.
+- The formal fresh whole-range named-single review of signed head `ed9964b`
+  found one remaining P2: worktree frontmatter parsing used
+  `Path.read_bytes()` before enforcing the 1 MiB journal limit, so an
+  oversized or sparse Markdown file could consume unbounded memory before
+  rejection.
+- Worktree journal parsing now reuses the secure descriptor reader. It rejects
+  an already-oversized regular file from descriptor metadata before any
+  content read and consumes at most the 1 MiB limit plus one byte in each of
+  two passes. Only the first complete snapshot remains retained across passes;
+  the second is compared through one 64 KiB chunk. Final descriptor/path
+  revalidation binds object identity, owner/group/mode access policy, and size,
+  while the streamed comparison rejects same-size content replacement.
+  Bounded display labels lead every helper message, and `OSError` detail is
+  reduced to type/errno/strerror so an original absolute pathname cannot bypass
+  that bound or be duplicated by the issue collector.
+- The initial nine-test focused selection passed in Python 3.13.0 and Xcode
+  Python 3.9.6, but a subsequent narrow implementation audit correctly found
+  that its growth case modified the first pass rather than the second and that
+  raw `OSError` text could reintroduce an unbounded original pathname. That
+  initial selection is retained only as intermediate evidence and does not
+  satisfy the final gate.
+- The corrected fifteen-test focused selection passed in both supported
+  runtimes: Python 3.13.0 completed in 0.018 seconds and Xcode Python 3.9.6
+  completed in 0.026 seconds. It covers metadata-first sparse-file rejection,
+  bounded second-pass growth, bounded non-UTF-8 labels without original-path
+  leakage or collector duplication, path replacement, access-policy and size
+  changes, same-size content replacement, exact limit-error precedence over a
+  descriptor-close failure, the generic secure-reader close contracts, and
+  the skill adoption/limit wording.
+- A final independent read-only audit rechecked the streamed comparison,
+  per-pass byte ceilings, bounded diagnostic path, collector integration, and
+  replacement/access/size/close-precedence regressions against its earlier
+  findings and returned `No findings.`
+- The first exact-state dual-runtime full run completed all 420 tests. Xcode
+  Python 3.9.6 passed in 1152.388 seconds with 5 platform skips. Python 3.13.0
+  completed in 1110.669 seconds with 4 platform skips but recorded one
+  five-second outer `TimeoutExpired` in the pre-existing
+  `test_hook_group_writable_log_target_falls_back_without_appending` timing
+  harness while the two suites competed for resources.
+- A dedicated read-only timing audit proved that the current frontmatter
+  change adds about 0.18 milliseconds for the test's single journal, while
+  the fallback hook serially launches two CLIs that each copy, hash, and
+  validate the 3,622,896-byte Git runtime. The same timeout reproduced by
+  running that one unchanged test concurrently across runtimes, so it is the
+  pre-existing five-second harness margin rather than a frontmatter product
+  regression. After one immediate post-load timeout, the exact Python 3.13.0
+  test passed six consecutive isolated runs in 2.222 to 3.259 seconds.
+  Because this workstream did not change the hook path and a clean full rerun
+  is authoritative, the unrelated test threshold remains unchanged.
+- The final non-competing Python 3.13.0 full rerun passed all 420 tests in
+  639.117 seconds with 4 platform skips. Together with the harder competing
+  Xcode Python 3.9.6 pass, this supplies a clean full-suite result in both
+  supported runtimes for the final implementation and regression state.
+- Cleanup-failure injection retained seventeen empty owner-private,
+  read-only Git-launch directories after the test processes had terminated.
+  Each exact directory was verified empty, current-user-owned, and free of
+  open process references before `rmdir`; a bounded follow-up inventory found
+  no remaining recent `project-journal-git-launch-*` directory.

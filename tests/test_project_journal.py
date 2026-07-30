@@ -8637,6 +8637,318 @@ class ProjectJournalTests(unittest.TestCase):
 
         self.assertEqual(fields["id"], "20260723-longbody")
 
+    def test_frontmatter_sparse_file_rejected_before_read(self) -> None:
+        path = self.root / "oversized-sparse.md"
+        with path.open("wb") as stream:
+            stream.truncate(project_journal.MAX_TRACKED_JOURNAL_BLOB_BYTES + 1)
+
+        with mock.patch.object(
+            project_journal.os,
+            "read",
+            side_effect=AssertionError(
+                "oversized journal must be rejected before read"
+            ),
+        ):
+            with self.assertRaises(project_journal.JournalLimitExceeded) as raised:
+                project_journal._parse_frontmatter(path)
+
+        self.assertIn("journal file exceeds", str(raised.exception))
+
+    def test_frontmatter_growth_is_bounded_during_read(self) -> None:
+        path = self.root / "growing-frontmatter.md"
+        path.write_bytes(b"---\ntitle: Growing\n---\n")
+        actual_read = project_journal.os.read
+        actual_lseek = project_journal.os.lseek
+        returned_bytes = [0, 0]
+        rewinds = 0
+        grew = False
+
+        def grow_before_second_read(
+            fd: int,
+            offset: int,
+            whence: int,
+        ) -> int:
+            nonlocal grew, rewinds
+            if offset == 0 and whence == os.SEEK_SET:
+                rewinds += 1
+                if rewinds == 2:
+                    with path.open("ab") as stream:
+                        stream.truncate(
+                            project_journal.MAX_TRACKED_JOURNAL_BLOB_BYTES + 1
+                        )
+                    grew = True
+            return actual_lseek(fd, offset, whence)
+
+        def count_read(fd: int, size: int) -> bytes:
+            if rewinds not in {1, 2}:
+                raise AssertionError(f"unexpected secure-read pass {rewinds}")
+            chunk = actual_read(fd, size)
+            returned_bytes[rewinds - 1] += len(chunk)
+            return chunk
+
+        with (
+            mock.patch.object(
+                project_journal.os,
+                "lseek",
+                side_effect=grow_before_second_read,
+            ),
+            mock.patch.object(
+                project_journal.os,
+                "read",
+                side_effect=count_read,
+            ),
+        ):
+            with self.assertRaises(project_journal.JournalLimitExceeded) as raised:
+                project_journal._parse_frontmatter(path)
+
+        self.assertTrue(grew)
+        self.assertEqual(rewinds, 2)
+        self.assertIn("journal file exceeds", str(raised.exception))
+        self.assertLessEqual(
+            returned_bytes[0],
+            project_journal.MAX_TRACKED_JOURNAL_BLOB_BYTES + 1,
+        )
+        self.assertEqual(
+            returned_bytes[1],
+            project_journal.MAX_TRACKED_JOURNAL_BLOB_BYTES + 1,
+        )
+        self.assertLessEqual(
+            sum(returned_bytes),
+            2 * (project_journal.MAX_TRACKED_JOURNAL_BLOB_BYTES + 1),
+        )
+
+    def test_frontmatter_long_label_does_not_leak_oserror_path(self) -> None:
+        path = self.root / "bounded-label.md"
+        path.write_bytes(b"---\ntitle: Bounded label\n---\n")
+        raw_label = (
+            b"docs/project_journal/" + b"\xff" * 700 + b"-bounded-frontmatter.md"
+        )
+        label = project_journal._bounded_journal_path_label(raw_label)
+        leaked_path = "/sensitive/" + "x" * 5000
+        failure = OSError(errno.EIO, "injected stat failure", leaked_path)
+
+        with mock.patch.object(
+            project_journal.os,
+            "stat",
+            side_effect=failure,
+        ):
+            with self.assertRaises(project_journal.UserError) as raised:
+                project_journal._parse_frontmatter(path, label=raw_label)
+
+        message = str(raised.exception)
+        self.assertEqual(message.count(label), 1)
+        self.assertTrue(message.startswith(f"{label}:"))
+        self.assertIn("errno=5 (EIO)", message)
+        self.assertNotIn(leaked_path, message)
+        self.assertLessEqual(
+            len(message.encode("utf-8", errors="backslashreplace")),
+            project_journal.MAX_VALIDATION_ISSUE_PATH_BYTES + 256,
+        )
+
+    def test_worktree_frontmatter_error_uses_one_bounded_label(self) -> None:
+        repo = self.root / "repo"
+        path = repo / "docs/project_journal/2026/07/bounded-error.md"
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b"---\ntitle: Bounded error\n---\n")
+        rel_path = path.relative_to(repo).as_posix()
+        failure = OSError(errno.EIO, "injected stat failure", str(path))
+
+        with mock.patch.object(
+            project_journal.os,
+            "stat",
+            side_effect=failure,
+        ):
+            entries, issues = project_journal._load_entries_from_paths(
+                repo,
+                [path],
+            )
+
+        self.assertEqual(entries, [])
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(issues[0].count(rel_path), 1)
+        self.assertIn("errno=5 (EIO)", issues[0])
+        self.assertNotIn(str(path), issues[0])
+
+    def test_frontmatter_rejects_path_identity_replacement(self) -> None:
+        path = self.root / "replaced-frontmatter.md"
+        held = self.root / "original-frontmatter.md"
+        content = b"---\ntitle: Replaced\n---\n"
+        path.write_bytes(content)
+        actual_lseek = project_journal.os.lseek
+        rewinds = 0
+
+        def replace_path_before_second_read(
+            fd: int,
+            offset: int,
+            whence: int,
+        ) -> int:
+            nonlocal rewinds
+            if offset == 0 and whence == os.SEEK_SET:
+                rewinds += 1
+                if rewinds == 2:
+                    path.rename(held)
+                    path.write_bytes(content)
+            return actual_lseek(fd, offset, whence)
+
+        with mock.patch.object(
+            project_journal.os,
+            "lseek",
+            side_effect=replace_path_before_second_read,
+        ):
+            with self.assertRaises(project_journal.UserError) as raised:
+                project_journal._parse_frontmatter(path)
+
+        self.assertEqual(rewinds, 2)
+        self.assertIn(
+            "object identity changed while being read",
+            str(raised.exception),
+        )
+
+    def test_frontmatter_rejects_access_policy_change(self) -> None:
+        path = self.root / "mode-changing-frontmatter.md"
+        path.write_bytes(b"---\ntitle: Mode change\n---\n")
+        original_mode = stat.S_IMODE(path.stat().st_mode)
+        changed_mode = original_mode ^ stat.S_IXUSR
+        actual_lseek = project_journal.os.lseek
+        rewinds = 0
+
+        def change_mode_before_second_read(
+            fd: int,
+            offset: int,
+            whence: int,
+        ) -> int:
+            nonlocal rewinds
+            if offset == 0 and whence == os.SEEK_SET:
+                rewinds += 1
+                if rewinds == 2:
+                    path.chmod(changed_mode)
+            return actual_lseek(fd, offset, whence)
+
+        with mock.patch.object(
+            project_journal.os,
+            "lseek",
+            side_effect=change_mode_before_second_read,
+        ):
+            with self.assertRaises(project_journal.UserError) as raised:
+                project_journal._parse_frontmatter(path)
+
+        self.assertEqual(rewinds, 2)
+        self.assertIn(
+            "object identity changed while being read",
+            str(raised.exception),
+        )
+
+    def test_frontmatter_limit_error_survives_descriptor_close_failure(
+        self,
+    ) -> None:
+        path = self.root / "oversized-close-failure.md"
+        with path.open("wb") as stream:
+            stream.truncate(project_journal.MAX_TRACKED_JOURNAL_BLOB_BYTES + 1)
+        actual_close = project_journal.os.close
+        close_error = OSError(errno.EIO, "injected close failure")
+
+        class TrackingLimit(project_journal.UserError):
+            created: list[TrackingLimit] = []
+
+            def __init__(self, message: str) -> None:
+                super().__init__(message)
+                self.created.append(self)
+
+        def close_then_fail(fd: int) -> None:
+            actual_close(fd)
+            raise close_error
+
+        with mock.patch.object(
+            project_journal.os,
+            "close",
+            side_effect=close_then_fail,
+        ):
+            with self.assertRaises(TrackingLimit) as raised:
+                project_journal._secure_read_regular_path(
+                    path,
+                    label="journal file",
+                    byte_limit=project_journal.MAX_TRACKED_JOURNAL_BLOB_BYTES,
+                    display_path="bounded-journal.md",
+                    limit_error=TrackingLimit,
+                )
+
+        self.assertEqual(len(TrackingLimit.created), 1)
+        self.assertIs(raised.exception, TrackingLimit.created[0])
+        self.assertIsNone(raised.exception.__cause__)
+        notes = "\n".join(getattr(raised.exception, "__notes__", ()))
+        self.assertIn("journal file descriptor cleanup failed", notes)
+        self.assertIn("errno=5 (EIO)", notes)
+
+    def test_frontmatter_rejects_bounded_size_change(self) -> None:
+        path = self.root / "size-changing-frontmatter.md"
+        path.write_bytes(b"---\ntitle: Size change\n---\n")
+        actual_lseek = project_journal.os.lseek
+        rewinds = 0
+
+        def append_before_second_read(
+            fd: int,
+            offset: int,
+            whence: int,
+        ) -> int:
+            nonlocal rewinds
+            if offset == 0 and whence == os.SEEK_SET:
+                rewinds += 1
+                if rewinds == 2:
+                    with path.open("ab") as stream:
+                        stream.write(b"\n")
+            return actual_lseek(fd, offset, whence)
+
+        with mock.patch.object(
+            project_journal.os,
+            "lseek",
+            side_effect=append_before_second_read,
+        ):
+            with self.assertRaises(project_journal.UserError) as raised:
+                project_journal._parse_frontmatter(path)
+
+        self.assertEqual(rewinds, 2)
+        self.assertIn(
+            "object identity changed while being read",
+            str(raised.exception),
+        )
+
+    def test_frontmatter_rejects_same_size_content_change(self) -> None:
+        path = self.root / "changing-frontmatter.md"
+        initial = b"---\ntitle: One\n---\n"
+        replacement = b"---\ntitle: Two\n---\n"
+        self.assertEqual(len(initial), len(replacement))
+        path.write_bytes(initial)
+        actual_lseek = project_journal.os.lseek
+        rewinds = 0
+        changed = False
+
+        def replace_before_second_read(
+            fd: int,
+            offset: int,
+            whence: int,
+        ) -> int:
+            nonlocal rewinds, changed
+            if offset == 0 and whence == os.SEEK_SET:
+                rewinds += 1
+                if rewinds == 2:
+                    path.write_bytes(replacement)
+                    changed = True
+            return actual_lseek(fd, offset, whence)
+
+        with mock.patch.object(
+            project_journal.os,
+            "lseek",
+            side_effect=replace_before_second_read,
+        ):
+            with self.assertRaises(project_journal.UserError) as raised:
+                project_journal._parse_frontmatter(path)
+
+        self.assertTrue(changed)
+        self.assertIn(
+            "content changed while being read",
+            str(raised.exception),
+        )
+
     def test_frontmatter_line_cap_still_bounds_opening_block(self) -> None:
         oversized_frontmatter = "\n".join(
             ["---", "title: oversized"]
@@ -12982,6 +13294,23 @@ class ProjectJournalTests(unittest.TestCase):
             skill,
         )
         self.assertIn(
+            "Reject worktree journals larger than 1 MiB from descriptor metadata before any content read",
+            skill,
+        )
+        self.assertIn(
+            "Consume at most 1 MiB plus one byte per pass",
+            skill,
+        )
+        self.assertIn("stream the second through one 64 KiB comparison chunk", skill)
+        self.assertIn(
+            "derive `OSError` detail only from type/errno/strerror",
+            skill,
+        )
+        self.assertIn(
+            "Reject concurrent growth and same-size content replacement",
+            skill,
+        )
+        self.assertIn(
             "repeats descriptor/path identity, access, size, and digest validation",
             skill,
         )
@@ -13238,6 +13567,26 @@ class ProjectJournalTests(unittest.TestCase):
         )
         self.assertIn(
             "close-only ordinary failure is wrapped as `UserError`",
+            readme,
+        )
+        self.assertIn(
+            "Worktree journals larger than 1 MiB are rejected from descriptor metadata before any content read",
+            readme,
+        )
+        self.assertIn(
+            "Each pass consumes at most 1 MiB plus one byte",
+            readme,
+        )
+        self.assertIn(
+            "second uses at most one 64 KiB comparison chunk",
+            readme,
+        )
+        self.assertIn(
+            "renders `OSError` detail only from its type/errno/strerror",
+            readme,
+        )
+        self.assertIn(
+            "Concurrent growth and same-size content replacement therefore fail closed",
             readme,
         )
         self.assertIn(

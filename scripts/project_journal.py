@@ -2646,11 +2646,43 @@ def _secure_read_regular_path(
     *,
     label: str,
     byte_limit: int,
+    display_path: str | None = None,
+    limit_error: type[UserError] = UserError,
     missing_ok: bool = False,
     deadline: float | None = None,
     deadline_error: str = "secure file inspection exceeded its shared deadline",
 ) -> bytes | None:
     _check_deadline(deadline, deadline_error)
+    rendered_path = str(path) if display_path is None else display_path
+
+    def path_message(message: str, detail: str | None = None) -> str:
+        if display_path is None:
+            rendered = f"{message}: {rendered_path}"
+        else:
+            rendered = f"{rendered_path}: {message}"
+        if detail is not None:
+            rendered += f": {detail}"
+        return rendered
+
+    def error_detail(error: OSError) -> str:
+        if display_path is None:
+            return str(error)
+        error_number = error.errno
+        if not isinstance(error_number, int):
+            return f"type={type(error).__name__}"
+        error_name = errno.errorcode.get(error_number)
+        number_label = f"errno={error_number}"
+        if error_name is not None:
+            number_label += f" ({error_name})"
+        try:
+            message = os.strerror(error_number)
+        except ValueError:
+            return number_label
+        return f"{number_label}: {message}"
+
+    def limit_message() -> str:
+        return path_message(f"{label} exceeds {byte_limit} bytes")
+
     flags = (
         os.O_RDONLY
         | getattr(os, "O_CLOEXEC", 0)
@@ -2662,37 +2694,44 @@ def _secure_read_regular_path(
     except FileNotFoundError:
         if missing_ok:
             return None
-        raise UserError(f"{label} does not exist: {path}") from None
+        raise UserError(path_message(f"{label} does not exist")) from None
     except OSError as exc:
         detail = (
             "path is a symlink or could not be opened without following links"
             if exc.errno in {errno.ELOOP, errno.EMLINK}
-            else str(exc)
+            else error_detail(exc)
         )
-        raise UserError(f"failed to open {label} {path}: {detail}") from exc
+        if display_path is None:
+            message = f"failed to open {label} {rendered_path}: {detail}"
+        else:
+            message = path_message(f"failed to open {label}", detail)
+        raise UserError(message) from exc
 
     operation_error: BaseException | None = None
     try:
         _check_deadline(deadline, deadline_error)
         before = os.fstat(fd)
         if not stat.S_ISREG(before.st_mode):
-            raise UserError(f"{label} is not a regular file: {path}")
+            raise UserError(path_message(f"{label} is not a regular file"))
         if before.st_size > byte_limit:
-            raise UserError(f"{label} exceeds {byte_limit} bytes: {path}")
+            raise limit_error(limit_message())
         try:
             path_before = os.stat(path, follow_symlinks=False)
         except OSError as exc:
             raise UserError(
-                f"{label} path became unavailable while being bound: {path}: {exc}"
+                path_message(
+                    f"{label} path became unavailable while being bound",
+                    error_detail(exc),
+                )
             ) from exc
         _check_deadline(deadline, deadline_error)
         identity = _file_identity(before)
         if _file_identity(path_before) != identity or not stat.S_ISREG(
             path_before.st_mode
         ):
-            raise UserError(f"{label} path changed while being bound: {path}")
+            raise UserError(path_message(f"{label} path changed while being bound"))
 
-        def read_once() -> bytes:
+        def read_snapshot() -> bytes:
             _check_deadline(deadline, deadline_error)
             os.lseek(fd, 0, os.SEEK_SET)
             content = bytearray()
@@ -2707,20 +2746,46 @@ def _secure_read_regular_path(
                     break
                 content.extend(chunk)
             if len(content) > byte_limit:
-                raise UserError(f"{label} exceeds {byte_limit} bytes: {path}")
+                raise limit_error(limit_message())
             return bytes(content)
 
-        first = read_once()
+        def matches_snapshot(expected: bytes) -> bool:
+            _check_deadline(deadline, deadline_error)
+            os.lseek(fd, 0, os.SEEK_SET)
+            expected_view = memoryview(expected)
+            offset = 0
+            matched = True
+            while offset <= byte_limit:
+                _check_deadline(deadline, deadline_error)
+                chunk = os.read(
+                    fd,
+                    min(PROCESS_READ_CHUNK_BYTES, byte_limit + 1 - offset),
+                )
+                _check_deadline(deadline, deadline_error)
+                if not chunk:
+                    break
+                end = offset + len(chunk)
+                if expected_view[offset:end] != chunk:
+                    matched = False
+                offset = end
+            if offset > byte_limit:
+                raise limit_error(limit_message())
+            return matched and offset == len(expected)
+
+        first = read_snapshot()
         _check_deadline(deadline, deadline_error)
         between = os.fstat(fd)
-        second = read_once()
+        content_matches = matches_snapshot(first)
         _check_deadline(deadline, deadline_error)
         after = os.fstat(fd)
         try:
             path_after = os.stat(path, follow_symlinks=False)
         except OSError as exc:
             raise UserError(
-                f"{label} path became unavailable while being read: {path}: {exc}"
+                path_message(
+                    f"{label} path became unavailable while being read",
+                    error_detail(exc),
+                )
             ) from exc
         _check_deadline(deadline, deadline_error)
         if (
@@ -2729,9 +2794,11 @@ def _secure_read_regular_path(
             or _file_identity(path_after) != identity
             or not stat.S_ISREG(path_after.st_mode)
         ):
-            raise UserError(f"{label} object identity changed while being read: {path}")
-        if first != second:
-            raise UserError(f"{label} content changed while being read: {path}")
+            raise UserError(
+                path_message(f"{label} object identity changed while being read")
+            )
+        if not content_matches:
+            raise UserError(path_message(f"{label} content changed while being read"))
         return first
     except BaseException as error:
         operation_error = error
@@ -3703,11 +3770,14 @@ def _parse_frontmatter(
     label: str | bytes | None = None,
 ) -> dict[str, Any]:
     path_label = _bounded_journal_path_label(str(path) if label is None else label)
-    content = path.read_bytes()
-    if len(content) > MAX_TRACKED_JOURNAL_BLOB_BYTES:
-        raise JournalLimitExceeded(
-            f"{path_label}: journal file exceeds {MAX_TRACKED_JOURNAL_BLOB_BYTES} bytes"
-        )
+    content = _secure_read_regular_path(
+        path,
+        label="journal file",
+        byte_limit=MAX_TRACKED_JOURNAL_BLOB_BYTES,
+        display_path=path_label,
+        limit_error=JournalLimitExceeded,
+    )
+    assert content is not None
     try:
         text = content.decode("utf-8")
     except UnicodeDecodeError as exc:
