@@ -809,6 +809,126 @@ class ProjectJournalTests(unittest.TestCase):
                         deadline=100.5,
                     )
 
+    def test_generated_index_status_preserves_primary_over_close_failure(
+        self,
+    ) -> None:
+        marker = self.root / "generated-index-primary-close.md"
+        marker.write_text("---\n", encoding="utf-8")
+        primary = project_journal.GeneratedIndexInspectionLimitExceeded(
+            "injected generated-index limit",
+            limit_name="generated-index marker bytes",
+            limit=1,
+            observed=2,
+        )
+        close_error = OSError(
+            errno.EIO,
+            "injected generated-index close failure",
+        )
+        actual_close = project_journal.os.close
+
+        def close_then_fail(fd: int) -> None:
+            actual_close(fd)
+            raise close_error
+
+        with (
+            mock.patch.object(
+                project_journal,
+                "_read_generated_index_marker_prefix",
+                side_effect=primary,
+            ),
+            mock.patch.object(
+                project_journal.os,
+                "close",
+                side_effect=close_then_fail,
+            ),
+            self.assertRaises(
+                project_journal.GeneratedIndexInspectionLimitExceeded
+            ) as raised,
+        ):
+            project_journal._generated_index_status(marker)
+
+        self.assertIs(raised.exception, primary)
+        self.assertEqual(primary.limit_name, "generated-index marker bytes")
+        self.assertEqual(primary.limit, 1)
+        self.assertEqual(primary.observed, 2)
+        notes = "\n".join(getattr(primary, "__notes__", ()))
+        self.assertIn("generated-index marker descriptor cleanup failed", notes)
+        self.assertIn("errno=5 (EIO)", notes)
+        self.assertIn("injected generated-index close failure", notes)
+
+    def test_generated_index_status_wraps_close_only_failure(self) -> None:
+        marker = self.root / "generated-index-close-only.md"
+        marker.write_text("---\n", encoding="utf-8")
+        close_error = OSError(
+            errno.EIO,
+            "injected generated-index close-only failure",
+        )
+        actual_close = project_journal.os.close
+
+        def close_then_fail(fd: int) -> None:
+            actual_close(fd)
+            raise close_error
+
+        with mock.patch.object(
+            project_journal.os,
+            "close",
+            side_effect=close_then_fail,
+        ):
+            with self.assertRaises(
+                project_journal.GeneratedIndexInspectionError
+            ) as raised:
+                project_journal._generated_index_status(marker)
+
+        self.assertIs(raised.exception.__cause__, close_error)
+        self.assertEqual(
+            raised.exception.code,
+            "generated_index_inspection_failed",
+        )
+        self.assertEqual(raised.exception.errno, errno.EIO)
+        self.assertIn(
+            "generated-index marker descriptor cleanup failed",
+            str(raised.exception),
+        )
+
+    def test_generated_index_status_does_not_consume_ambient_exception(
+        self,
+    ) -> None:
+        marker = self.root / "generated-index-ambient-close.md"
+        marker.write_text("---\n", encoding="utf-8")
+        ambient = RuntimeError("unrelated outer exception")
+        close_error = OSError(
+            errno.EIO,
+            "injected generated-index ambient close failure",
+        )
+        actual_close = project_journal.os.close
+
+        def close_then_fail(fd: int) -> None:
+            actual_close(fd)
+            raise close_error
+
+        try:
+            raise ambient
+        except RuntimeError:
+            with (
+                mock.patch.object(
+                    project_journal.os,
+                    "close",
+                    side_effect=close_then_fail,
+                ),
+                self.assertRaises(
+                    project_journal.GeneratedIndexInspectionError
+                ) as raised,
+            ):
+                project_journal._generated_index_status(marker)
+
+        self.assertIs(raised.exception.__cause__, close_error)
+        self.assertEqual(
+            raised.exception.code,
+            "generated_index_inspection_failed",
+        )
+        self.assertEqual(raised.exception.errno, errno.EIO)
+        self.assertEqual(getattr(ambient, "__notes__", ()), ())
+
     def test_journal_scan_treats_disappeared_entry_as_missing(self) -> None:
         repo = self.init_repo()
         journal = repo / "docs/project_journal/disappearing.md"
@@ -19341,6 +19461,240 @@ class ProjectJournalTests(unittest.TestCase):
                 if name == "oversized":
                     self.assertEqual(raised.exception.limit, 4)
                     self.assertEqual(raised.exception.observed, 5)
+
+    def test_discovery_auxiliary_open_preserves_primary_over_close_failure(
+        self,
+    ) -> None:
+        auxiliary = self.root / "auxiliary-open-primary-close"
+        auxiliary.write_text("content\n", encoding="utf-8")
+        primary = project_journal.DiscoveryAuxiliaryInspectionError(
+            "injected binding failure",
+            error_number=errno.EACCES,
+        )
+        close_error = OSError(
+            errno.EIO,
+            "injected binding close failure",
+        )
+        actual_close = project_journal.os.close
+
+        def close_then_fail(fd: int) -> None:
+            actual_close(fd)
+            raise close_error
+
+        with (
+            mock.patch.object(
+                project_journal.os,
+                "fstat",
+                side_effect=primary,
+            ),
+            mock.patch.object(
+                project_journal.os,
+                "close",
+                side_effect=close_then_fail,
+            ),
+            self.assertRaises(
+                project_journal.DiscoveryAuxiliaryInspectionError
+            ) as raised,
+        ):
+            project_journal._open_discovery_regular_path(
+                auxiliary,
+                label="test auxiliary",
+                deadline=time.monotonic() + 1.0,
+                missing_ok=False,
+            )
+
+        self.assertIs(raised.exception, primary)
+        self.assertEqual(primary.errno, errno.EACCES)
+        notes = "\n".join(getattr(primary, "__notes__", ()))
+        self.assertIn("test auxiliary binding descriptor cleanup failed", notes)
+        self.assertIn("errno=5 (EIO)", notes)
+        self.assertIn("injected binding close failure", notes)
+
+    def test_discovery_auxiliary_read_preserves_primary_over_close_failure(
+        self,
+    ) -> None:
+        auxiliary = self.root / "auxiliary-read-primary-close"
+        auxiliary.write_text("content\n", encoding="utf-8")
+        primary = project_journal.DiscoveryAuxiliaryInspectionLimitExceeded(
+            "injected read limit",
+            limit_name="test auxiliary bytes",
+            limit=1,
+            observed=2,
+        )
+        close_error = OSError(
+            errno.EIO,
+            "injected read close failure",
+        )
+        actual_close = project_journal.os.close
+
+        def close_then_fail(fd: int) -> None:
+            actual_close(fd)
+            raise close_error
+
+        with (
+            mock.patch.object(
+                project_journal.os,
+                "lseek",
+                side_effect=primary,
+            ),
+            mock.patch.object(
+                project_journal.os,
+                "close",
+                side_effect=close_then_fail,
+            ),
+            self.assertRaises(
+                project_journal.DiscoveryAuxiliaryInspectionLimitExceeded
+            ) as raised,
+        ):
+            project_journal._read_discovery_regular_path(
+                auxiliary,
+                label="test auxiliary",
+                byte_limit=1024,
+                deadline=time.monotonic() + 1.0,
+            )
+
+        self.assertIs(raised.exception, primary)
+        self.assertEqual(primary.limit_name, "test auxiliary bytes")
+        self.assertEqual(primary.limit, 1)
+        self.assertEqual(primary.observed, 2)
+        notes = "\n".join(getattr(primary, "__notes__", ()))
+        self.assertIn("test auxiliary descriptor cleanup failed", notes)
+        self.assertIn("errno=5 (EIO)", notes)
+        self.assertIn("injected read close failure", notes)
+
+    def test_discovery_auxiliary_close_only_failures_are_structured(
+        self,
+    ) -> None:
+        auxiliary = self.root / "auxiliary-close-only"
+        auxiliary.write_text("content\n", encoding="utf-8")
+
+        for operation in ("read", "exists"):
+            with self.subTest(operation=operation):
+                close_error = OSError(
+                    errno.EIO,
+                    f"injected {operation} close-only failure",
+                )
+                actual_close = project_journal.os.close
+
+                def close_then_fail(fd: int) -> None:
+                    actual_close(fd)
+                    raise close_error
+
+                with mock.patch.object(
+                    project_journal.os,
+                    "close",
+                    side_effect=close_then_fail,
+                ):
+                    with self.assertRaises(
+                        project_journal.DiscoveryAuxiliaryInspectionError
+                    ) as raised:
+                        if operation == "read":
+                            project_journal._read_discovery_regular_path(
+                                auxiliary,
+                                label="test auxiliary",
+                                byte_limit=1024,
+                                deadline=time.monotonic() + 1.0,
+                            )
+                        else:
+                            project_journal._discovery_regular_path_exists(
+                                auxiliary,
+                                label="test auxiliary",
+                                deadline=time.monotonic() + 1.0,
+                            )
+
+                self.assertIs(raised.exception.__cause__, close_error)
+                self.assertEqual(
+                    raised.exception.code,
+                    "discovery_auxiliary_inspection_failed",
+                )
+                self.assertEqual(raised.exception.errno, errno.EIO)
+                self.assertIn(
+                    "test auxiliary",
+                    str(raised.exception),
+                )
+                self.assertIn(
+                    "descriptor cleanup failed",
+                    str(raised.exception),
+                )
+
+    def test_discovery_auxiliary_read_does_not_consume_ambient_exception(
+        self,
+    ) -> None:
+        auxiliary = self.root / "auxiliary-read-ambient-close"
+        auxiliary.write_text("content\n", encoding="utf-8")
+        ambient = RuntimeError("unrelated outer exception")
+        close_error = OSError(
+            errno.EIO,
+            "injected read ambient close failure",
+        )
+        actual_close = project_journal.os.close
+
+        def close_then_fail(fd: int) -> None:
+            actual_close(fd)
+            raise close_error
+
+        try:
+            raise ambient
+        except RuntimeError:
+            with (
+                mock.patch.object(
+                    project_journal.os,
+                    "close",
+                    side_effect=close_then_fail,
+                ),
+                self.assertRaises(
+                    project_journal.DiscoveryAuxiliaryInspectionError
+                ) as raised,
+            ):
+                project_journal._read_discovery_regular_path(
+                    auxiliary,
+                    label="test auxiliary",
+                    byte_limit=1024,
+                    deadline=time.monotonic() + 1.0,
+                )
+
+        self.assertIs(raised.exception.__cause__, close_error)
+        self.assertEqual(
+            raised.exception.code,
+            "discovery_auxiliary_inspection_failed",
+        )
+        self.assertEqual(raised.exception.errno, errno.EIO)
+        self.assertEqual(getattr(ambient, "__notes__", ()), ())
+
+    def test_discovery_auxiliary_close_only_base_exception_remains_exact(
+        self,
+    ) -> None:
+        auxiliary = self.root / "auxiliary-close-only-base-exception"
+        auxiliary.write_text("content\n", encoding="utf-8")
+        close_error = LegacyInterrupt("injected close-only interruption")
+        actual_close = project_journal.os.close
+
+        def close_then_interrupt(fd: int) -> None:
+            actual_close(fd)
+            raise close_error
+
+        raised_error: LegacyInterrupt | None = None
+        with mock.patch.object(
+            project_journal.os,
+            "close",
+            side_effect=close_then_interrupt,
+        ):
+            try:
+                project_journal._read_discovery_regular_path(
+                    auxiliary,
+                    label="test auxiliary",
+                    byte_limit=1024,
+                    deadline=time.monotonic() + 1.0,
+                )
+            except LegacyInterrupt as raised:
+                raised_error = raised
+            else:
+                self.fail("expected close-only interruption")
+
+        self.assertIs(raised_error, close_error)
+        notes = "\n".join(getattr(close_error, "__notes__", ()))
+        self.assertIn("test auxiliary descriptor cleanup failed", notes)
+        self.assertIn("type=LegacyInterrupt", notes)
 
     def test_enrich_reports_oversized_exclude_and_hook_files(self) -> None:
         adoption = {

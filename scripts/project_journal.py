@@ -1125,6 +1125,35 @@ def _exception_evidence_details(
     return details[:MAX_DEFERRED_SIGNAL_REPORT_DETAILS]
 
 
+def _close_descriptor_preserving_error(
+    fd: int,
+    *,
+    active_error: BaseException | None,
+    context: str,
+    wrap_close_error: Callable[[str, int | None], BaseException],
+) -> None:
+    try:
+        os.close(fd)
+    except BaseException as close_error:
+        details = _exception_evidence_details(
+            close_error,
+            context=context,
+        )
+        if active_error is not None:
+            _add_exception_details(active_error, details)
+            return
+        if isinstance(close_error, Exception):
+            error_number = getattr(close_error, "errno", None)
+            wrapped = wrap_close_error(
+                details[0],
+                error_number if isinstance(error_number, int) else None,
+            )
+            _add_exception_details(wrapped, details[1:])
+            raise wrapped from close_error
+        _add_exception_details(close_error, details)
+        raise
+
+
 def _merge_fd_close_restore_error(
     close_error: BaseException | None,
     restore_error: BaseException | None,
@@ -6041,6 +6070,7 @@ def _generated_index_status(
             error_number=exc.errno,
         ) from exc
 
+    operation_error: BaseException | None = None
     try:
         _check_generated_index_deadline(deadline, path)
         before = os.fstat(fd)
@@ -6112,8 +6142,21 @@ def _generated_index_status(
                 "during inspection"
             )
         return first_status
+    except BaseException as error:
+        operation_error = error
+        raise
     finally:
-        os.close(fd)
+        _close_descriptor_preserving_error(
+            fd,
+            active_error=operation_error,
+            context="generated-index marker descriptor cleanup failed",
+            wrap_close_error=lambda message, error_number: (
+                GeneratedIndexInspectionError(
+                    message,
+                    error_number=error_number,
+                )
+            ),
+        )
 
 
 def _load_entries_from_paths(
@@ -11322,8 +11365,18 @@ def _open_discovery_regular_path(
             )
         _check_discovery_auxiliary_deadline(deadline, label)
         return fd, identity
-    except BaseException:
-        os.close(fd)
+    except BaseException as error:
+        _close_descriptor_preserving_error(
+            fd,
+            active_error=error,
+            context=f"{label} binding descriptor cleanup failed",
+            wrap_close_error=lambda message, error_number: (
+                DiscoveryAuxiliaryInspectionError(
+                    message,
+                    error_number=error_number,
+                )
+            ),
+        )
         raise
 
 
@@ -11377,6 +11430,7 @@ def _read_discovery_regular_path(
             )
         return bytes(content)
 
+    operation_error: BaseException | None = None
     try:
         if identity[5] > byte_limit:
             raise DiscoveryAuxiliaryInspectionLimitExceeded(
@@ -11411,8 +11465,21 @@ def _read_discovery_regular_path(
                 f"{label} content changed while being read: {path}"
             )
         return first
+    except BaseException as error:
+        operation_error = error
+        raise
     finally:
-        os.close(fd)
+        _close_descriptor_preserving_error(
+            fd,
+            active_error=operation_error,
+            context=f"{label} descriptor cleanup failed",
+            wrap_close_error=lambda message, error_number: (
+                DiscoveryAuxiliaryInspectionError(
+                    message,
+                    error_number=error_number,
+                )
+            ),
+        )
 
 
 def _discovery_regular_path_exists(
@@ -11430,7 +11497,17 @@ def _discovery_regular_path_exists(
     if opened is None:
         return False
     fd, _identity = opened
-    os.close(fd)
+    _close_descriptor_preserving_error(
+        fd,
+        active_error=None,
+        context=f"{label} existence descriptor cleanup failed",
+        wrap_close_error=lambda message, error_number: (
+            DiscoveryAuxiliaryInspectionError(
+                message,
+                error_number=error_number,
+            )
+        ),
+    )
     _check_discovery_auxiliary_deadline(deadline, label)
     return True
 
