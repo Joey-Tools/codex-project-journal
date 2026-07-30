@@ -7989,6 +7989,28 @@ def _close_hook_binding(
     active_error: BaseException | None = None,
 ) -> None:
     cleanup_error: BaseException | None = None
+    descriptor_count = len(binding.ancestors) + (
+        1 if binding.install_lock_fd is not None else 0
+    )
+
+    try:
+        signal_fence = _block_fd_close_signals()
+    except BaseException as error:
+        details = _exception_evidence_details(
+            error,
+            context="hook binding descriptor signal-fence acquisition failed",
+        )
+        details.append(
+            _bounded_signal_report_detail(
+                "hook binding descriptor drain did not begin; "
+                f"{descriptor_count} descriptors remained not close-attempted"
+            )
+        )
+        if active_error is not None:
+            _add_exception_details(active_error, details)
+            return
+        _add_exception_details(error, details[1:])
+        raise
 
     def close_descriptor(fd: int, *, context: str) -> None:
         nonlocal cleanup_error
@@ -8005,16 +8027,35 @@ def _close_hook_binding(
                 raise
             cleanup_error = error
 
-    if binding.install_lock_fd is not None:
-        close_descriptor(
-            binding.install_lock_fd,
-            context="hook installation lock descriptor cleanup failed",
-        )
-    for ancestor in reversed(binding.ancestors):
-        close_descriptor(
-            ancestor.fd,
-            context=(f"hook path binding descriptor cleanup failed: {ancestor.path}"),
-        )
+    restore_error: BaseException | None = None
+    try:
+        # One fence covers the complete entry-time owner set. Every numeric FD
+        # receives one close dispatch before pending SIGINT can run Python.
+        # POSIX close failure leaves reuse state uncertain, so never retry it.
+        if binding.install_lock_fd is not None:
+            close_descriptor(
+                binding.install_lock_fd,
+                context="hook installation lock descriptor cleanup failed",
+            )
+        for ancestor in reversed(binding.ancestors):
+            close_descriptor(
+                ancestor.fd,
+                context=(
+                    f"hook path binding descriptor cleanup failed: {ancestor.path}"
+                ),
+            )
+    finally:
+        try:
+            signal_fence.restore()
+        except BaseException as error:
+            restore_error = error
+    selected_error = _merge_fd_close_restore_error(
+        active_error if active_error is not None else cleanup_error,
+        restore_error,
+        context="hook binding descriptor drain",
+    )
+    if active_error is None:
+        cleanup_error = selected_error
     if active_error is None and cleanup_error is not None:
         raise cleanup_error
 

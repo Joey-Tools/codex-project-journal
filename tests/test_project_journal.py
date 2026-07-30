@@ -13339,6 +13339,14 @@ class ProjectJournalTests(unittest.TestCase):
             "Final hook binding cleanup attempts the installation lock and every retained ancestor descriptor",
             skill,
         )
+        self.assertIn(
+            "After successful acquisition, one POSIX signal fence covers the complete drain",
+            skill,
+        )
+        self.assertIn(
+            "entry-blocked pending `SIGINT` blocked and pending",
+            skill,
+        )
         self.assertIn("required `O_NOFOLLOW|O_NONBLOCK`", skill)
         self.assertIn("every ancestor identity/access policy", skill)
         self.assertIn(
@@ -13633,6 +13641,14 @@ class ProjectJournalTests(unittest.TestCase):
         )
         self.assertIn(
             "Final hook binding cleanup attempts the installation lock and every retained ancestor descriptor",
+            readme,
+        )
+        self.assertIn(
+            "After successful acquisition, one POSIX signal fence covers the complete drain",
+            readme,
+        )
+        self.assertIn(
+            "entry-blocked pending `SIGINT` remains blocked and pending",
             readme,
         )
         self.assertIn(
@@ -17361,6 +17377,303 @@ class ProjectJournalTests(unittest.TestCase):
             str(raised.exception),
         )
         self.assertEqual(stdout.getvalue(), "")
+
+    @unittest.skipUnless(os.name == "posix", "POSIX signal-mask contract")
+    def test_hook_binding_cleanup_defers_sigint_until_entire_drain(self) -> None:
+        first_ancestor = mock.Mock(fd=732, path=pathlib.Path("/bound/first"))
+        final_ancestor = mock.Mock(fd=733, path=pathlib.Path("/bound/final"))
+        binding = mock.Mock(
+            install_lock_fd=731,
+            ancestors=(first_ancestor, final_ancestor),
+        )
+        closed: list[int] = []
+
+        def request_sigint_after_first_close(fd: int) -> None:
+            closed.append(fd)
+            if len(closed) == 1:
+                os.kill(os.getpid(), signal.SIGINT)
+
+        with self.default_unblocked_sigint():
+            with mock.patch.object(
+                project_journal.os,
+                "close",
+                side_effect=request_sigint_after_first_close,
+            ):
+                with self.assertRaises(KeyboardInterrupt):
+                    project_journal._close_hook_binding(binding)
+
+        self.assertEqual(closed, [731, 733, 732])
+
+    @unittest.skipUnless(os.name == "posix", "POSIX signal-mask contract")
+    def test_hook_binding_cleanup_preserves_close_error_over_pending_sigint(
+        self,
+    ) -> None:
+        first_ancestor = mock.Mock(fd=742, path=pathlib.Path("/bound/first"))
+        final_ancestor = mock.Mock(fd=743, path=pathlib.Path("/bound/final"))
+        binding = mock.Mock(
+            install_lock_fd=741,
+            ancestors=(first_ancestor, final_ancestor),
+        )
+        close_failure = OSError(
+            errno.EIO,
+            "injected hook lock close failure before pending SIGINT restore",
+        )
+        closed: list[int] = []
+
+        def fail_first_close_with_pending_sigint(fd: int) -> None:
+            closed.append(fd)
+            if len(closed) == 1:
+                os.kill(os.getpid(), signal.SIGINT)
+                raise close_failure
+
+        with self.default_unblocked_sigint():
+            with mock.patch.object(
+                project_journal.os,
+                "close",
+                side_effect=fail_first_close_with_pending_sigint,
+            ):
+                with self.assertRaises(project_journal.UserError) as raised:
+                    project_journal._close_hook_binding(binding)
+
+        self.assertEqual(closed, [741, 743, 742])
+        self.assertIs(raised.exception.__cause__, close_failure)
+        notes = "\n".join(getattr(raised.exception, "__notes__", ()))
+        self.assertIn("type=KeyboardInterrupt", notes)
+        self.assertEqual(notes.count("type=KeyboardInterrupt"), 1)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX signal-mask contract")
+    def test_hook_binding_cleanup_preserves_active_error_over_pending_sigint(
+        self,
+    ) -> None:
+        first_ancestor = mock.Mock(fd=752, path=pathlib.Path("/bound/first"))
+        final_ancestor = mock.Mock(fd=753, path=pathlib.Path("/bound/final"))
+        binding = mock.Mock(
+            install_lock_fd=751,
+            ancestors=(first_ancestor, final_ancestor),
+        )
+        primary = LegacyInterrupt("injected active hook installation interruption")
+        closed: list[int] = []
+
+        def request_sigint_after_first_close(fd: int) -> None:
+            closed.append(fd)
+            if len(closed) == 1:
+                os.kill(os.getpid(), signal.SIGINT)
+
+        with self.default_unblocked_sigint():
+            with mock.patch.object(
+                project_journal.os,
+                "close",
+                side_effect=request_sigint_after_first_close,
+            ):
+                with self.assertRaises(LegacyInterrupt) as raised:
+                    try:
+                        raise primary
+                    except LegacyInterrupt as active_error:
+                        project_journal._close_hook_binding(
+                            binding,
+                            active_error=active_error,
+                        )
+                        raise
+
+        self.assertIs(raised.exception, primary)
+        self.assertEqual(closed, [751, 753, 752])
+        notes = "\n".join(getattr(primary, "__notes__", ()))
+        self.assertIn("type=KeyboardInterrupt", notes)
+        self.assertEqual(notes.count("type=KeyboardInterrupt"), 1)
+
+    def test_hook_binding_cleanup_reports_signal_fence_acquisition_failure(
+        self,
+    ) -> None:
+        binding = mock.Mock(
+            install_lock_fd=761,
+            ancestors=(mock.Mock(fd=762, path=pathlib.Path("/bound/root")),),
+        )
+        fence_failure = project_journal.UnsupportedPlatform(
+            "injected hook binding signal-fence acquisition failure"
+        )
+        with (
+            mock.patch.object(
+                project_journal,
+                "_block_fd_close_signals",
+                side_effect=fence_failure,
+            ),
+            mock.patch.object(project_journal.os, "close") as close,
+        ):
+            with self.assertRaises(project_journal.UnsupportedPlatform) as raised:
+                project_journal._close_hook_binding(binding)
+
+        self.assertIs(raised.exception, fence_failure)
+        close.assert_not_called()
+        notes = "\n".join(getattr(fence_failure, "__notes__", ()))
+        self.assertIn("2 descriptors remained not close-attempted", notes)
+
+    def test_hook_binding_cleanup_keeps_active_error_on_fence_failure(
+        self,
+    ) -> None:
+        binding = mock.Mock(
+            install_lock_fd=771,
+            ancestors=(mock.Mock(fd=772, path=pathlib.Path("/bound/root")),),
+        )
+        primary = LegacyInterrupt("injected active hook binding failure")
+        fence_failure = project_journal.UnsupportedPlatform(
+            "injected secondary signal-fence acquisition failure"
+        )
+        with (
+            mock.patch.object(
+                project_journal,
+                "_block_fd_close_signals",
+                side_effect=fence_failure,
+            ),
+            mock.patch.object(project_journal.os, "close") as close,
+        ):
+            project_journal._close_hook_binding(
+                binding,
+                active_error=primary,
+            )
+
+        close.assert_not_called()
+        notes = "\n".join(getattr(primary, "__notes__", ()))
+        self.assertIn(
+            "hook binding descriptor signal-fence acquisition failed",
+            notes,
+        )
+        self.assertIn("2 descriptors remained not close-attempted", notes)
+
+    def test_hook_binding_cleanup_propagates_restore_only_failure(self) -> None:
+        first_ancestor = mock.Mock(fd=782, path=pathlib.Path("/bound/first"))
+        final_ancestor = mock.Mock(fd=783, path=pathlib.Path("/bound/final"))
+        binding = mock.Mock(
+            install_lock_fd=781,
+            ancestors=(first_ancestor, final_ancestor),
+        )
+        restore_failure = LegacyInterrupt(
+            "injected hook binding signal-mask restoration failure"
+        )
+        signal_fence = mock.Mock()
+        signal_fence.restore.side_effect = restore_failure
+        closed: list[int] = []
+
+        with (
+            mock.patch.object(
+                project_journal,
+                "_block_fd_close_signals",
+                return_value=signal_fence,
+            ),
+            mock.patch.object(
+                project_journal.os,
+                "close",
+                side_effect=closed.append,
+            ),
+        ):
+            with self.assertRaises(LegacyInterrupt) as raised:
+                project_journal._close_hook_binding(binding)
+
+        self.assertIs(raised.exception, restore_failure)
+        self.assertEqual(closed, [781, 783, 782])
+        signal_fence.restore.assert_called_once_with()
+
+    def test_hook_binding_cleanup_keeps_close_error_over_restore_failure(
+        self,
+    ) -> None:
+        first_ancestor = mock.Mock(fd=792, path=pathlib.Path("/bound/first"))
+        final_ancestor = mock.Mock(fd=793, path=pathlib.Path("/bound/final"))
+        binding = mock.Mock(
+            install_lock_fd=791,
+            ancestors=(first_ancestor, final_ancestor),
+        )
+        close_failure = OSError(
+            errno.EIO,
+            "injected hook lock close failure before restore failure",
+        )
+        restore_failure = LegacyInterrupt(
+            "injected secondary hook binding restoration failure"
+        )
+        signal_fence = mock.Mock()
+        signal_fence.restore.side_effect = restore_failure
+        closed: list[int] = []
+
+        def fail_first_close(fd: int) -> None:
+            closed.append(fd)
+            if len(closed) == 1:
+                raise close_failure
+
+        with (
+            mock.patch.object(
+                project_journal,
+                "_block_fd_close_signals",
+                return_value=signal_fence,
+            ),
+            mock.patch.object(
+                project_journal.os,
+                "close",
+                side_effect=fail_first_close,
+            ),
+        ):
+            with self.assertRaises(project_journal.UserError) as raised:
+                project_journal._close_hook_binding(binding)
+
+        self.assertIs(raised.exception.__cause__, close_failure)
+        self.assertEqual(closed, [791, 793, 792])
+        notes = "\n".join(getattr(raised.exception, "__notes__", ()))
+        self.assertIn("injected secondary hook binding restoration failure", notes)
+        self.assertIn("type=LegacyInterrupt", notes)
+        signal_fence.restore.assert_called_once_with()
+
+    def test_hook_binding_cleanup_keeps_active_error_over_close_and_restore(
+        self,
+    ) -> None:
+        first_ancestor = mock.Mock(fd=802, path=pathlib.Path("/bound/first"))
+        final_ancestor = mock.Mock(fd=803, path=pathlib.Path("/bound/final"))
+        binding = mock.Mock(
+            install_lock_fd=801,
+            ancestors=(first_ancestor, final_ancestor),
+        )
+        primary = LegacyInterrupt("injected active hook binding failure")
+        close_failure = OSError(
+            errno.EIO,
+            "injected secondary hook binding close failure",
+        )
+        restore_failure = LegacyInterrupt(
+            "injected secondary hook binding restoration failure"
+        )
+        signal_fence = mock.Mock()
+        signal_fence.restore.side_effect = restore_failure
+        closed: list[int] = []
+
+        def fail_first_close(fd: int) -> None:
+            closed.append(fd)
+            if len(closed) == 1:
+                raise close_failure
+
+        with (
+            mock.patch.object(
+                project_journal,
+                "_block_fd_close_signals",
+                return_value=signal_fence,
+            ),
+            mock.patch.object(
+                project_journal.os,
+                "close",
+                side_effect=fail_first_close,
+            ),
+        ):
+            with self.assertRaises(LegacyInterrupt) as raised:
+                try:
+                    raise primary
+                except LegacyInterrupt as active_error:
+                    project_journal._close_hook_binding(
+                        binding,
+                        active_error=active_error,
+                    )
+                    raise
+
+        self.assertIs(raised.exception, primary)
+        self.assertEqual(closed, [801, 803, 802])
+        notes = "\n".join(getattr(primary, "__notes__", ()))
+        self.assertIn("injected secondary hook binding close failure", notes)
+        self.assertIn("injected secondary hook binding restoration failure", notes)
+        self.assertIn("type=LegacyInterrupt", notes)
+        signal_fence.restore.assert_called_once_with()
 
     def test_staged_hook_preserves_write_error_when_close_fails(self) -> None:
         repo = self.init_repo("repo-staged-hook-close").resolve()

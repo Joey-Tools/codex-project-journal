@@ -493,3 +493,48 @@ superseded_by:
   `py_compile`, the installed Joey/OpenAI skill validator, both runtimes'
   project journal validation, and `git diff --check`. The two task-scoped
   bytecode caches were removed with the protected cleanup helper.
+- Signed head `80310ce` passed exact-secret admission with complete temporary
+  cleanup, was pushed to PR #5, and passed Linux Python 3.14.6 CI in 75
+  seconds. The fully paginated request ledger proved zero GitHub Codex
+  requests on that head and no overlap among the four terminal historical
+  requests.
+- The first fresh named-single attempt returned `No findings.` but its own
+  full-suite command created ignored `scripts/__pycache__/` and
+  `tests/__pycache__/` entries. Terminal guard validation therefore stopped
+  with `blocked-safety`, and that result was not counted. The exact workspace
+  was removed only after proving it was owner-private, contained no symlink or
+  foreign-owned object, and had no process references.
+- A second independently materialized fresh-context, strictly read-only
+  whole-range named-single review found one P2 and passed terminal guard
+  validation: `_close_hook_binding()` drained multiple numeric descriptors
+  without the existing POSIX close signal fence. A pending `SIGINT` could run
+  Python between close dispatches, skip the remaining owners, and replace an
+  active operation or first close error.
+- After successful fence acquisition, one fence now covers the installation
+  lock and the complete reversed entry-time ancestor set. Every numeric
+  descriptor receives one close dispatch before the mask is restored; a close
+  error leaves reuse state uncertain and is never retried. Fence acquisition
+  failure performs no unprotected close and reports the count not attempted.
+  Error priority is active operation, then first close, then restoration or
+  newly delivered pending `SIGINT`; later failures remain bounded evidence.
+  A caller-entry blocked pending `SIGINT` remains blocked and pending.
+- Thirteen focused final-binding, real-`SIGINT`, acquisition-failure,
+  restoration-matrix, command-precedence, and documentation regressions
+  passed in both supported runtimes after the final documentation correction:
+  Python 3.13.0 completed in 0.019 seconds and Xcode Python 3.9.6 in 0.025
+  seconds. Ruff check/format and
+  `git diff --check` also passed.
+- An independent final read-only audit rechecked the single-fence owner set,
+  zero unprotected closes after acquisition failure, reuse-uncertain no-retry
+  rule, active/close/restore priority matrix, real pending-`SIGINT` delivery,
+  and entry-blocked pending state. After the documentation scope correction it
+  returned `No findings.`
+- Final exact-state full suites passed all 431 tests in both supported local
+  runtimes: Python 3.13.0 completed in 996.951 seconds with 4 platform skips,
+  and Xcode Python 3.9.6 completed in 1021.178 seconds with 5 platform skips.
+  A bounded follow-up inventory found no retained recent
+  `project-journal-git-launch-*` directory.
+- Final post-evidence verification passed Ruff check/format, both runtimes'
+  `py_compile`, the installed Joey/OpenAI skill validator, both runtimes'
+  project journal validation, and `git diff --check`. The two task-scoped
+  bytecode caches were removed with the protected cleanup helper.
