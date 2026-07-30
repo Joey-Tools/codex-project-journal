@@ -330,3 +330,48 @@ superseded_by:
 - Final exact-state full suites after both follow-up fixes passed all 404
   tests: Python 3.13.0 completed in 958.148 seconds with 4 platform skips, and
   Xcode Python 3.9.6 completed in 977.729 seconds with 5 platform skips.
+- The next formal fresh whole-range named-single review of signed head
+  `e827a50` found two remaining P2 failure-evidence gaps. The hook pipeline let
+  a successful EOF drain mask a failed bounded copy and did not consume the
+  drain status, so an incomplete diagnostic could be accepted for persistent
+  append. Several hook path, lock, and staging cleanup paths also let a
+  descriptor-close failure replace the active validation, write, sync, or
+  permission error.
+- The hook now sends distinct generation, exact bounded-copy, and EOF-drain
+  statuses over an anonymous parent-owned status channel and classifies the
+  records independently of producer/capture completion order. It accepts
+  persistent append only when both capture stages succeed; otherwise it skips
+  the durable log and emits an explicit hard-bounded partial diagnostic to
+  stderr. Path-component, root/ancestor, installation-lock, and staged-hook
+  descriptor cleanup now preserves the exact active exception and attaches
+  bounded close-failure evidence. `OSError` wrappers copy that evidence to the
+  top-level `UserError`, while a close failure with no active exception remains
+  independently actionable.
+- A follow-up read-only implementation audit found that root-descriptor
+  ownership began too late, two natural `OSError` wrapping paths discarded
+  attached cleanup notes, and the first drain-failure test failed only after
+  EOF. Root ownership now covers every fallible validation, the wrappers retain
+  bounded notes, and the drain regression uses a 1 MiB producer plus a reader
+  that consumes at most 4 KiB before failing. The hook finishes inside the
+  five-second test deadline, reports the independent copy/drain statuses,
+  skips persistent append, and keeps stderr within the documented ceiling.
+- A final bounded audit found that an unbounded all-digit status could overflow
+  the shell integer comparison and be treated as false rather than invalid.
+  Status admission now accepts only canonical decimal `0..255` before any
+  integer operation, with the shell parser pinned to the C locale. The
+  regression injects 128-digit generation, copy, and drain records and proves
+  each fails closed without invoking an unsafe comparison.
+- Ten focused regressions passed in both supported runtimes: Python 3.13.0
+  completed in 21.025 seconds and Xcode Python 3.9.6 in 20.825 seconds. They
+  cover exact bounded retention plus observable EOF drain, independent copy
+  and pre-EOF drain failure injection, POSIX hook syntax, and simultaneous
+  operation plus descriptor-close failures across target snapshot,
+  filesystem-root binding, path component, path ancestor, install lock, and
+  staged hook write paths, plus bounded status-record admission. The early
+  drain failure's substituted append command writes an invocation marker, and
+  the regression proves that marker remains absent rather than inferring
+  skipped append from a missing log alone.
+- Final implementation-state full suites passed all 411 tests in both
+  supported runtimes: Python 3.13.0 completed in 1004.673 seconds with 4
+  platform skips, and Xcode Python 3.9.6 completed in 1028.254 seconds with 5
+  platform skips.

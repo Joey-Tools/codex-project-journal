@@ -1156,6 +1156,15 @@ def _close_descriptor_preserving_error(
         raise
 
 
+def _wrap_user_error_preserving_details(
+    message: str,
+    source: BaseException,
+) -> UserError:
+    wrapped = UserError(message)
+    _add_exception_details(wrapped, getattr(source, "__notes__", ()))
+    return wrapped
+
+
 def _merge_fd_close_restore_error(
     close_error: BaseException | None,
     restore_error: BaseException | None,
@@ -6872,25 +6881,86 @@ if [ -n "$tmp_dir" ] && [ -d "$tmp_dir" ] && [ ! -L "$tmp_dir" ]; then
         date -u '+%Y-%m-%dT%H:%M:%SZ'
         {python_exe} {script_path} generate --repo "$repo" --output {DEFAULT_INDEX.as_posix()} --ensure-exclude
         generation_status=$?
-        printf '%s\n' "$generation_status" >&7
+        printf 'generation:%s\n' "$generation_status" >&7
       }} 2>&1
     }} | {{
       LC_ALL=C dd ibs=1 obs={HOOK_DIAGNOSTIC_COPY_BLOCK_BYTES} count={MAX_HOOK_DIAGNOSTIC_BYTES} >&4 2>/dev/null
+      capture_status=$?
       cat >/dev/null
+      drain_status=$?
+      printf 'capture:%s:%s\n' "$capture_status" "$drain_status" >&7
     }}
     exec 4>&-
     exec 7>&-
-    if ! IFS= read -r generation_status <&6; then
+    generation_status=125
+    capture_status=125
+    drain_status=125
+    generation_seen=0
+    capture_seen=0
+    status_invalid=0
+    while IFS= read -r status_record <&6; do
+      case "$status_record" in
+        generation:*)
+          if [ "$generation_seen" -ne 0 ]; then
+            status_invalid=1
+          else
+            generation_seen=1
+            generation_status=${{status_record#generation:}}
+          fi
+          ;;
+        capture:*:*)
+          if [ "$capture_seen" -ne 0 ]; then
+            status_invalid=1
+          else
+            capture_seen=1
+            capture_status=${{status_record#capture:}}
+            drain_status=${{capture_status#*:}}
+            capture_status=${{capture_status%%:*}}
+          fi
+          ;;
+        *)
+          status_invalid=1
+          ;;
+      esac
+    done
+    if [ "$status_invalid" -ne 0 ]; then
       generation_status=125
+      capture_status=125
+      drain_status=125
     fi
+    LC_ALL=C
     case "$generation_status" in
-      ''|*[!0-9]*) generation_status=125 ;;
+      0|[1-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5]) ;;
+      *) generation_status=125 ;;
     esac
-    if [ "$generation_status" -ne 0 ]; then
-      if ! {python_exe} {script_path} _append-hook-log --repo "$repo" <&3 2>/dev/null; then
+    case "$capture_status" in
+      0|[1-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5]) ;;
+      *) capture_status=125 ;;
+    esac
+    case "$drain_status" in
+      0|[1-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5]) ;;
+      *) drain_status=125 ;;
+    esac
+    diagnostic_capture_failed=0
+    if [ "$capture_status" -ne 0 ] || [ "$drain_status" -ne 0 ]; then
+      diagnostic_capture_failed=1
+    fi
+    if [ "$generation_status" -ne 0 ] || [ "$diagnostic_capture_failed" -ne 0 ]; then
+      diagnostic_append_failed=0
+      if [ "$diagnostic_capture_failed" -ne 0 ]; then
+        diagnostic_append_failed=1
+      elif ! {python_exe} {script_path} _append-hook-log --repo "$repo" <&3 2>/dev/null; then
+        diagnostic_append_failed=1
+      fi
+      if [ "$diagnostic_append_failed" -ne 0 ]; then
         trap '' PIPE
-        printf '%s\n' \
-          'project-journal: index refresh and persistent diagnostic append failed; bounded diagnostic follows' >&2 || true
+        if [ "$diagnostic_capture_failed" -ne 0 ]; then
+          printf '%s\n' \
+            "project-journal: diagnostic capture failed (dd=$capture_status drain=$drain_status); bounded partial diagnostic follows" >&2 || true
+        else
+          printf '%s\n' \
+            'project-journal: index refresh and persistent diagnostic append failed; bounded diagnostic follows' >&2 || true
+        fi
         LC_ALL=C dd ibs=1 obs={HOOK_DIAGNOSTIC_COPY_BLOCK_BYTES} count={MAX_HOOK_DIAGNOSTIC_BYTES} <&5 >&2 2>/dev/null || true
         printf '%s\n' 'project-journal: end bounded diagnostic' >&2 || true
       fi
@@ -7696,22 +7766,30 @@ def _bind_hook_directory(
             )
         filesystem_root = pathlib.Path(os.sep)
         root_fd = os.open(filesystem_root, flags)
-        root_identity = _validate_hook_directory_stat(
-            filesystem_root,
-            os.fstat(root_fd),
-            require_access_policy=False,
-        )
-        root_path_identity = _validate_hook_directory_stat(
-            filesystem_root,
-            os.stat(filesystem_root, follow_symlinks=False),
-            require_access_policy=False,
-        )
-        if root_identity != root_path_identity:
-            os.close(root_fd)
-            raise UserError(
-                f"filesystem root changed while hook path was being bound: "
-                f"{filesystem_root}"
+        try:
+            root_identity = _validate_hook_directory_stat(
+                filesystem_root,
+                os.fstat(root_fd),
+                require_access_policy=False,
             )
+            root_path_identity = _validate_hook_directory_stat(
+                filesystem_root,
+                os.stat(filesystem_root, follow_symlinks=False),
+                require_access_policy=False,
+            )
+            if root_identity != root_path_identity:
+                raise UserError(
+                    f"filesystem root changed while hook path was being bound: "
+                    f"{filesystem_root}"
+                )
+        except BaseException as error:
+            _close_descriptor_preserving_error(
+                root_fd,
+                active_error=error,
+                context="filesystem root descriptor cleanup failed",
+                wrap_close_error=lambda message, _error_number: UserError(message),
+            )
+            raise
         opened.append(
             _BoundHookDirectory(
                 path=filesystem_root,
@@ -7770,8 +7848,16 @@ def _bind_hook_directory(
                         component_path,
                         "hook path component",
                     )
-            except BaseException:
-                os.close(child_fd)
+            except BaseException as error:
+                _close_descriptor_preserving_error(
+                    child_fd,
+                    active_error=error,
+                    context=(
+                        "hook path component descriptor cleanup failed: "
+                        f"{component_path}"
+                    ),
+                    wrap_close_error=lambda message, _error_number: UserError(message),
+                )
                 raise
             current = _BoundHookDirectory(
                 path=component_path,
@@ -7783,14 +7869,30 @@ def _bind_hook_directory(
             )
             opened.append(current)
     except OSError as exc:
+        wrapped = _wrap_user_error_preserving_details(
+            f"failed descriptor-relative hook path traversal under {plan.root}: {exc}",
+            exc,
+        )
         for ancestor in reversed(opened):
-            os.close(ancestor.fd)
-        raise UserError(
-            f"failed descriptor-relative hook path traversal under {plan.root}: {exc}"
-        ) from exc
-    except BaseException:
+            _close_descriptor_preserving_error(
+                ancestor.fd,
+                active_error=wrapped,
+                context=(
+                    f"hook path traversal descriptor cleanup failed: {ancestor.path}"
+                ),
+                wrap_close_error=lambda message, _error_number: UserError(message),
+            )
+        raise wrapped from exc
+    except BaseException as error:
         for ancestor in reversed(opened):
-            os.close(ancestor.fd)
+            _close_descriptor_preserving_error(
+                ancestor.fd,
+                active_error=error,
+                context=(
+                    f"hook path traversal descriptor cleanup failed: {ancestor.path}"
+                ),
+                wrap_close_error=lambda message, _error_number: UserError(message),
+            )
         raise
 
     final = opened[-1]
@@ -7919,8 +8021,13 @@ def _acquire_hook_install_lock(
                 f"hook installation lock identity changed while being acquired: "
                 f"{binding.path / name}"
             )
-    except BaseException:
-        os.close(fd)
+    except BaseException as error:
+        _close_descriptor_preserving_error(
+            fd,
+            active_error=error,
+            context="hook installation lock descriptor cleanup failed",
+            wrap_close_error=lambda message, _error_number: UserError(message),
+        )
         raise
     return dataclasses.replace(
         binding,
@@ -9115,13 +9222,22 @@ def _install_hook(
     try:
         temporary_fd = os.open(temporary_name, flags, 0o600, dir_fd=binding.fd)
         temporary_created = True
+        temporary_error: BaseException | None = None
         try:
             _write_all(temporary_fd, content)
             os.fsync(temporary_fd)
             os.fchmod(temporary_fd, 0o755)
             os.fsync(temporary_fd)
+        except BaseException as error:
+            temporary_error = error
+            raise
         finally:
-            os.close(temporary_fd)
+            _close_descriptor_preserving_error(
+                temporary_fd,
+                active_error=temporary_error,
+                context="staged hook descriptor cleanup failed",
+                wrap_close_error=lambda message, _error_number: UserError(message),
+            )
         staged, staged_content = _snapshot_hook_target(binding, temporary_name)
         if (
             not staged.exists
@@ -9186,8 +9302,9 @@ def _install_hook(
                 temporary_name,
                 staged,
             )
-            raise UserError(
-                f"absent-target hook rename may have committed: {exc}; {detail}"
+            raise _wrap_user_error_preserving_details(
+                f"absent-target hook rename may have committed: {exc}; {detail}",
+                exc,
             ) from exc
         if commit_state.must_preserve_temporary:
             temporary_created = False
@@ -9205,8 +9322,9 @@ def _install_hook(
                 temporary_name,
                 expected_recovery,
             )
-            raise UserError(
-                f"hook exchange may have committed{durability_detail}; {recovery}"
+            raise _wrap_user_error_preserving_details(
+                f"hook exchange may have committed{durability_detail}; {recovery}",
+                exc,
             ) from exc
         if commit_state.installed_target_committed:
             temporary_created = False
@@ -9217,13 +9335,15 @@ def _install_hook(
                 staged,
             )
             pending_step = commit_state.pending_step or "post-commit verification"
-            raise UserError(
+            raise _wrap_user_error_preserving_details(
                 f"hook target installation committed, but {pending_step} is "
                 f"incomplete: "
-                f"{exc}; {detail}"
+                f"{exc}; {detail}",
+                exc,
             ) from exc
-        raise UserError(
-            f"failed to install hook {binding.path / target.name}: {exc}"
+        raise _wrap_user_error_preserving_details(
+            f"failed to install hook {binding.path / target.name}: {exc}",
+            exc,
         ) from exc
     except Exception as exc:
         if commit_state.installed_target_committed:

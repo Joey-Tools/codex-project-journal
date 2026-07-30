@@ -14081,6 +14081,197 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertEqual(list(hook_tmp.iterdir()), [])
         self.assertFalse((repo / ".git/project-journal-index.log").exists())
 
+    def test_hook_capture_or_drain_failure_skips_persistent_append(self) -> None:
+        for failure_kind in ("capture", "drain"):
+            with self.subTest(failure_kind=failure_kind):
+                repo = self.init_repo(f"repo-{failure_kind}-failure")
+                journal = self.write_journal(
+                    repo,
+                    "docs/project_journal/2026/05/2026-05-05-alpha-a1b2c3.md",
+                    entry_id="20260505-a1b2c3",
+                    title="Alpha Work",
+                    status="active",
+                    updated="2026-05-05",
+                )
+                journal.write_text(
+                    journal.read_text(encoding="utf-8").replace(
+                        "status: active",
+                        "status: invalid",
+                    ),
+                    encoding="utf-8",
+                )
+                body = project_journal._hook_body()
+                capture_stage = (
+                    "      LC_ALL=C dd "
+                    f"ibs=1 obs={project_journal.HOOK_DIAGNOSTIC_COPY_BLOCK_BYTES} "
+                    f"count={project_journal.MAX_HOOK_DIAGNOSTIC_BYTES} "
+                    ">&4 2>/dev/null\n"
+                )
+                drain_stage = "      cat >/dev/null\n"
+                self.assertEqual(body.count(capture_stage), 1)
+                self.assertEqual(body.count(drain_stage), 1)
+                if failure_kind == "capture":
+                    body = body.replace(capture_stage, "      false\n", 1)
+                    expected_status = "dd=1 drain=0"
+                else:
+                    payload_size = 1024 * 1024
+                    append_marker = self.root / "unexpected-append-invocation"
+                    fake_python = self.root / "drain-failure-noisy-python"
+                    fake_python.write_text(
+                        f"#!{sys.executable}\n"
+                        + textwrap.dedent(
+                            f"""\
+                            import os
+                            import sys
+
+                            if len(sys.argv) > 2 and sys.argv[2] == "generate":
+                                remaining = memoryview(b"D" * {payload_size})
+                                while remaining:
+                                    written = os.write(1, remaining)
+                                    if written <= 0:
+                                        raise OSError(
+                                            "producer write made no progress"
+                                        )
+                                    remaining = remaining[written:]
+                                raise SystemExit(1)
+                            if (
+                                len(sys.argv) > 2
+                                and sys.argv[2] == "_append-hook-log"
+                            ):
+                                with open(
+                                    {str(append_marker)!r},
+                                    "xb",
+                                ) as marker:
+                                    marker.write(b"invoked")
+                            raise SystemExit(1)
+                            """
+                        ),
+                        encoding="utf-8",
+                    )
+                    fake_python.chmod(0o700)
+                    original_python = shlex.quote(sys.executable)
+                    self.assertEqual(body.count(original_python), 4)
+                    body = body.replace(
+                        original_python,
+                        shlex.quote(str(fake_python)),
+                    )
+                    drain_marker = self.root / "partial-drain-count"
+                    fake_drain = self.root / "partial-drain"
+                    fake_drain.write_text(
+                        f"#!{sys.executable}\n"
+                        + textwrap.dedent(
+                            f"""\
+                            import os
+
+                            chunk = os.read(0, 4096)
+                            with open({str(drain_marker)!r}, "xb") as marker:
+                                marker.write(str(len(chunk)).encode("ascii"))
+                            raise SystemExit(1)
+                            """
+                        ),
+                        encoding="utf-8",
+                    )
+                    fake_drain.chmod(0o700)
+                    body = body.replace(
+                        drain_stage,
+                        f"      {shlex.quote(str(fake_drain))}\n",
+                        1,
+                    )
+                    expected_status = "dd=0 drain=1"
+
+                result, hook_tmp = self.run_hook_body(repo, body)
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("diagnostic capture failed", result.stderr)
+                self.assertIn(expected_status, result.stderr)
+                self.assertIn("end bounded diagnostic", result.stderr)
+                self.assertLessEqual(
+                    len(result.stderr.encode("utf-8")),
+                    project_journal.MAX_HOOK_DIAGNOSTIC_BYTES + 2048,
+                )
+                self.assertFalse((repo / ".git/project-journal-index.log").exists())
+                self.assertEqual(list(hook_tmp.iterdir()), [])
+                if failure_kind == "drain":
+                    drained = int(drain_marker.read_text(encoding="ascii"))
+                    self.assertGreater(drained, 0)
+                    self.assertLessEqual(drained, 4096)
+                    self.assertLess(
+                        drained,
+                        payload_size - project_journal.MAX_HOOK_DIAGNOSTIC_BYTES,
+                    )
+                    self.assertFalse(append_marker.exists())
+                hook_tmp.rmdir()
+
+    def test_hook_rejects_unbounded_numeric_status_records(self) -> None:
+        oversized_status = "9" * 128
+        for status_kind in ("generation", "capture", "drain"):
+            with self.subTest(status_kind=status_kind):
+                repo = self.init_repo(f"repo-{status_kind}-status")
+                journal = self.write_journal(
+                    repo,
+                    "docs/project_journal/2026/05/2026-05-05-alpha-a1b2c3.md",
+                    entry_id="20260505-a1b2c3",
+                    title="Alpha Work",
+                    status="active",
+                    updated="2026-05-05",
+                )
+                body = project_journal._hook_body()
+                if status_kind == "generation":
+                    journal.write_text(
+                        journal.read_text(encoding="utf-8").replace(
+                            "status: active",
+                            "status: invalid",
+                        ),
+                        encoding="utf-8",
+                    )
+                    generation_record = (
+                        "        printf 'generation:%s\n' \"$generation_status\" >&7\n"
+                    )
+                    self.assertEqual(body.count(generation_record), 1)
+                    body = body.replace(
+                        generation_record,
+                        f"        printf 'generation:{oversized_status}\n' >&7\n",
+                        1,
+                    )
+                else:
+                    capture_record = (
+                        "      printf 'capture:%s:%s\n' "
+                        '"$capture_status" "$drain_status" >&7\n'
+                    )
+                    self.assertEqual(body.count(capture_record), 1)
+                    if status_kind == "capture":
+                        replacement = (
+                            f"      printf 'capture:{oversized_status}:0\n' >&7\n"
+                        )
+                    else:
+                        replacement = (
+                            f"      printf 'capture:0:{oversized_status}\n' >&7\n"
+                        )
+                    body = body.replace(capture_record, replacement, 1)
+
+                result, hook_tmp = self.run_hook_body(repo, body)
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                log = repo / ".git/project-journal-index.log"
+                if status_kind == "generation":
+                    self.assertTrue(log.is_file())
+                    self.assertGreater(log.stat().st_size, 0)
+                else:
+                    self.assertFalse(log.exists())
+                    expected = (
+                        "dd=125 drain=0"
+                        if status_kind == "capture"
+                        else "dd=0 drain=125"
+                    )
+                    self.assertIn("diagnostic capture failed", result.stderr)
+                    self.assertIn(expected, result.stderr)
+                    self.assertLessEqual(
+                        len(result.stderr.encode("utf-8")),
+                        project_journal.MAX_HOOK_DIAGNOSTIC_BYTES + 2048,
+                    )
+                self.assertEqual(list(hook_tmp.iterdir()), [])
+                hook_tmp.rmdir()
+
     def test_hook_body_has_valid_posix_shell_syntax(self) -> None:
         result = subprocess.run(
             ["/bin/sh", "-n"],
@@ -16340,6 +16531,387 @@ class ProjectJournalTests(unittest.TestCase):
                     if opened_fd is not None:
                         actual_close(opened_fd)
                     project_journal._close_hook_binding(binding)
+
+    def test_hook_path_component_preserves_validation_error_when_close_fails(
+        self,
+    ) -> None:
+        repo = self.init_repo("repo-hook-path-close").resolve()
+        plan = project_journal._default_hook_path_plan(repo)
+        actual_open = os.open
+        actual_close = os.close
+        actual_validate = project_journal._validate_hook_directory_stat
+        child_fd: int | None = None
+        primary = OSError(
+            errno.EIO,
+            "injected hook path component validation failure",
+        )
+        close_failure = OSError(
+            errno.EIO,
+            "injected hook path component close failure",
+        )
+
+        def capture_open(
+            path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+            flags: int,
+            mode: int = 0o777,
+            *,
+            dir_fd: int | None = None,
+        ) -> int:
+            nonlocal child_fd
+            fd = actual_open(path, flags, mode, dir_fd=dir_fd)
+            if dir_fd is not None and child_fd is None:
+                child_fd = fd
+            return fd
+
+        def fail_child_validation(
+            path: pathlib.Path,
+            value: os.stat_result,
+            *,
+            require_access_policy: bool,
+        ) -> tuple[int, int, int, int, int]:
+            if path != pathlib.Path(os.sep):
+                raise primary
+            return actual_validate(
+                path,
+                value,
+                require_access_policy=require_access_policy,
+            )
+
+        def fail_child_close(fd: int) -> None:
+            if fd == child_fd:
+                raise close_failure
+            actual_close(fd)
+
+        try:
+            with (
+                mock.patch.object(
+                    project_journal.os,
+                    "open",
+                    side_effect=capture_open,
+                ),
+                mock.patch.object(
+                    project_journal,
+                    "_validate_hook_directory_stat",
+                    side_effect=fail_child_validation,
+                ),
+                mock.patch.object(
+                    project_journal.os,
+                    "close",
+                    side_effect=fail_child_close,
+                ),
+            ):
+                with self.assertRaises(project_journal.UserError) as raised:
+                    project_journal._bind_hook_directory(repo, plan)
+
+            self.assertIs(raised.exception.__cause__, primary)
+            notes = "\n".join(getattr(raised.exception, "__notes__", ()))
+            self.assertIn("hook path component descriptor cleanup failed", notes)
+            self.assertIn("injected hook path component close failure", notes)
+        finally:
+            if child_fd is not None:
+                actual_close(child_fd)
+
+    def test_hook_root_binding_preserves_failure_when_close_fails(self) -> None:
+        for failure_kind in ("validation", "identity"):
+            with self.subTest(failure_kind=failure_kind):
+                repo = self.init_repo(f"repo-hook-root-{failure_kind}").resolve()
+                plan = project_journal._default_hook_path_plan(repo)
+                actual_open = os.open
+                actual_close = os.close
+                actual_validate = project_journal._validate_hook_directory_stat
+                root_fd: int | None = None
+                validation_count = 0
+                primary = OSError(
+                    errno.EIO,
+                    "injected filesystem root validation failure",
+                )
+                close_failure = OSError(
+                    errno.EIO,
+                    "injected filesystem root close failure",
+                )
+
+                def capture_root_open(
+                    path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+                    flags: int,
+                    mode: int = 0o777,
+                    *,
+                    dir_fd: int | None = None,
+                ) -> int:
+                    nonlocal root_fd
+                    fd = actual_open(path, flags, mode, dir_fd=dir_fd)
+                    if root_fd is None:
+                        root_fd = fd
+                    return fd
+
+                def fail_root_validation(
+                    path: pathlib.Path,
+                    value: os.stat_result,
+                    *,
+                    require_access_policy: bool,
+                ) -> tuple[int, int, int, int, int]:
+                    nonlocal validation_count
+                    validation_count += 1
+                    if failure_kind == "validation":
+                        raise primary
+                    identity = actual_validate(
+                        path,
+                        value,
+                        require_access_policy=require_access_policy,
+                    )
+                    if validation_count == 2:
+                        return (identity[0] + 1, *identity[1:])
+                    return identity
+
+                def fail_root_close(fd: int) -> None:
+                    if fd == root_fd:
+                        raise close_failure
+                    actual_close(fd)
+
+                try:
+                    with (
+                        mock.patch.object(
+                            project_journal.os,
+                            "open",
+                            side_effect=capture_root_open,
+                        ),
+                        mock.patch.object(
+                            project_journal,
+                            "_validate_hook_directory_stat",
+                            side_effect=fail_root_validation,
+                        ),
+                        mock.patch.object(
+                            project_journal.os,
+                            "close",
+                            side_effect=fail_root_close,
+                        ),
+                    ):
+                        with self.assertRaises(project_journal.UserError) as raised:
+                            project_journal._bind_hook_directory(repo, plan)
+
+                    if failure_kind == "validation":
+                        self.assertIs(raised.exception.__cause__, primary)
+                    else:
+                        self.assertIn(
+                            "filesystem root changed while hook path was being bound",
+                            str(raised.exception),
+                        )
+                    notes = "\n".join(getattr(raised.exception, "__notes__", ()))
+                    self.assertIn("filesystem root descriptor cleanup failed", notes)
+                    self.assertIn("injected filesystem root close failure", notes)
+                finally:
+                    if root_fd is not None:
+                        actual_close(root_fd)
+
+    def test_hook_path_traversal_preserves_primary_when_root_close_fails(
+        self,
+    ) -> None:
+        for failure_kind in ("oserror", "interrupt"):
+            with self.subTest(failure_kind=failure_kind):
+                repo = self.init_repo(f"repo-hook-root-close-{failure_kind}").resolve()
+                plan = project_journal._default_hook_path_plan(repo)
+                actual_open = os.open
+                actual_close = os.close
+                root_fd: int | None = None
+                open_count = 0
+                if failure_kind == "oserror":
+                    primary: BaseException = OSError(
+                        errno.EIO,
+                        "injected hook path traversal failure",
+                    )
+                else:
+                    primary = KeyboardInterrupt(
+                        "injected hook path traversal interruption"
+                    )
+                close_failure = OSError(
+                    errno.EIO,
+                    "injected hook root close failure",
+                )
+
+                def fail_after_root_open(
+                    path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+                    flags: int,
+                    mode: int = 0o777,
+                    *,
+                    dir_fd: int | None = None,
+                ) -> int:
+                    nonlocal root_fd, open_count
+                    open_count += 1
+                    if open_count == 1:
+                        root_fd = actual_open(path, flags, mode, dir_fd=dir_fd)
+                        return root_fd
+                    raise primary
+
+                def fail_root_close(fd: int) -> None:
+                    if fd == root_fd:
+                        raise close_failure
+                    actual_close(fd)
+
+                try:
+                    with (
+                        mock.patch.object(
+                            project_journal.os,
+                            "open",
+                            side_effect=fail_after_root_open,
+                        ),
+                        mock.patch.object(
+                            project_journal.os,
+                            "close",
+                            side_effect=fail_root_close,
+                        ),
+                    ):
+                        if failure_kind == "oserror":
+                            with self.assertRaises(project_journal.UserError) as raised:
+                                project_journal._bind_hook_directory(repo, plan)
+                            self.assertIs(raised.exception.__cause__, primary)
+                        else:
+                            with self.assertRaises(KeyboardInterrupt) as raised:
+                                project_journal._bind_hook_directory(repo, plan)
+                            self.assertIs(raised.exception, primary)
+
+                    notes = "\n".join(getattr(raised.exception, "__notes__", ()))
+                    self.assertIn(
+                        "hook path traversal descriptor cleanup failed",
+                        notes,
+                    )
+                    self.assertIn("injected hook root close failure", notes)
+                finally:
+                    if root_fd is not None:
+                        actual_close(root_fd)
+
+    def test_hook_install_lock_preserves_validation_error_when_close_fails(
+        self,
+    ) -> None:
+        repo = self.init_repo("repo-hook-lock-close").resolve()
+        binding = project_journal._bind_hook_directory(
+            repo,
+            project_journal._default_hook_path_plan(repo),
+        )
+        actual_open = os.open
+        actual_close = os.close
+        lock_fd: int | None = None
+        primary = project_journal.UserError("injected hook lock validation failure")
+        close_failure = OSError(
+            errno.EIO,
+            "injected hook lock close failure",
+        )
+
+        def capture_lock_open(
+            path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+            flags: int,
+            mode: int = 0o777,
+            *,
+            dir_fd: int | None = None,
+        ) -> int:
+            nonlocal lock_fd
+            fd = actual_open(path, flags, mode, dir_fd=dir_fd)
+            if path == ".project-journal-install.lock":
+                lock_fd = fd
+            return fd
+
+        def fail_lock_close(fd: int) -> None:
+            if fd == lock_fd:
+                raise close_failure
+            actual_close(fd)
+
+        try:
+            with (
+                mock.patch.object(
+                    project_journal.os,
+                    "open",
+                    side_effect=capture_lock_open,
+                ),
+                mock.patch.object(
+                    project_journal,
+                    "_reject_extended_acl",
+                    side_effect=primary,
+                ),
+                mock.patch.object(
+                    project_journal.os,
+                    "close",
+                    side_effect=fail_lock_close,
+                ),
+            ):
+                with self.assertRaises(project_journal.UserError) as raised:
+                    project_journal._acquire_hook_install_lock(binding)
+
+            self.assertIs(raised.exception, primary)
+            notes = "\n".join(getattr(primary, "__notes__", ()))
+            self.assertIn(
+                "hook installation lock descriptor cleanup failed",
+                notes,
+            )
+            self.assertIn("injected hook lock close failure", notes)
+        finally:
+            if lock_fd is not None:
+                actual_close(lock_fd)
+            project_journal._close_hook_binding(binding)
+
+    def test_staged_hook_preserves_write_error_when_close_fails(self) -> None:
+        repo = self.init_repo("repo-staged-hook-close").resolve()
+        with mock.patch.dict(
+            os.environ,
+            {"GIT_CONFIG_NOSYSTEM": "1"},
+            clear=False,
+        ):
+            binding = project_journal._preflight_hook_targets(repo)
+        actual_open = os.open
+        actual_close = os.close
+        temporary_fd: int | None = None
+        primary = OSError(errno.EIO, "injected staged hook write failure")
+        close_failure = OSError(
+            errno.EIO,
+            "injected staged hook close failure",
+        )
+
+        def capture_temporary_open(
+            path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+            flags: int,
+            mode: int = 0o777,
+            *,
+            dir_fd: int | None = None,
+        ) -> int:
+            nonlocal temporary_fd
+            fd = actual_open(path, flags, mode, dir_fd=dir_fd)
+            if isinstance(path, str) and path.startswith(
+                ".project-journal-post-merge-"
+            ):
+                temporary_fd = fd
+            return fd
+
+        def fail_temporary_close(fd: int) -> None:
+            if fd == temporary_fd:
+                raise close_failure
+            actual_close(fd)
+
+        try:
+            with (
+                mock.patch.object(
+                    project_journal.os,
+                    "open",
+                    side_effect=capture_temporary_open,
+                ),
+                mock.patch.object(
+                    project_journal,
+                    "_write_all",
+                    side_effect=primary,
+                ),
+                mock.patch.object(
+                    project_journal.os,
+                    "close",
+                    side_effect=fail_temporary_close,
+                ),
+            ):
+                with self.assertRaises(project_journal.UserError) as raised:
+                    project_journal._install_hook(binding, binding.targets[0])
+
+            self.assertIs(raised.exception.__cause__, primary)
+            notes = "\n".join(getattr(raised.exception, "__notes__", ()))
+            self.assertIn("staged hook descriptor cleanup failed", notes)
+            self.assertIn("injected staged hook close failure", notes)
+        finally:
+            if temporary_fd is not None:
+                actual_close(temporary_fd)
+            project_journal._close_hook_binding(binding)
 
     def test_hook_installers_are_serialized_by_owner_private_lock(self) -> None:
         repo = self.init_repo().resolve()
