@@ -7664,6 +7664,76 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertIn("\\udcff", decoded)
         self.assertEqual(json.loads(decoded), rows)
 
+    def test_discovery_json_output_writes_non_utf8_hooks_path_error_to_strict_sink(
+        self,
+    ) -> None:
+        repo = self.init_repo().resolve()
+        raw_path = b".githooks-\xff"
+        configured = project_journal._parse_repo_hook_path_config(
+            b"local\0file:/repo/.git/config\0" + raw_path + b"\0",
+            "test effective core.hooksPath query",
+        )
+
+        with mock.patch.object(
+            project_journal,
+            "_repo_hook_path_config",
+            return_value=configured,
+        ):
+            with mock.patch.object(
+                project_journal,
+                "_allowed_hook_roots",
+                return_value=[repo],
+            ):
+                with mock.patch.object(
+                    project_journal.os,
+                    "open",
+                    side_effect=OSError(
+                        errno.EACCES,
+                        "injected hook access failure",
+                        os.fspath(repo / configured.raw_path / "post-merge"),
+                    ),
+                ):
+                    with self.assertRaises(
+                        project_journal.DiscoveryAuxiliaryInspectionError,
+                    ) as raised:
+                        project_journal._has_hook_marker(repo)
+
+        undecodable_byte = os.fsdecode(b"\xff")
+        self.assertIn(undecodable_byte, str(raised.exception))
+        discovery_error = project_journal._discovery_error(raised.exception)
+        self.assertNotIn(undecodable_byte, discovery_error["message"])
+        self.assertIn("\\udcff", discovery_error["message"])
+        rows = [
+            {
+                "repo": str(repo),
+                "discovery_error": {"hooks_installed": discovery_error},
+            }
+        ]
+        raw_stdout = io.BytesIO()
+        strict_stdout = io.TextIOWrapper(
+            raw_stdout,
+            encoding="utf-8",
+            errors="strict",
+        )
+        args = mock.Mock(
+            codex_home=str(self.root),
+            since_days=1,
+            json_output=True,
+        )
+
+        with mock.patch.object(
+            project_journal,
+            "_discover_repos",
+            return_value=rows,
+        ):
+            with mock.patch.object(project_journal.sys, "stdout", strict_stdout):
+                project_journal.command_discover_repos(args)
+                strict_stdout.flush()
+
+        decoded = raw_stdout.getvalue().decode("utf-8", errors="strict")
+        self.assertIn("\\udcff", decoded)
+        self.assertEqual(json.loads(decoded), rows)
+
     def test_frontmatter_line_cap_does_not_count_long_body(self) -> None:
         body = "\n".join(
             f"Body line {index}"

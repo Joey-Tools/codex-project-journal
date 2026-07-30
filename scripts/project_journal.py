@@ -2249,10 +2249,14 @@ class _IndexedJournalLoad:
     valid_count: int
 
 
+def _utf8_safe_display(value: str) -> str:
+    return value.encode("utf-8", errors="backslashreplace").decode("utf-8")
+
+
 def _bounded_journal_path_label(path: str | bytes) -> str:
     raw_path = path if isinstance(path, bytes) else os.fsencode(path)
-    display = os.fsdecode(raw_path)
-    rendered_bytes = display.encode("utf-8", errors="backslashreplace")
+    display = _utf8_safe_display(os.fsdecode(raw_path))
+    rendered_bytes = display.encode("utf-8")
     if len(rendered_bytes) <= MAX_VALIDATION_ISSUE_PATH_BYTES:
         return rendered_bytes.decode("utf-8")
     reference = {
@@ -11505,10 +11509,10 @@ def _discover_adoption_status(
     except (OSError, UserError) as exc:
         return {
             "adoption_status": "inconclusive",
-            "adoption_error": {
-                "code": getattr(exc, "code", "adoption_check_failed"),
-                "message": str(exc),
-            },
+            "adoption_error": _discovery_error(
+                exc,
+                default_code="adoption_check_failed",
+            ),
             "tracked_journal_adopted": None,
             "tracked_non_generated_journal_count": None,
             "valid_tracked_journal_count": None,
@@ -11522,10 +11526,14 @@ def _discover_adoption_status(
     }
 
 
-def _discovery_error(exc: BaseException) -> dict[str, Any]:
+def _discovery_error(
+    exc: BaseException,
+    *,
+    default_code: str = "repo_discovery_failed",
+) -> dict[str, Any]:
     error: dict[str, Any] = {
-        "code": getattr(exc, "code", "repo_discovery_failed"),
-        "message": str(exc),
+        "code": getattr(exc, "code", default_code),
+        "message": _utf8_safe_display(str(exc)),
     }
     if isinstance(
         exc,
