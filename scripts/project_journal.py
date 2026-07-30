@@ -7977,23 +7977,46 @@ def _bind_hook_directory(
     )
     try:
         _revalidate_hook_directory(binding)
-    except BaseException:
-        _close_hook_binding(binding)
+    except BaseException as error:
+        _close_hook_binding(binding, active_error=error)
         raise
     return binding
 
 
-def _close_hook_binding(binding: _HookDirectoryBinding) -> None:
+def _close_hook_binding(
+    binding: _HookDirectoryBinding,
+    *,
+    active_error: BaseException | None = None,
+) -> None:
+    cleanup_error: BaseException | None = None
+
+    def close_descriptor(fd: int, *, context: str) -> None:
+        nonlocal cleanup_error
+        evidence_owner = active_error if active_error is not None else cleanup_error
+        try:
+            _close_descriptor_preserving_error(
+                fd,
+                active_error=evidence_owner,
+                context=context,
+                wrap_close_error=lambda message, _error_number: UserError(message),
+            )
+        except BaseException as error:
+            if evidence_owner is not None:
+                raise
+            cleanup_error = error
+
     if binding.install_lock_fd is not None:
-        try:
-            os.close(binding.install_lock_fd)
-        except OSError:
-            pass
+        close_descriptor(
+            binding.install_lock_fd,
+            context="hook installation lock descriptor cleanup failed",
+        )
     for ancestor in reversed(binding.ancestors):
-        try:
-            os.close(ancestor.fd)
-        except OSError:
-            pass
+        close_descriptor(
+            ancestor.fd,
+            context=(f"hook path binding descriptor cleanup failed: {ancestor.path}"),
+        )
+    if active_error is None and cleanup_error is not None:
+        raise cleanup_error
 
 
 def _revalidate_hook_install_lock(binding: _HookDirectoryBinding) -> None:
@@ -8124,8 +8147,8 @@ def _preflight_hook_targets(repo: pathlib.Path) -> _HookDirectoryBinding:
         binding = dataclasses.replace(provisional, targets=tuple(targets))
         _revalidate_hook_directory(binding)
         return binding
-    except BaseException:
-        _close_hook_binding(binding)
+    except BaseException as error:
+        _close_hook_binding(binding, active_error=error)
         raise
 
 
@@ -9491,12 +9514,16 @@ def _install_hook(
 def command_install_hooks(args: argparse.Namespace) -> int:
     repo = _resolve_repo(args.repo)
     binding = _preflight_hook_targets(repo)
+    operation_error: BaseException | None = None
     try:
         _ensure_exclude(repo, DEFAULT_INDEX.as_posix())
         _revalidate_hook_directory(binding)
         installed = [_install_hook(binding, target) for target in binding.targets]
+    except BaseException as error:
+        operation_error = error
+        raise
     finally:
-        _close_hook_binding(binding)
+        _close_hook_binding(binding, active_error=operation_error)
     for path in installed:
         print(path)
     return 0

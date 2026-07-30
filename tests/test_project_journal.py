@@ -13335,6 +13335,10 @@ class ProjectJournalTests(unittest.TestCase):
             "completed cleanup and never claims a missing recovery object",
             skill,
         )
+        self.assertIn(
+            "Final hook binding cleanup attempts the installation lock and every retained ancestor descriptor",
+            skill,
+        )
         self.assertIn("required `O_NOFOLLOW|O_NONBLOCK`", skill)
         self.assertIn("every ancestor identity/access policy", skill)
         self.assertIn(
@@ -13625,6 +13629,10 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertIn("installed-target-committed state", readme)
         self.assertIn(
             "completed cleanup and never claims a missing recovery object",
+            readme,
+        )
+        self.assertIn(
+            "Final hook binding cleanup attempts the installation lock and every retained ancestor descriptor",
             readme,
         )
         self.assertIn(
@@ -17196,6 +17204,163 @@ class ProjectJournalTests(unittest.TestCase):
             if lock_fd is not None:
                 actual_close(lock_fd)
             project_journal._close_hook_binding(binding)
+
+    def test_hook_binding_cleanup_drains_after_first_close_failure(self) -> None:
+        first_ancestor = mock.Mock(fd=702, path=pathlib.Path("/bound/first"))
+        final_ancestor = mock.Mock(fd=703, path=pathlib.Path("/bound/final"))
+        binding = mock.Mock(
+            install_lock_fd=701,
+            ancestors=(first_ancestor, final_ancestor),
+        )
+        lock_failure = OSError(
+            errno.EIO,
+            "injected final hook lock close failure",
+        )
+        ancestor_failure = OSError(
+            errno.EBADF,
+            "injected final hook ancestor close failure",
+        )
+        closed: list[int] = []
+
+        def fail_selected_close(fd: int) -> None:
+            closed.append(fd)
+            if fd == binding.install_lock_fd:
+                raise lock_failure
+            if fd == final_ancestor.fd:
+                raise ancestor_failure
+
+        with mock.patch.object(
+            project_journal.os,
+            "close",
+            side_effect=fail_selected_close,
+        ):
+            with self.assertRaises(project_journal.UserError) as raised:
+                project_journal._close_hook_binding(binding)
+
+        self.assertEqual(closed, [701, 703, 702])
+        self.assertIs(raised.exception.__cause__, lock_failure)
+        self.assertIn(
+            "hook installation lock descriptor cleanup failed",
+            str(raised.exception),
+        )
+        notes = "\n".join(getattr(raised.exception, "__notes__", ()))
+        self.assertIn(
+            "hook path binding descriptor cleanup failed: /bound/final",
+            notes,
+        )
+        self.assertIn("injected final hook ancestor close failure", notes)
+
+    def test_install_hooks_preserves_operation_error_over_final_close_failures(
+        self,
+    ) -> None:
+        first_ancestor = mock.Mock(fd=712, path=pathlib.Path("/bound/first"))
+        final_ancestor = mock.Mock(fd=713, path=pathlib.Path("/bound/final"))
+        binding = mock.Mock(
+            install_lock_fd=711,
+            ancestors=(first_ancestor, final_ancestor),
+            targets=(),
+        )
+        primary = project_journal.UserError("injected final hook operation failure")
+        closed: list[int] = []
+
+        def fail_every_close(fd: int) -> None:
+            closed.append(fd)
+            raise OSError(errno.EIO, f"injected close failure for fd {fd}")
+
+        with (
+            mock.patch.object(
+                project_journal,
+                "_resolve_repo",
+                return_value=self.root,
+            ),
+            mock.patch.object(
+                project_journal,
+                "_preflight_hook_targets",
+                return_value=binding,
+            ),
+            mock.patch.object(project_journal, "_ensure_exclude"),
+            mock.patch.object(
+                project_journal,
+                "_revalidate_hook_directory",
+                side_effect=primary,
+            ),
+            mock.patch.object(
+                project_journal.os,
+                "close",
+                side_effect=fail_every_close,
+            ),
+        ):
+            with self.assertRaises(project_journal.UserError) as raised:
+                project_journal.command_install_hooks(mock.Mock(repo=self.root))
+
+        self.assertIs(raised.exception, primary)
+        self.assertEqual(closed, [711, 713, 712])
+        notes = "\n".join(getattr(primary, "__notes__", ()))
+        self.assertIn(
+            "hook installation lock descriptor cleanup failed",
+            notes,
+        )
+        self.assertIn(
+            "hook path binding descriptor cleanup failed: /bound/final",
+            notes,
+        )
+        self.assertIn(
+            "hook path binding descriptor cleanup failed: /bound/first",
+            notes,
+        )
+
+    def test_install_hooks_reports_close_only_failure_before_success_output(
+        self,
+    ) -> None:
+        first_ancestor = mock.Mock(fd=722, path=pathlib.Path("/bound/first"))
+        final_ancestor = mock.Mock(fd=723, path=pathlib.Path("/bound/final"))
+        binding = mock.Mock(
+            install_lock_fd=721,
+            ancestors=(first_ancestor, final_ancestor),
+            targets=(),
+        )
+        close_failure = OSError(
+            errno.EIO,
+            "injected final hook close-only failure",
+        )
+        closed: list[int] = []
+
+        def fail_first_close(fd: int) -> None:
+            closed.append(fd)
+            if fd == binding.install_lock_fd:
+                raise close_failure
+
+        stdout = io.StringIO()
+        with (
+            mock.patch.object(
+                project_journal,
+                "_resolve_repo",
+                return_value=self.root,
+            ),
+            mock.patch.object(
+                project_journal,
+                "_preflight_hook_targets",
+                return_value=binding,
+            ),
+            mock.patch.object(project_journal, "_ensure_exclude"),
+            mock.patch.object(project_journal, "_revalidate_hook_directory"),
+            mock.patch.object(
+                project_journal.os,
+                "close",
+                side_effect=fail_first_close,
+            ),
+            contextlib.redirect_stdout(stdout),
+        ):
+            with self.assertRaises(project_journal.UserError) as raised:
+                project_journal.command_install_hooks(mock.Mock(repo=self.root))
+
+        self.assertEqual(closed, [721, 723, 722])
+        self.assertIs(raised.exception.__cause__, close_failure)
+        self.assertIn(
+            "hook installation lock descriptor cleanup failed",
+            str(raised.exception),
+        )
+        self.assertEqual(stdout.getvalue(), "")
 
     def test_staged_hook_preserves_write_error_when_close_fails(self) -> None:
         repo = self.init_repo("repo-staged-hook-close").resolve()

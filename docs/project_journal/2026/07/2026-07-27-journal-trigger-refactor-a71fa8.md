@@ -460,3 +460,36 @@ superseded_by:
   seconds with 4 platform skips, and Xcode Python 3.9.6 completed in 1041.244
   seconds with 5 platform skips. A bounded follow-up inventory found no
   retained recent Git-launch directory.
+- The next formal fresh whole-range named-single review of signed head
+  `0291adf` found one P2: final `_close_hook_binding()` cleanup unconditionally
+  discarded installation-lock and retained-ancestor descriptor close
+  failures. A close-only failure could therefore leave `install-hooks`
+  reporting success, while an active installation failure lost its cleanup
+  evidence.
+- Final hook binding cleanup now attempts the installation lock followed by
+  every retained ancestor even after a failure. An active operation exception
+  remains the exact primary and accumulates bounded close evidence. Without an
+  active exception, the first close failure becomes an actionable `UserError`;
+  later close failures attach to it while the remaining descriptors still
+  drain. Binding revalidation, preflight, and the top-level install command all
+  pass their exact active exception into that aggregate cleanup.
+- Three focused final-binding regressions passed in both supported runtimes:
+  Python 3.13.0 completed in 0.004 seconds and Xcode Python 3.9.6 in 0.005
+  seconds. They prove continued drain after a first close-only failure,
+  exact-primary preservation plus evidence from every final close, and
+  close-only rejection before a nominal successful command return. An
+  independent read-only audit rechecked all three production call sites and
+  the new tests and returned `No findings.`
+- The expanded final-binding regression set, including the existing component,
+  traversal, installation-lock close, and documentation checks, passed all
+  seven tests in both supported runtimes: Python 3.13.0 completed in 1.926
+  seconds and Xcode Python 3.9.6 in 1.954 seconds.
+- Final exact-state full suites after the final-binding fix passed all 423
+  tests in both supported local runtimes: Python 3.13.0 completed in 1004.900
+  seconds with 4 platform skips, and Xcode Python 3.9.6 completed in 1035.859
+  seconds with 5 platform skips. A bounded follow-up inventory found no
+  retained recent `project-journal-git-launch-*` directory.
+- Final post-evidence verification passed Ruff check/format, both runtimes'
+  `py_compile`, the installed Joey/OpenAI skill validator, both runtimes'
+  project journal validation, and `git diff --check`. The two task-scoped
+  bytecode caches were removed with the protected cleanup helper.
