@@ -13970,7 +13970,7 @@ class ProjectJournalTests(unittest.TestCase):
             % project_journal.HOOK_DIAGNOSTIC_COPY_BLOCK_BYTES,
             0,
         )
-        completion_marker = self.root / "noisy-producer-complete"
+        drain_marker = self.root / "diagnostic-drain-complete"
         payload_pattern = (
             b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz|"
         )
@@ -13999,8 +13999,6 @@ class ProjectJournalTests(unittest.TestCase):
                         if written <= 0:
                             raise OSError("producer write made no progress")
                         remaining = remaining[written:]
-                    with open({str(completion_marker)!r}, "xb") as marker:
-                        marker.write(b"complete")
                     raise SystemExit(1)
                 raise SystemExit(1)
                 """
@@ -14012,6 +14010,33 @@ class ProjectJournalTests(unittest.TestCase):
         body = project_journal._hook_body()
         self.assertEqual(body.count(original_python), 4)
         body = body.replace(original_python, shlex.quote(str(fake_python)))
+        fake_drain = self.root / "observable-cat"
+        fake_drain.write_text(
+            f"#!{sys.executable}\n"
+            + textwrap.dedent(
+                f"""\
+                import os
+
+                drained = 0
+                while True:
+                    chunk = os.read(0, 64 * 1024)
+                    if not chunk:
+                        break
+                    drained += len(chunk)
+                with open({str(drain_marker)!r}, "xb") as marker:
+                    marker.write(str(drained).encode("ascii"))
+                """
+            ),
+            encoding="utf-8",
+        )
+        fake_drain.chmod(0o700)
+        drain_stage = "      cat >/dev/null\n"
+        self.assertEqual(body.count(drain_stage), 1)
+        body = body.replace(
+            drain_stage,
+            f"      {shlex.quote(str(fake_drain))}\n",
+            1,
+        )
 
         result, hook_tmp = self.run_hook_body(repo, body)
 
@@ -14042,7 +14067,13 @@ class ProjectJournalTests(unittest.TestCase):
             + payload[: project_journal.MAX_HOOK_DIAGNOSTIC_BYTES - len(date_prefix)]
         )
         self.assertEqual(capture_bytes, expected_capture)
-        self.assertEqual(completion_marker.read_bytes(), b"complete")
+        expected_drained = (
+            len(date_prefix) + len(payload) - project_journal.MAX_HOOK_DIAGNOSTIC_BYTES
+        )
+        self.assertEqual(
+            int(drain_marker.read_text(encoding="ascii")),
+            expected_drained,
+        )
         self.assertLessEqual(
             len(result.stderr.encode("utf-8")),
             project_journal.MAX_HOOK_DIAGNOSTIC_BYTES + 2048,
@@ -16212,6 +16243,103 @@ class ProjectJournalTests(unittest.TestCase):
                     project_journal._snapshot_hook_target(binding, "post-merge")
         finally:
             project_journal._close_hook_binding(binding)
+
+    def test_hook_target_snapshot_preserves_operation_error_when_close_fails(
+        self,
+    ) -> None:
+        for failure_kind in ("validation", "read"):
+            with self.subTest(failure_kind=failure_kind):
+                repo = self.init_repo(f"repo-hook-snapshot-{failure_kind}").resolve()
+                target = repo / ".git/hooks/post-merge"
+                target.write_bytes(b"managed hook\n")
+                binding = project_journal._bind_hook_directory(
+                    repo,
+                    project_journal._default_hook_path_plan(repo),
+                )
+                actual_open = os.open
+                actual_close = os.close
+                opened_fd: int | None = None
+                close_failure = OSError(
+                    errno.EIO,
+                    "injected hook target close failure",
+                )
+                if failure_kind == "validation":
+                    operation_failure: BaseException = project_journal.UserError(
+                        "injected hook target validation failure"
+                    )
+                else:
+                    operation_failure = OSError(
+                        errno.EIO,
+                        "injected hook target read failure",
+                    )
+
+                def capture_open(
+                    path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+                    flags: int,
+                    mode: int = 0o777,
+                    *,
+                    dir_fd: int | None = None,
+                ) -> int:
+                    nonlocal opened_fd
+                    fd = actual_open(path, flags, mode, dir_fd=dir_fd)
+                    if path == "post-merge" and dir_fd == binding.fd:
+                        opened_fd = fd
+                    return fd
+
+                def fail_target_close(fd: int) -> None:
+                    if fd == opened_fd:
+                        raise close_failure
+                    actual_close(fd)
+
+                try:
+                    with contextlib.ExitStack() as stack:
+                        stack.enter_context(
+                            mock.patch.object(
+                                project_journal.os,
+                                "open",
+                                side_effect=capture_open,
+                            )
+                        )
+                        stack.enter_context(
+                            mock.patch.object(
+                                project_journal.os,
+                                "close",
+                                side_effect=fail_target_close,
+                            )
+                        )
+                        if failure_kind == "validation":
+                            stack.enter_context(
+                                mock.patch.object(
+                                    project_journal,
+                                    "_reject_extended_acl",
+                                    side_effect=operation_failure,
+                                )
+                            )
+                        else:
+                            stack.enter_context(
+                                mock.patch.object(
+                                    project_journal.os,
+                                    "read",
+                                    side_effect=operation_failure,
+                                )
+                            )
+                        with self.assertRaises(type(operation_failure)) as raised:
+                            project_journal._snapshot_hook_target(
+                                binding,
+                                "post-merge",
+                            )
+
+                    self.assertIs(raised.exception, operation_failure)
+                    notes = "\n".join(getattr(raised.exception, "__notes__", ()))
+                    self.assertIn(
+                        "hook target inspection descriptor cleanup failed",
+                        notes,
+                    )
+                    self.assertIn("injected hook target close failure", notes)
+                finally:
+                    if opened_fd is not None:
+                        actual_close(opened_fd)
+                    project_journal._close_hook_binding(binding)
 
     def test_hook_installers_are_serialized_by_owner_private_lock(self) -> None:
         repo = self.init_repo().resolve()

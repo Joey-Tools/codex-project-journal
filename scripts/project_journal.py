@@ -7578,6 +7578,7 @@ def _snapshot_hook_target(
             f"failed to open hook target {binding.path / name}: {exc}"
         ) from exc
 
+    operation_error: BaseException | None = None
     try:
         before = os.fstat(fd)
         if not stat.S_ISREG(before.st_mode):
@@ -7611,8 +7612,16 @@ def _snapshot_hook_target(
             "hook target",
         )
         linked = os.stat(name, dir_fd=binding.fd, follow_symlinks=False)
+    except BaseException as error:
+        operation_error = error
+        raise
     finally:
-        os.close(fd)
+        _close_descriptor_preserving_error(
+            fd,
+            active_error=operation_error,
+            context="hook target inspection descriptor cleanup failed",
+            wrap_close_error=lambda message, _error_number: UserError(message),
+        )
     if len(content) > MAX_EXISTING_HOOK_BYTES:
         raise UserError(
             f"hook target exceeds {MAX_EXISTING_HOOK_BYTES} bytes: "

@@ -301,8 +301,8 @@ superseded_by:
   symlink, group-writable and post-write-replaced log targets, exact ordered
   fragmented bytes, and a differentiated 100 KiB producer. The last
   regression requires an out-of-band producer-completion marker and compares
-  the capture byte-for-byte with its exact 64 KiB prefix, proving both the
-  ceiling and downstream drain.
+  the capture byte-for-byte with its exact 64 KiB prefix. Later evidence below
+  supersedes its original claim to prove downstream EOF drain.
 - The exact-state Python 3.13.0 full suite passed all 403 tests in 1029.497
   seconds with 4 platform skips. The simultaneously launched Xcode Python
   3.9.6 suite reached all 403 tests but recorded one five-second outer timeout
@@ -310,8 +310,23 @@ superseded_by:
   passed three consecutive isolated runs in 6.836 seconds total. A clean
   non-competing Xcode Python 3.9.6 full rerun passed all 403 tests in 641.546
   seconds with 5 platform skips, superseding the parallel-load timeout.
-- A final independent read-only implementation audit of stable-special
-  rejection, missing/existing leaf races, descriptor/path revalidation, close
-  precedence, exact truncation, and producer-drain evidence returned
-  `No findings.` It was an informal pre-commit audit, not the formal named
-  review.
+- A late child result from the informal read-only audit superseded its
+  parent-level `No findings.` summary: a 100 KiB producer can finish after
+  `dd` frees enough pipe capacity while unread bytes remain buffered, so its
+  completion marker does not prove that the following `cat` reaches EOF. The
+  corrected regression replaces that exact drain stage with an observable
+  reader that records its byte count only after EOF, and requires the count to
+  equal the complete stream remainder after the first 64 KiB.
+- The formal fresh whole-range named-single review of signed head `5708e4b`
+  found one additional P2: `_snapshot_hook_target()` allowed a simultaneous
+  descriptor-close failure to replace an active target validation or read
+  error. Snapshot cleanup now uses the existing exact-primary-preservation
+  helper. The regression injects validation-plus-close and read-plus-close
+  failures independently, preserves the exact operation exception, and
+  retains bounded close evidence.
+- The corrected exact-drain and snapshot primary-plus-close regressions passed
+  in both supported runtimes: Python 3.13.0 completed the two tests in 3.864
+  seconds, and Xcode Python 3.9.6 completed them in 3.868 seconds.
+- Final exact-state full suites after both follow-up fixes passed all 404
+  tests: Python 3.13.0 completed in 958.148 seconds with 4 platform skips, and
+  Xcode Python 3.9.6 completed in 977.729 seconds with 5 platform skips.
