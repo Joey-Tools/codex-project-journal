@@ -378,6 +378,43 @@ class DiscoveryCwdValidationError(UserError):
         )
 
 
+class RepositoryResolutionError(UserError):
+    """A Git-looking discovery candidate could not be classified safely."""
+
+    code = "repository_resolution_failed"
+
+    def __init__(
+        self,
+        path: pathlib.Path,
+        detail: str,
+        *,
+        resolution_reason: str,
+        marker_kind: str | None = None,
+        marker_path: pathlib.Path | None = None,
+        marker_path_hint: pathlib.Path | None = None,
+        marker_path_status: str | None = None,
+        marker_level: int | None = None,
+        marker_directory_device: int | None = None,
+        marker_directory_inode: int | None = None,
+        path_status: str | None = None,
+        error_number: int | None = None,
+    ) -> None:
+        self.detail = detail[:MAX_DISCOVERY_ERROR_DETAIL_CHARS]
+        self.resolution_reason = resolution_reason
+        self.marker_kind = marker_kind
+        self.marker_path = marker_path
+        self.marker_path_hint = marker_path_hint
+        self.marker_path_status = marker_path_status
+        self.marker_level = marker_level
+        self.marker_directory_device = marker_directory_device
+        self.marker_directory_inode = marker_directory_inode
+        self.path_status = path_status
+        self.cleanup_errors: list[dict[str, Any]] = []
+        if error_number is not None:
+            self.errno = error_number
+        super().__init__(f"repository resolution failed for {path}: {self.detail}")
+
+
 class _DiscoveryJsonIntegerLimitExceeded(ValueError):
     def __init__(self, observed: int) -> None:
         self.observed = observed
@@ -9468,16 +9505,547 @@ def _source_root_from_linked_worktree(
     return source_root
 
 
-def _filesystem_repo_root(path: pathlib.Path) -> pathlib.Path | None:
-    candidate = path if path.is_dir() else path.parent
-    while True:
-        git_marker = candidate / ".git"
-        if git_marker.is_dir() or git_marker.is_file():
-            return _lexical_absolute_path(candidate)
+def _check_repository_resolution_deadline(
+    path: pathlib.Path,
+    deadline: float | None,
+) -> None:
+    try:
+        _check_deadline(
+            deadline,
+            "repository discovery exceeded its shared deadline",
+        )
+    except UserError as exc:
+        raise RepositoryResolutionError(
+            path,
+            str(exc),
+            resolution_reason="deadline_exceeded",
+        ) from exc
+
+
+def _repository_directory_identity(value: os.stat_result) -> tuple[int, int]:
+    return value.st_dev, value.st_ino
+
+
+def _nearest_existing_discovery_directory(
+    path: pathlib.Path,
+    *,
+    deadline: float | None,
+) -> tuple[pathlib.Path, os.stat_result]:
+    candidate = path
+    for _level in range(MAX_DISCOVERY_CWD_COMPONENTS + 1):
+        _check_repository_resolution_deadline(candidate, deadline)
+        try:
+            candidate_stat = os.stat(candidate)
+        except (FileNotFoundError, NotADirectoryError):
+            parent = candidate.parent
+            if parent == candidate:
+                raise RepositoryResolutionError(
+                    path,
+                    "no existing directory could be proved while walking "
+                    "the candidate ancestors",
+                    resolution_reason="ancestor_unavailable",
+                ) from None
+            candidate = parent
+            continue
+        except OSError as exc:
+            raise RepositoryResolutionError(
+                path,
+                f"candidate ancestor inspection failed at {candidate}: {exc}",
+                resolution_reason="ancestor_inspection_failed",
+                error_number=exc.errno,
+            ) from exc
+        _check_repository_resolution_deadline(candidate, deadline)
+        if stat.S_ISDIR(candidate_stat.st_mode):
+            return candidate, candidate_stat
         parent = candidate.parent
         if parent == candidate:
-            return None
+            raise RepositoryResolutionError(
+                path,
+                f"candidate ancestor is not a directory: {candidate}",
+                resolution_reason="ancestor_not_directory",
+            )
         candidate = parent
+    raise RepositoryResolutionError(
+        path,
+        "candidate ancestor inspection exceeded the "
+        f"{MAX_DISCOVERY_CWD_COMPONENTS + 1}-level bound",
+        resolution_reason="ancestor_scan_limit",
+    )
+
+
+def _stat_failed_git_marker(
+    directory_fd: int,
+    directory_stat: os.stat_result,
+    *,
+    directory_hint: pathlib.Path,
+    deadline: float | None,
+    source_path: pathlib.Path,
+) -> os.stat_result | None:
+    for attempt in range(2):
+        _check_repository_resolution_deadline(source_path, deadline)
+        try:
+            marker_stat = os.stat(
+                ".git",
+                dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            _check_repository_resolution_deadline(source_path, deadline)
+            return None
+        except NotADirectoryError as exc:
+            _check_repository_resolution_deadline(source_path, deadline)
+            try:
+                rebound = os.fstat(directory_fd)
+            except OSError as rebound_error:
+                raise RepositoryResolutionError(
+                    source_path,
+                    "descriptor-bound ancestor revalidation failed while "
+                    f"classifying the .git entry near {directory_hint}: "
+                    f"{rebound_error}",
+                    resolution_reason="descriptor_binding_failed",
+                    error_number=rebound_error.errno,
+                ) from rebound_error
+            _check_repository_resolution_deadline(source_path, deadline)
+            if not stat.S_ISDIR(rebound.st_mode) or _repository_directory_identity(
+                rebound
+            ) != _repository_directory_identity(directory_stat):
+                raise RepositoryResolutionError(
+                    source_path,
+                    "descriptor-bound ancestor changed while classifying "
+                    f"the .git entry near {directory_hint}",
+                    resolution_reason="ancestor_changed",
+                    path_status="path_unverified",
+                ) from exc
+            if attempt == 0:
+                continue
+            raise RepositoryResolutionError(
+                source_path,
+                "descriptor-relative .git classification remained incomplete "
+                f"near the unverified lexical hint {directory_hint}: {exc}",
+                resolution_reason="marker_classification_incomplete",
+                error_number=exc.errno,
+            ) from exc
+        except (TypeError, NotImplementedError) as exc:
+            raise RepositoryResolutionError(
+                source_path,
+                f"descriptor-relative no-follow .git inspection is unavailable: {exc}",
+                resolution_reason="descriptor_traversal_unavailable",
+            ) from exc
+        except OSError as exc:
+            raise RepositoryResolutionError(
+                source_path,
+                "descriptor-relative .git inspection failed near the "
+                f"unverified lexical hint {directory_hint}: {exc}",
+                resolution_reason="marker_inspection_failed",
+                error_number=exc.errno,
+            ) from exc
+        _check_repository_resolution_deadline(source_path, deadline)
+        return marker_stat
+    raise AssertionError("unreachable marker inspection retry state")
+
+
+def _git_marker_kind(value: os.stat_result) -> str:
+    if stat.S_ISDIR(value.st_mode):
+        return "directory"
+    if stat.S_ISREG(value.st_mode):
+        return "regular_file"
+    if stat.S_ISLNK(value.st_mode):
+        return "symlink"
+    return "other"
+
+
+def _git_marker_kind_label(kind: str) -> str:
+    return {
+        "directory": "directory",
+        "regular_file": "regular file",
+        "symlink": "symlink",
+        "other": "other filesystem object",
+    }[kind]
+
+
+def _repository_initial_directory_open_flags(
+    source_path: pathlib.Path,
+) -> int:
+    try:
+        return (
+            os.O_RDONLY
+            | _required_open_flag("O_DIRECTORY")
+            | _required_open_flag("O_CLOEXEC")
+            | _required_open_flag("O_NONBLOCK")
+        )
+    except UserError as exc:
+        raise RepositoryResolutionError(
+            source_path,
+            f"descriptor-bound repository traversal is unavailable: {exc}",
+            resolution_reason="descriptor_traversal_unavailable",
+        ) from exc
+
+
+def _repository_parent_directory_open_flags(
+    source_path: pathlib.Path,
+) -> int:
+    try:
+        return _repository_initial_directory_open_flags(
+            source_path,
+        ) | _required_open_flag("O_NOFOLLOW")
+    except RepositoryResolutionError:
+        raise
+    except UserError as exc:
+        raise RepositoryResolutionError(
+            source_path,
+            f"descriptor-bound parent traversal is unavailable: {exc}",
+            resolution_reason="descriptor_traversal_unavailable",
+        ) from exc
+
+
+@dataclasses.dataclass
+class _RepositoryResolutionFdOwner:
+    source_path: pathlib.Path
+    _owned: dict[int, tuple[str, bool]] = dataclasses.field(default_factory=dict)
+    _cleanup_failure: tuple[RepositoryResolutionError, BaseException] | None = None
+    _close_recovery_eligible: bool = False
+    _close_ambient_error: BaseException | None = None
+
+    def __enter__(self) -> _RepositoryResolutionFdOwner:
+        return self
+
+    def __exit__(
+        self,
+        _error_type: type[BaseException] | None,
+        active_error: BaseException | None,
+        _traceback: Any,
+    ) -> None:
+        try:
+            cleanup_error, cleanup_cause = self.close_all(primary=active_error)
+            if active_error is None and cleanup_error is not None:
+                raise cleanup_error from cleanup_cause
+        except BaseException as cleanup_interrupt:
+            if (
+                active_error is None
+                and self._cleanup_failure is None
+                and self._close_recovery_eligible
+            ):
+                interrupted_close_error = cleanup_interrupt.__context__
+                if (
+                    isinstance(interrupted_close_error, Exception)
+                    and interrupted_close_error is not self._close_ambient_error
+                ):
+                    recovered_primary = RepositoryResolutionError(
+                        self.source_path,
+                        "repository-resolution descriptor close failed before "
+                        f"cleanup state persisted: {interrupted_close_error}",
+                        resolution_reason="descriptor_close_failed",
+                        error_number=getattr(
+                            interrupted_close_error,
+                            "errno",
+                            None,
+                        ),
+                    )
+                    self._cleanup_failure = (
+                        recovered_primary,
+                        interrupted_close_error,
+                    )
+            selected_primary = (
+                active_error
+                if active_error is not None
+                else (
+                    self._cleanup_failure[0]
+                    if self._cleanup_failure is not None
+                    else None
+                )
+            )
+            if selected_primary is not None:
+                if cleanup_interrupt is selected_primary:
+                    self.close_all(primary=selected_primary)
+                    raise
+                _record_rollout_cleanup_error(
+                    selected_primary,
+                    context="repository-resolution descriptor-owner drain interrupted",
+                    cleanup_error=cleanup_interrupt,
+                )
+                self.close_all(primary=selected_primary)
+                if active_error is None:
+                    assert self._cleanup_failure is not None
+                    raise selected_primary from self._cleanup_failure[1]
+            else:
+                self.close_all(primary=cleanup_interrupt)
+                raise
+
+    @property
+    def owned_fds(self) -> tuple[int, ...]:
+        return tuple(self._owned)
+
+    def open(
+        self,
+        path: os.PathLike[str] | str,
+        flags: int,
+        *,
+        dir_fd: int | None = None,
+        cleanup_context: str,
+    ) -> int:
+        opened_fd: int | None = None
+        try:
+            opened_fd = os.open(path, flags, dir_fd=dir_fd)
+            self._owned[opened_fd] = (cleanup_context, False)
+        except BaseException as primary:
+            if opened_fd is not None and opened_fd not in self._owned:
+                try:
+                    os.close(opened_fd)
+                except BaseException as cleanup_error:
+                    _record_rollout_cleanup_error(
+                        primary,
+                        context=(
+                            "new repository-resolution descriptor cleanup failed "
+                            "before ownership registration"
+                        ),
+                        cleanup_error=cleanup_error,
+                    )
+            raise
+        return opened_fd
+
+    def _begin_close_attempt(self, fd: int) -> int:
+        if fd not in self._owned:
+            raise AssertionError(f"repository-resolution descriptor {fd} is not owned")
+        context, close_attempted = self._owned[fd]
+        if close_attempted:
+            raise AssertionError(
+                f"repository-resolution descriptor {fd} was already close-attempted"
+            )
+        self._close_ambient_error = sys.exc_info()[1]
+        self._close_recovery_eligible = True
+        return self._owned.__setitem__(fd, (context, True)) or fd
+
+    def _close_owned_fd(self, fd: int) -> None:
+        try:
+            os.close(self._begin_close_attempt(fd))
+        except BaseException:
+            raise
+        else:
+            self._close_recovery_eligible = False
+        finally:
+            # POSIX close failure leaves descriptor reuse uncertain. Never retry
+            # the same numeric descriptor after a close attempt.
+            owned_record = self._owned.get(fd)
+            if owned_record is not None and owned_record[1]:
+                self._owned.pop(fd, None)
+
+    def close(self, fd: int, *, context: str) -> None:
+        try:
+            self._close_owned_fd(fd)
+        except BaseException as close_error:
+            if not isinstance(close_error, Exception):
+                raise
+            raise RepositoryResolutionError(
+                self.source_path,
+                f"{context}: {close_error}",
+                resolution_reason="descriptor_close_failed",
+                error_number=getattr(close_error, "errno", None),
+            ) from close_error
+
+    def close_all(
+        self,
+        *,
+        primary: BaseException | None = None,
+    ) -> tuple[RepositoryResolutionError | None, BaseException | None]:
+        selected_primary = (
+            primary
+            if primary is not None
+            else (
+                self._cleanup_failure[0] if self._cleanup_failure is not None else None
+            )
+        )
+        while self._owned:
+            fd, (context, close_attempted) = next(iter(self._owned.items()))
+            if close_attempted:
+                self._owned.pop(fd, None)
+                continue
+            try:
+                self._close_owned_fd(fd)
+            except BaseException as cleanup_error:
+                if selected_primary is None:
+                    if not isinstance(cleanup_error, Exception):
+                        self.close_all(primary=cleanup_error)
+                        raise
+                    cleanup_primary = RepositoryResolutionError(
+                        self.source_path,
+                        f"{context}: {cleanup_error}",
+                        resolution_reason="descriptor_close_failed",
+                        error_number=getattr(cleanup_error, "errno", None),
+                    )
+                    self._cleanup_failure = (cleanup_primary, cleanup_error)
+                    self._close_recovery_eligible = False
+                    selected_primary = cleanup_primary
+                else:
+                    _record_rollout_cleanup_error(
+                        selected_primary,
+                        context=context,
+                        cleanup_error=cleanup_error,
+                    )
+        if self._cleanup_failure is None:
+            return None, None
+        return self._cleanup_failure
+
+
+def _classify_failed_git_resolution(
+    directory: pathlib.Path,
+    directory_stat: os.stat_result,
+    *,
+    source_path: pathlib.Path,
+    git_detail: str,
+    deadline: float | None,
+) -> None:
+    initial_flags = _repository_initial_directory_open_flags(source_path)
+    parent_flags = _repository_parent_directory_open_flags(source_path)
+    start_device = directory_stat.st_dev
+    owner = _RepositoryResolutionFdOwner(source_path)
+    current_fd: int | None = None
+    parent_fd: int | None = None
+    current_stat = directory_stat
+    current_hint = directory
+    completed_without_marker = False
+    with owner:
+        _check_repository_resolution_deadline(source_path, deadline)
+        try:
+            current_fd = owner.open(
+                directory,
+                initial_flags,
+                cleanup_context=(
+                    "current ancestor descriptor cleanup failed after repository "
+                    "resolution error"
+                ),
+            )
+        except OSError as exc:
+            raise RepositoryResolutionError(
+                source_path,
+                f"initial ancestor descriptor binding failed at {directory}: {exc}",
+                resolution_reason="descriptor_binding_failed",
+                path_status="path_unverified",
+                error_number=exc.errno,
+            ) from exc
+        _check_repository_resolution_deadline(source_path, deadline)
+        try:
+            bound_stat = os.fstat(current_fd)
+        except OSError as exc:
+            raise RepositoryResolutionError(
+                source_path,
+                f"initial ancestor descriptor validation failed at {directory}: {exc}",
+                resolution_reason="descriptor_binding_failed",
+                path_status="path_unverified",
+                error_number=exc.errno,
+            ) from exc
+        _check_repository_resolution_deadline(source_path, deadline)
+        if not stat.S_ISDIR(bound_stat.st_mode) or _repository_directory_identity(
+            bound_stat
+        ) != _repository_directory_identity(directory_stat):
+            raise RepositoryResolutionError(
+                source_path,
+                "initial ancestor path no longer binds the pre-Git directory "
+                f"object at {directory}",
+                resolution_reason="ancestor_changed",
+                path_status="path_unverified",
+            )
+        current_stat = bound_stat
+
+        for level in range(MAX_DISCOVERY_CWD_COMPONENTS + 1):
+            assert current_fd is not None
+            marker_stat = _stat_failed_git_marker(
+                current_fd,
+                current_stat,
+                directory_hint=current_hint,
+                deadline=deadline,
+                source_path=source_path,
+            )
+            if marker_stat is not None:
+                marker_kind = _git_marker_kind(marker_stat)
+                marker_hint = current_hint / ".git"
+                raise RepositoryResolutionError(
+                    source_path,
+                    "found a "
+                    f"{_git_marker_kind_label(marker_kind)} descriptor-relative "
+                    f".git entry at ancestor level {level} "
+                    f"(device {current_stat.st_dev}, inode {current_stat.st_ino}); "
+                    f"lexical hint {marker_hint} is path_unverified; "
+                    f"Git rev-parse failed: {git_detail}",
+                    resolution_reason="git_marker_present",
+                    marker_kind=marker_kind,
+                    marker_path_hint=marker_hint,
+                    marker_path_status="path_unverified",
+                    marker_level=level,
+                    marker_directory_device=current_stat.st_dev,
+                    marker_directory_inode=current_stat.st_ino,
+                )
+
+            _check_repository_resolution_deadline(source_path, deadline)
+            try:
+                parent_fd = owner.open(
+                    "..",
+                    parent_flags,
+                    dir_fd=current_fd,
+                    cleanup_context=(
+                        "bound parent descriptor cleanup failed after repository "
+                        "resolution error"
+                    ),
+                )
+            except (TypeError, NotImplementedError) as exc:
+                raise RepositoryResolutionError(
+                    source_path,
+                    f"descriptor-relative parent traversal is unavailable: {exc}",
+                    resolution_reason="descriptor_traversal_unavailable",
+                ) from exc
+            except OSError as exc:
+                raise RepositoryResolutionError(
+                    source_path,
+                    "descriptor-relative parent binding failed near the "
+                    f"unverified lexical hint {current_hint}: {exc}",
+                    resolution_reason="ancestor_inspection_failed",
+                    error_number=exc.errno,
+                ) from exc
+            _check_repository_resolution_deadline(source_path, deadline)
+            try:
+                parent_stat = os.fstat(parent_fd)
+            except OSError as exc:
+                raise RepositoryResolutionError(
+                    source_path,
+                    "descriptor-bound parent validation failed near the "
+                    f"unverified lexical hint {current_hint}: {exc}",
+                    resolution_reason="descriptor_binding_failed",
+                    error_number=exc.errno,
+                ) from exc
+            _check_repository_resolution_deadline(source_path, deadline)
+            if not stat.S_ISDIR(parent_stat.st_mode):
+                raise RepositoryResolutionError(
+                    source_path,
+                    "descriptor-bound parent is not a directory near the "
+                    f"unverified lexical hint {current_hint}",
+                    resolution_reason="ancestor_not_directory",
+                )
+
+            if (
+                _repository_directory_identity(parent_stat)
+                == _repository_directory_identity(current_stat)
+                or parent_stat.st_dev != start_device
+            ):
+                completed_without_marker = True
+                break
+            if level == MAX_DISCOVERY_CWD_COMPONENTS:
+                raise RepositoryResolutionError(
+                    source_path,
+                    "failed Git resolution could not be classified within the "
+                    f"{MAX_DISCOVERY_CWD_COMPONENTS + 1}-level bound",
+                    resolution_reason="marker_scan_limit",
+                )
+
+            owner.close(
+                current_fd,
+                context="ancestor descriptor close failed during parent handoff",
+            )
+            current_fd = parent_fd
+            parent_fd = None
+            current_stat = parent_stat
+            current_hint = current_hint / ".."
+        assert completed_without_marker
+        _check_repository_resolution_deadline(source_path, deadline)
+    return None
 
 
 def _repo_root_for_existing_path(
@@ -9486,12 +10054,11 @@ def _repo_root_for_existing_path(
     deadline: float | None = None,
 ) -> pathlib.Path | None:
     deadline_error = "repository discovery exceeded its shared deadline"
-    while not path.exists():
-        _check_deadline(deadline, deadline_error)
-        parent = path.parent
-        if parent == path:
-            return None
-        path = parent
+    source_path = path
+    path, path_stat = _nearest_existing_discovery_directory(
+        path,
+        deadline=deadline,
+    )
     try:
         result = _run_git(
             path,
@@ -9501,9 +10068,28 @@ def _repo_root_for_existing_path(
             deadline_error=deadline_error,
             operation="Git repository discovery",
         )
-    except UnsupportedGitVersion:
-        return _filesystem_repo_root(path)
+    except UnsupportedGitVersion as exc:
+        _classify_failed_git_resolution(
+            path,
+            path_stat,
+            source_path=source_path,
+            git_detail=str(exc),
+            deadline=deadline,
+        )
+        return None
     if result.returncode != 0:
+        detail = (
+            result.stderr.strip()
+            or result.stdout.strip()
+            or "Git rev-parse returned a nonzero status"
+        )
+        _classify_failed_git_resolution(
+            path,
+            path_stat,
+            source_path=source_path,
+            git_detail=detail,
+            deadline=deadline,
+        )
         return None
     return _lexical_absolute_path(pathlib.Path(result.stdout.strip()))
 
@@ -9844,6 +10430,29 @@ def _discovery_error(exc: BaseException) -> dict[str, Any]:
                 "observed": exc.observed,
             }
         )
+    if isinstance(exc, RepositoryResolutionError):
+        error["resolution_reason"] = exc.resolution_reason
+        if exc.marker_kind is not None:
+            error["marker_kind"] = exc.marker_kind
+        if exc.marker_path is not None:
+            error["marker_path"] = str(exc.marker_path)
+        if exc.marker_path_hint is not None:
+            error["marker_path_hint"] = str(exc.marker_path_hint)
+        if exc.marker_path_status is not None:
+            error["marker_path_status"] = exc.marker_path_status
+        if exc.marker_level is not None:
+            error["marker_level"] = exc.marker_level
+        if exc.marker_directory_device is not None:
+            error["marker_directory_device"] = exc.marker_directory_device
+        if exc.marker_directory_inode is not None:
+            error["marker_directory_inode"] = exc.marker_directory_inode
+        if exc.path_status is not None:
+            error["path_status"] = exc.path_status
+    cleanup_errors = getattr(exc, "cleanup_errors", None)
+    if isinstance(cleanup_errors, (list, tuple)) and cleanup_errors:
+        error["cleanup_errors"] = [
+            dict(cleanup_error) for cleanup_error in cleanup_errors
+        ]
     error_number = getattr(exc, "errno", None)
     if isinstance(error_number, int):
         error["errno"] = error_number
@@ -10194,6 +10803,7 @@ def _discover_repos(codex_home: pathlib.Path, since_days: int) -> list[dict[str,
                         known_rollouts.add(rollout_identity)
                         state.add_rollout()
                     last_seen = _rollout_last_seen(rollout)
+                    pending_cwds: list[str] = []
                     cwds_for_rollout: set[str] = set()
                     for raw_cwd in _extract_cwds(rollout, state):
                         state.check_deadline()
@@ -10202,6 +10812,9 @@ def _discover_repos(codex_home: pathlib.Path, since_days: int) -> list[dict[str,
                         if cwd in cwds_for_rollout:
                             continue
                         cwds_for_rollout.add(cwd)
+                        pending_cwds.append(cwd)
+                    for cwd in pending_cwds:
+                        state.check_deadline()
                         if cwd not in resolved_roots:
                             now = time.monotonic()
                             state.check_deadline()

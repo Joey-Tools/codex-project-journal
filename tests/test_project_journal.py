@@ -4,6 +4,7 @@ import contextlib
 import ctypes
 import errno
 import importlib.util
+import inspect
 import io
 import json
 import os
@@ -60,6 +61,12 @@ def stat_with_gid(value: os.stat_result, gid: int) -> os.stat_result:
 def stat_with_uid(value: os.stat_result, uid: int) -> os.stat_result:
     fields = list(value)
     fields[4] = uid
+    return os.stat_result(fields)
+
+
+def stat_with_dev(value: os.stat_result, device: int) -> os.stat_result:
+    fields = list(value)
+    fields[2] = device
     return os.stat_result(fields)
 
 
@@ -1243,6 +1250,10 @@ class ProjectJournalTests(unittest.TestCase):
         finally:
             runtime.snapshot_owner.cleanup()
 
+    @unittest.skipIf(
+        os.geteuid() == 0,
+        "UID 0 bypasses owner-directory DAC replacement denial",
+    )
     def test_git_launch_directory_blocks_executable_replacement_before_popen(
         self,
     ) -> None:
@@ -1292,6 +1303,10 @@ class ProjectJournalTests(unittest.TestCase):
         finally:
             runtime.snapshot_owner.cleanup()
 
+    @unittest.skipIf(
+        os.geteuid() == 0,
+        "UID 0 bypasses owner-directory DAC replacement denial",
+    )
     def test_git_launch_directory_blocks_destination_replacement_before_reread(
         self,
     ) -> None:
@@ -3020,18 +3035,36 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         rows = json.loads(result.stdout)
         self.assertEqual(len(rows), 1)
-        self.assertEqual(
-            pathlib.Path(rows[0]["repo"]),
-            project_journal._lexical_absolute_path(repo),
-        )
+        self.assertIsNone(rows[0]["repo"])
+        self.assertEqual(rows[0]["candidate_cwd"], str(repo))
+        self.assertEqual(rows[0]["discovery_status"], "inconclusive")
         self.assertEqual(rows[0]["adoption_status"], "inconclusive")
         self.assertEqual(
             rows[0]["adoption_error"]["code"],
-            "unsupported_git_version",
+            "repository_resolution_failed",
         )
         self.assertIn(
             "selected Git executable bytes identify a script wrapper",
             rows[0]["adoption_error"]["message"],
+        )
+        resolution_error = rows[0]["discovery_error"]["repo_resolution"]
+        self.assertEqual(
+            resolution_error["code"],
+            "repository_resolution_failed",
+        )
+        self.assertEqual(
+            resolution_error["resolution_reason"],
+            "git_marker_present",
+        )
+        self.assertEqual(resolution_error["marker_kind"], "directory")
+        self.assertNotIn("marker_path", resolution_error)
+        self.assertEqual(
+            pathlib.Path(resolution_error["marker_path_hint"]),
+            repo / ".git",
+        )
+        self.assertEqual(
+            resolution_error["marker_path_status"],
+            "path_unverified",
         )
         self.assertIsNone(rows[0]["index_ignored"])
         self.assertFalse(shim_log.exists())
@@ -3840,6 +3873,1877 @@ class ProjectJournalTests(unittest.TestCase):
         )
 
         self.assertEqual(resolved, repo.resolve())
+
+    def test_failed_discovery_resolution_returns_none_after_complete_no_marker_scan(
+        self,
+    ) -> None:
+        existing = self.root / "plain"
+        existing.mkdir()
+        candidate = existing / "missing" / "nested"
+        failure = subprocess.CompletedProcess(
+            [],
+            128,
+            "",
+            "fatal: not a git repository",
+        )
+
+        with mock.patch.object(
+            project_journal,
+            "_run_git",
+            return_value=failure,
+        ) as run:
+            resolved = project_journal._repo_root_for_existing_path(
+                candidate,
+                deadline=time.monotonic() + 5,
+            )
+
+        self.assertIsNone(resolved)
+        self.assertEqual(run.call_args.args[0], existing)
+
+    def test_failed_discovery_resolution_binds_marker_lookup_across_symlink_retarget(
+        self,
+    ) -> None:
+        target_with_marker = self.root / "retarget-a"
+        target_without_marker = self.root / "retarget-b"
+        target_with_marker.mkdir()
+        target_without_marker.mkdir()
+        (target_with_marker / ".git").mkdir()
+        link = self.root / "retarget-link"
+        link.symlink_to(target_with_marker, target_is_directory=True)
+        failure = subprocess.CompletedProcess(
+            [],
+            128,
+            "",
+            "fatal: injected Git failure",
+        )
+        actual_stat = project_journal.os.stat
+        injected = False
+        marker_probe_used_descriptor = False
+        marker_probe_found_marker = False
+        observed_b_during_probe = False
+        restored_a_after_probe = False
+
+        def atomically_retarget_link(target: pathlib.Path) -> None:
+            replacement = self.root / "retarget-link.next"
+            replacement.unlink(missing_ok=True)
+            replacement.symlink_to(target, target_is_directory=True)
+            os.replace(replacement, link)
+
+        def retarget_during_marker_lookup(
+            path: os.PathLike[str] | str,
+            *,
+            dir_fd: int | None = None,
+            follow_symlinks: bool = True,
+        ) -> os.stat_result:
+            nonlocal injected
+            nonlocal marker_probe_found_marker
+            nonlocal marker_probe_used_descriptor
+            nonlocal observed_b_during_probe
+            nonlocal restored_a_after_probe
+            path_text = os.fspath(path)
+            is_marker_lookup = not follow_symlinks and (
+                (dir_fd is None and pathlib.Path(path) == link / ".git")
+                or (dir_fd is not None and path_text == ".git")
+            )
+            if is_marker_lookup and not injected:
+                marker_probe_used_descriptor = dir_fd is not None
+                atomically_retarget_link(target_without_marker)
+                observed_b_during_probe = (
+                    project_journal._repository_directory_identity(actual_stat(link))
+                    == project_journal._repository_directory_identity(
+                        actual_stat(target_without_marker)
+                    )
+                )
+                try:
+                    result = actual_stat(
+                        path,
+                        dir_fd=dir_fd,
+                        follow_symlinks=follow_symlinks,
+                    )
+                    marker_probe_found_marker = True
+                    return result
+                finally:
+                    atomically_retarget_link(target_with_marker)
+                    restored_a_after_probe = (
+                        project_journal._repository_directory_identity(
+                            actual_stat(link)
+                        )
+                        == project_journal._repository_directory_identity(
+                            actual_stat(target_with_marker)
+                        )
+                    )
+                    injected = True
+            return actual_stat(
+                path,
+                dir_fd=dir_fd,
+                follow_symlinks=follow_symlinks,
+            )
+
+        with mock.patch.object(
+            project_journal,
+            "_run_git",
+            return_value=failure,
+        ):
+            with mock.patch.object(
+                project_journal.os,
+                "stat",
+                side_effect=retarget_during_marker_lookup,
+            ):
+                with self.assertRaises(
+                    project_journal.RepositoryResolutionError,
+                ) as raised:
+                    project_journal._repo_root_for_existing_path(
+                        link,
+                        deadline=time.monotonic() + 5,
+                    )
+
+        self.assertTrue(injected)
+        self.assertTrue(os.path.samefile(link, target_with_marker))
+        self.assertTrue(observed_b_during_probe)
+        self.assertTrue(restored_a_after_probe)
+        self.assertTrue(marker_probe_used_descriptor)
+        self.assertTrue(marker_probe_found_marker)
+        self.assertEqual(
+            raised.exception.resolution_reason,
+            "git_marker_present",
+        )
+        self.assertEqual(raised.exception.marker_kind, "directory")
+        self.assertIsNone(raised.exception.marker_path)
+        self.assertEqual(raised.exception.marker_path_hint, link / ".git")
+        self.assertEqual(
+            raised.exception.marker_path_status,
+            "path_unverified",
+        )
+
+    def test_failed_discovery_resolution_initial_bind_follows_stable_symlink(
+        self,
+    ) -> None:
+        target = self.root / "stable-symlink-target"
+        target.mkdir()
+        link = self.root / "stable-symlink"
+        link.symlink_to(target, target_is_directory=True)
+        failure = subprocess.CompletedProcess(
+            [],
+            128,
+            "",
+            "fatal: injected Git failure",
+        )
+        actual_open = project_journal.os.open
+        initial_flags: int | None = None
+        parent_flags: list[int] = []
+
+        def capture_directory_flags(
+            path: os.PathLike[str] | str,
+            flags: int,
+            mode: int = 0o777,
+            *,
+            dir_fd: int | None = None,
+        ) -> int:
+            nonlocal initial_flags
+            if pathlib.Path(path) == link and dir_fd is None:
+                initial_flags = flags
+            if os.fspath(path) == ".." and dir_fd is not None:
+                parent_flags.append(flags)
+            return actual_open(
+                path,
+                flags,
+                mode,
+                dir_fd=dir_fd,
+            )
+
+        with mock.patch.object(
+            project_journal,
+            "_run_git",
+            return_value=failure,
+        ):
+            with mock.patch.object(
+                project_journal.os,
+                "open",
+                side_effect=capture_directory_flags,
+            ):
+                resolved = project_journal._repo_root_for_existing_path(
+                    link,
+                    deadline=time.monotonic() + 5,
+                )
+
+        self.assertIsNone(resolved)
+        self.assertIsNotNone(initial_flags)
+        assert initial_flags is not None
+        self.assertTrue(initial_flags & os.O_DIRECTORY)
+        self.assertTrue(initial_flags & os.O_CLOEXEC)
+        self.assertTrue(initial_flags & os.O_NONBLOCK)
+        self.assertFalse(initial_flags & os.O_NOFOLLOW)
+        self.assertTrue(parent_flags)
+        for flags in parent_flags:
+            self.assertTrue(flags & os.O_DIRECTORY)
+            self.assertTrue(flags & os.O_CLOEXEC)
+            self.assertTrue(flags & os.O_NONBLOCK)
+            self.assertTrue(flags & os.O_NOFOLLOW)
+
+    def test_failed_discovery_resolution_initial_bind_mismatch_preserves_close_error(
+        self,
+    ) -> None:
+        target_a = self.root / "initial-bind-a"
+        target_b = self.root / "initial-bind-b"
+        target_a.mkdir()
+        target_b.mkdir()
+        link = self.root / "initial-bind-link"
+        link.symlink_to(target_a, target_is_directory=True)
+        retargeted = False
+        actual_close = project_journal.os.close
+        close_calls: list[int] = []
+
+        def retarget_after_pre_git_stat(
+            *_args: object,
+            **_kwargs: object,
+        ) -> subprocess.CompletedProcess[str]:
+            nonlocal retargeted
+            link.unlink()
+            link.symlink_to(target_b, target_is_directory=True)
+            retargeted = True
+            return subprocess.CompletedProcess(
+                [],
+                128,
+                "",
+                "fatal: injected Git failure",
+            )
+
+        def close_then_fail(fd: int) -> None:
+            close_calls.append(fd)
+            actual_close(fd)
+            raise OSError(
+                errno.EIO,
+                "injected initial descriptor close failure",
+            )
+
+        with mock.patch.object(
+            project_journal,
+            "_run_git",
+            side_effect=retarget_after_pre_git_stat,
+        ):
+            with mock.patch.object(
+                project_journal.os,
+                "close",
+                side_effect=close_then_fail,
+            ):
+                with self.assertRaises(
+                    project_journal.RepositoryResolutionError,
+                ) as raised:
+                    project_journal._repo_root_for_existing_path(
+                        link,
+                        deadline=time.monotonic() + 5,
+                    )
+
+        self.assertTrue(retargeted)
+        self.assertEqual(len(close_calls), 1)
+        self.assertEqual(
+            raised.exception.resolution_reason,
+            "ancestor_changed",
+        )
+        self.assertEqual(raised.exception.path_status, "path_unverified")
+        self.assertEqual(len(raised.exception.cleanup_errors), 1)
+        self.assertEqual(raised.exception.cleanup_errors[0]["errno"], errno.EIO)
+        serialized = project_journal._discovery_error(raised.exception)
+        self.assertEqual(serialized["path_status"], "path_unverified")
+        self.assertEqual(serialized["cleanup_errors"][0]["errno"], errno.EIO)
+
+    def test_failed_discovery_resolution_never_returns_none_after_close_failure(
+        self,
+    ) -> None:
+        cwd = self.root / "close-failure-candidate"
+        cwd.mkdir()
+        failure = subprocess.CompletedProcess(
+            [],
+            128,
+            "",
+            "fatal: injected Git failure",
+        )
+        actual_open = project_journal.os.open
+        actual_close = project_journal.os.close
+        opened_fds: set[int] = set()
+        close_calls: list[int] = []
+        close_failure_count = 0
+
+        def track_open(
+            path: os.PathLike[str] | str,
+            flags: int,
+            mode: int = 0o777,
+            *,
+            dir_fd: int | None = None,
+        ) -> int:
+            result = actual_open(
+                path,
+                flags,
+                mode,
+                dir_fd=dir_fd,
+            )
+            opened_fds.add(result)
+            return result
+
+        def close_then_fail_twice(fd: int) -> None:
+            nonlocal close_failure_count
+            close_calls.append(fd)
+            actual_close(fd)
+            close_failure_count += 1
+            if close_failure_count <= 2:
+                raise OSError(
+                    errno.EIO,
+                    f"injected descriptor close failure {close_failure_count}",
+                )
+
+        with mock.patch.object(
+            project_journal,
+            "_run_git",
+            return_value=failure,
+        ):
+            with mock.patch.object(
+                project_journal.os,
+                "open",
+                side_effect=track_open,
+            ):
+                with mock.patch.object(
+                    project_journal.os,
+                    "close",
+                    side_effect=close_then_fail_twice,
+                ):
+                    with self.assertRaises(
+                        project_journal.RepositoryResolutionError,
+                    ) as raised:
+                        project_journal._repo_root_for_existing_path(
+                            cwd,
+                            deadline=time.monotonic() + 5,
+                        )
+
+        self.assertEqual(
+            raised.exception.resolution_reason,
+            "descriptor_close_failed",
+        )
+        self.assertEqual(set(close_calls), opened_fds)
+        self.assertEqual(len(close_calls), len(opened_fds))
+        self.assertEqual(len(raised.exception.cleanup_errors), 1)
+        self.assertEqual(
+            project_journal._discovery_error(raised.exception)["cleanup_errors"][0][
+                "errno"
+            ],
+            errno.EIO,
+        )
+
+    def test_failed_discovery_resolution_preserves_marker_primary_on_close_failure(
+        self,
+    ) -> None:
+        cwd = self.root / "marker-close-failure"
+        cwd.mkdir()
+        (cwd / ".git").mkdir()
+        failure = subprocess.CompletedProcess(
+            [],
+            128,
+            "",
+            "fatal: injected Git failure",
+        )
+        actual_close = project_journal.os.close
+        close_calls: list[int] = []
+
+        def close_marker_descriptor_then_fail(fd: int) -> None:
+            close_calls.append(fd)
+            actual_close(fd)
+            raise OSError(
+                errno.EIO,
+                "injected marker descriptor close failure",
+            )
+
+        with mock.patch.object(
+            project_journal,
+            "_run_git",
+            return_value=failure,
+        ):
+            with mock.patch.object(
+                project_journal.os,
+                "close",
+                side_effect=close_marker_descriptor_then_fail,
+            ):
+                with self.assertRaises(
+                    project_journal.RepositoryResolutionError,
+                ) as raised:
+                    project_journal._repo_root_for_existing_path(
+                        cwd,
+                        deadline=time.monotonic() + 5,
+                    )
+
+        self.assertEqual(len(close_calls), 1)
+        self.assertEqual(
+            raised.exception.resolution_reason,
+            "git_marker_present",
+        )
+        self.assertEqual(len(raised.exception.cleanup_errors), 1)
+        self.assertEqual(raised.exception.cleanup_errors[0]["errno"], errno.EIO)
+
+    def test_failed_discovery_resolution_preserves_close_base_exception(
+        self,
+    ) -> None:
+        cwd = self.root / "close-interrupt-candidate"
+        cwd.mkdir()
+        failure = subprocess.CompletedProcess(
+            [],
+            128,
+            "",
+            "fatal: injected Git failure",
+        )
+        actual_close = project_journal.os.close
+        interruption = LegacyInterrupt("injected descriptor close interruption")
+        interrupted = False
+
+        def close_then_interrupt_once(fd: int) -> None:
+            nonlocal interrupted
+            actual_close(fd)
+            if not interrupted:
+                interrupted = True
+                raise interruption
+
+        with mock.patch.object(
+            project_journal,
+            "_run_git",
+            return_value=failure,
+        ):
+            with mock.patch.object(
+                project_journal.os,
+                "close",
+                side_effect=close_then_interrupt_once,
+            ):
+                with self.assertRaises(LegacyInterrupt) as raised:
+                    project_journal._repo_root_for_existing_path(
+                        cwd,
+                        deadline=time.monotonic() + 5,
+                    )
+
+        self.assertTrue(interrupted)
+        self.assertIs(raised.exception, interruption)
+
+    def test_failed_discovery_resolution_async_handoff_uses_one_fd_owner(
+        self,
+    ) -> None:
+        classify = project_journal._classify_failed_git_resolution
+        source_lines, first_line = inspect.getsourcelines(classify)
+
+        def exact_line_number(source: str) -> int:
+            matches = [
+                first_line + offset
+                for offset, line in enumerate(source_lines)
+                if line.strip() == source
+            ]
+            self.assertEqual(len(matches), 1)
+            return matches[0]
+
+        target_lines = {
+            "before_handoff_close": exact_line_number("owner.close("),
+            "after_parent_promotion": exact_line_number("parent_fd = None"),
+            "terminal_return": exact_line_number("return None"),
+        }
+        failure = subprocess.CompletedProcess(
+            [],
+            128,
+            "",
+            "fatal: injected Git failure",
+        )
+        actual_open = project_journal.os.open
+        actual_close = project_journal.os.close
+        owner_type = project_journal._RepositoryResolutionFdOwner
+
+        for phase, target_line in target_lines.items():
+            with self.subTest(phase=phase):
+                cwd = self.root / phase / "a" / "b"
+                cwd.mkdir(parents=True)
+                opened_fds: list[int] = []
+                close_calls: list[int] = []
+                owners: list[project_journal._RepositoryResolutionFdOwner] = []
+                interruption = LegacyInterrupt(
+                    f"injected {phase} descriptor-owner interruption"
+                )
+                injected = False
+
+                def track_open(
+                    path: os.PathLike[str] | str,
+                    flags: int,
+                    mode: int = 0o777,
+                    *,
+                    dir_fd: int | None = None,
+                ) -> int:
+                    result = actual_open(
+                        path,
+                        flags,
+                        mode,
+                        dir_fd=dir_fd,
+                    )
+                    opened_fds.append(result)
+                    return result
+
+                def track_close(fd: int) -> None:
+                    close_calls.append(fd)
+                    actual_close(fd)
+
+                def capture_owner(
+                    source_path: pathlib.Path,
+                ) -> project_journal._RepositoryResolutionFdOwner:
+                    owner = owner_type(source_path)
+                    owners.append(owner)
+                    return owner
+
+                def interrupt_at_target(
+                    frame: object,
+                    event: str,
+                    _arg: object,
+                ) -> object:
+                    nonlocal injected
+                    if (
+                        not injected
+                        and event == "line"
+                        and getattr(frame, "f_code", None) is classify.__code__
+                        and getattr(frame, "f_lineno", None) == target_line
+                    ):
+                        injected = True
+                        raise interruption
+                    return interrupt_at_target
+
+                previous_trace = sys.gettrace()
+                try:
+                    with mock.patch.object(
+                        project_journal,
+                        "_run_git",
+                        return_value=failure,
+                    ):
+                        with mock.patch.object(
+                            project_journal,
+                            "_RepositoryResolutionFdOwner",
+                            side_effect=capture_owner,
+                        ):
+                            with mock.patch.object(
+                                project_journal.os,
+                                "open",
+                                side_effect=track_open,
+                            ):
+                                with mock.patch.object(
+                                    project_journal.os,
+                                    "close",
+                                    side_effect=track_close,
+                                ):
+                                    sys.settrace(interrupt_at_target)
+                                    with self.assertRaises(
+                                        LegacyInterrupt,
+                                    ) as raised:
+                                        project_journal._repo_root_for_existing_path(
+                                            cwd,
+                                            deadline=time.monotonic() + 5,
+                                        )
+                finally:
+                    sys.settrace(previous_trace)
+
+                self.assertTrue(injected)
+                self.assertIs(raised.exception, interruption)
+                self.assertTrue(opened_fds)
+                self.assertCountEqual(close_calls, opened_fds)
+                self.assertEqual(len(close_calls), len(opened_fds))
+                self.assertEqual(len(owners), 1)
+                self.assertEqual(owners[0].owned_fds, ())
+
+    def test_failed_discovery_resolution_owner_drain_preserves_active_primary(
+        self,
+    ) -> None:
+        owner_type = project_journal._RepositoryResolutionFdOwner
+
+        def exact_line_number(function: object, source: str) -> int:
+            source_lines, first_line = inspect.getsourcelines(function)
+            matches = [
+                first_line + offset
+                for offset, line in enumerate(source_lines)
+                if line.strip() == source
+            ]
+            self.assertEqual(len(matches), 1)
+            return matches[0]
+
+        target_lines = {
+            "before_close_call": (
+                owner_type._close_owned_fd,
+                exact_line_number(
+                    owner_type._close_owned_fd,
+                    "os.close(self._begin_close_attempt(fd))",
+                ),
+            ),
+            "after_close_before_retire": (
+                owner_type._close_owned_fd,
+                exact_line_number(
+                    owner_type._close_owned_fd,
+                    "self._owned.pop(fd, None)",
+                ),
+            ),
+            "before_context_drain": (
+                owner_type.__exit__,
+                exact_line_number(
+                    owner_type.__exit__,
+                    "cleanup_error, cleanup_cause = "
+                    "self.close_all(primary=active_error)",
+                ),
+            ),
+            "after_context_drain": (
+                owner_type.__exit__,
+                exact_line_number(
+                    owner_type.__exit__,
+                    "if active_error is None and cleanup_error is not None:",
+                ),
+            ),
+            "before_drain_selection": (
+                owner_type.close_all,
+                exact_line_number(
+                    owner_type.close_all,
+                    "fd, (context, close_attempted) = next(iter(self._owned.items()))",
+                ),
+            ),
+        }
+        failure = subprocess.CompletedProcess(
+            [],
+            128,
+            "",
+            "fatal: injected Git failure",
+        )
+        actual_open = project_journal.os.open
+        actual_close = project_journal.os.close
+
+        for phase, (target_function, target_line) in target_lines.items():
+            with self.subTest(phase=phase):
+                cwd = self.root / f"owner-drain-{phase}"
+                cwd.mkdir()
+                primary = LegacyInterrupt(
+                    f"injected {phase} active classification primary"
+                )
+                cleanup_interrupt = LegacyInterrupt(
+                    f"injected {phase} owner-drain interruption"
+                )
+                opened_fds: list[int] = []
+                close_calls: list[int] = []
+                owners: list[project_journal._RepositoryResolutionFdOwner] = []
+                injected = False
+
+                def track_open(
+                    path: os.PathLike[str] | str,
+                    flags: int,
+                    mode: int = 0o777,
+                    *,
+                    dir_fd: int | None = None,
+                ) -> int:
+                    result = actual_open(
+                        path,
+                        flags,
+                        mode,
+                        dir_fd=dir_fd,
+                    )
+                    opened_fds.append(result)
+                    return result
+
+                def track_close(fd: int) -> None:
+                    close_calls.append(fd)
+                    actual_close(fd)
+
+                def capture_owner(
+                    source_path: pathlib.Path,
+                ) -> project_journal._RepositoryResolutionFdOwner:
+                    owner = owner_type(source_path)
+                    owners.append(owner)
+                    return owner
+
+                def interrupt_at_target(
+                    frame: object,
+                    event: str,
+                    _arg: object,
+                ) -> object:
+                    nonlocal injected
+                    if (
+                        not injected
+                        and event == "line"
+                        and getattr(frame, "f_code", None) is target_function.__code__
+                        and getattr(frame, "f_lineno", None) == target_line
+                    ):
+                        injected = True
+                        raise cleanup_interrupt
+                    return interrupt_at_target
+
+                previous_trace = sys.gettrace()
+                try:
+                    with mock.patch.object(
+                        project_journal,
+                        "_run_git",
+                        return_value=failure,
+                    ):
+                        with mock.patch.object(
+                            project_journal,
+                            "_RepositoryResolutionFdOwner",
+                            side_effect=capture_owner,
+                        ):
+                            with mock.patch.object(
+                                project_journal,
+                                "_stat_failed_git_marker",
+                                side_effect=primary,
+                            ):
+                                with mock.patch.object(
+                                    project_journal.os,
+                                    "open",
+                                    side_effect=track_open,
+                                ):
+                                    with mock.patch.object(
+                                        project_journal.os,
+                                        "close",
+                                        side_effect=track_close,
+                                    ):
+                                        sys.settrace(interrupt_at_target)
+                                        with self.assertRaises(
+                                            LegacyInterrupt,
+                                        ) as raised:
+                                            project_journal._repo_root_for_existing_path(
+                                                cwd,
+                                                deadline=time.monotonic() + 5,
+                                            )
+                finally:
+                    sys.settrace(previous_trace)
+
+                self.assertTrue(injected)
+                self.assertIs(raised.exception, primary)
+                self.assertTrue(opened_fds)
+                self.assertCountEqual(close_calls, opened_fds)
+                self.assertEqual(len(close_calls), len(opened_fds))
+                self.assertEqual(len(owners), 1)
+                self.assertEqual(owners[0].owned_fds, ())
+                cleanup_errors = getattr(primary, "cleanup_errors", [])
+                self.assertEqual(len(cleanup_errors), 1)
+                self.assertIn(
+                    str(cleanup_interrupt),
+                    cleanup_errors[0]["message"],
+                )
+
+    def test_repository_resolution_owner_preserves_first_close_failure_across_drain_interrupt(
+        self,
+    ) -> None:
+        owner_type = project_journal._RepositoryResolutionFdOwner
+        source_lines, first_line = inspect.getsourcelines(owner_type.close_all)
+        target_sources = {
+            "before_cleanup_wrapper": "cleanup_primary = RepositoryResolutionError(",
+            "before_cleanup_persist": (
+                "self._cleanup_failure = (cleanup_primary, cleanup_error)"
+            ),
+            "after_cleanup_persist": (
+                "fd, (context, close_attempted) = next(iter(self._owned.items()))"
+            ),
+        }
+        target_lines: dict[str, int] = {}
+        for phase, target_source in target_sources.items():
+            matches = [
+                first_line + offset
+                for offset, line in enumerate(source_lines)
+                if line.strip() == target_source
+            ]
+            self.assertEqual(len(matches), 1)
+            target_lines[phase] = matches[0]
+        actual_open = project_journal.os.open
+        actual_close = project_journal.os.close
+        flags = project_journal._repository_initial_directory_open_flags(self.root)
+
+        for phase, target_line in target_lines.items():
+            with self.subTest(phase=phase):
+                opened_fds: list[int] = []
+                close_calls: list[int] = []
+                close_failure: OSError | None = None
+                drain_interrupt = LegacyInterrupt(
+                    f"injected {phase} interruption after close failure"
+                )
+                injected = False
+                owner = owner_type(self.root)
+
+                def track_open(
+                    path: os.PathLike[str] | str,
+                    open_flags: int,
+                    mode: int = 0o777,
+                    *,
+                    dir_fd: int | None = None,
+                ) -> int:
+                    result = actual_open(
+                        path,
+                        open_flags,
+                        mode,
+                        dir_fd=dir_fd,
+                    )
+                    opened_fds.append(result)
+                    return result
+
+                def close_then_fail_once(fd: int) -> None:
+                    nonlocal close_failure
+                    close_calls.append(fd)
+                    actual_close(fd)
+                    if close_failure is None:
+                        close_failure = OSError(
+                            errno.EIO,
+                            "injected first descriptor close failure",
+                        )
+                        raise close_failure
+
+                def interrupt_cleanup_state(
+                    frame: object,
+                    event: str,
+                    _arg: object,
+                ) -> object:
+                    nonlocal injected
+                    if (
+                        close_failure is not None
+                        and not injected
+                        and event == "line"
+                        and getattr(frame, "f_code", None)
+                        is owner_type.close_all.__code__
+                        and getattr(frame, "f_lineno", None) == target_line
+                    ):
+                        injected = True
+                        raise drain_interrupt
+                    return interrupt_cleanup_state
+
+                previous_trace = sys.gettrace()
+                try:
+                    with mock.patch.object(
+                        project_journal.os,
+                        "open",
+                        side_effect=track_open,
+                    ):
+                        with mock.patch.object(
+                            project_journal.os,
+                            "close",
+                            side_effect=close_then_fail_once,
+                        ):
+                            sys.settrace(interrupt_cleanup_state)
+                            with self.assertRaises(
+                                project_journal.RepositoryResolutionError,
+                            ) as raised:
+                                with owner:
+                                    owner.open(
+                                        self.root,
+                                        flags,
+                                        cleanup_context=(
+                                            "first descriptor cleanup failed"
+                                        ),
+                                    )
+                                    owner.open(
+                                        self.root,
+                                        flags,
+                                        cleanup_context=(
+                                            "second descriptor cleanup failed"
+                                        ),
+                                    )
+                finally:
+                    sys.settrace(previous_trace)
+
+                self.assertTrue(injected)
+                self.assertIsNotNone(close_failure)
+                self.assertIs(raised.exception.__cause__, close_failure)
+                self.assertEqual(
+                    raised.exception.resolution_reason,
+                    "descriptor_close_failed",
+                )
+                self.assertEqual(raised.exception.errno, errno.EIO)
+                self.assertCountEqual(close_calls, opened_fds)
+                self.assertEqual(len(close_calls), len(opened_fds))
+                self.assertEqual(owner.owned_fds, ())
+                self.assertEqual(len(raised.exception.cleanup_errors), 1)
+                self.assertIn(
+                    str(drain_interrupt),
+                    raised.exception.cleanup_errors[0]["message"],
+                )
+
+    def test_repository_resolution_owner_does_not_treat_ambient_context_as_close_failure(
+        self,
+    ) -> None:
+        owner_type = project_journal._RepositoryResolutionFdOwner
+        source_lines, first_line = inspect.getsourcelines(owner_type.__exit__)
+        drain_lines = [
+            first_line + offset
+            for offset, line in enumerate(source_lines)
+            if line.strip() == "cleanup_error, cleanup_cause = "
+            "self.close_all(primary=active_error)"
+        ]
+        self.assertEqual(len(drain_lines), 1)
+        drain_line = drain_lines[0]
+        actual_open = project_journal.os.open
+        actual_close = project_journal.os.close
+        opened_fds: list[int] = []
+        close_calls: list[int] = []
+        ambient = project_journal.UnsupportedGitVersion(
+            "injected ambient Git version failure"
+        )
+        interruption = LegacyInterrupt(
+            "injected context-exit interruption before any close"
+        )
+        injected = False
+        owner = owner_type(self.root)
+        flags = project_journal._repository_initial_directory_open_flags(self.root)
+
+        def track_open(
+            path: os.PathLike[str] | str,
+            open_flags: int,
+            mode: int = 0o777,
+            *,
+            dir_fd: int | None = None,
+        ) -> int:
+            result = actual_open(
+                path,
+                open_flags,
+                mode,
+                dir_fd=dir_fd,
+            )
+            opened_fds.append(result)
+            return result
+
+        def track_close(fd: int) -> None:
+            close_calls.append(fd)
+            actual_close(fd)
+
+        def interrupt_before_drain(
+            frame: object,
+            event: str,
+            _arg: object,
+        ) -> object:
+            nonlocal injected
+            if (
+                not injected
+                and event == "line"
+                and getattr(frame, "f_code", None) is owner_type.__exit__.__code__
+                and getattr(frame, "f_lineno", None) == drain_line
+            ):
+                injected = True
+                raise interruption
+            return interrupt_before_drain
+
+        previous_trace = sys.gettrace()
+        try:
+            raise ambient
+        except project_journal.UnsupportedGitVersion:
+            try:
+                with mock.patch.object(
+                    project_journal.os,
+                    "open",
+                    side_effect=track_open,
+                ):
+                    with mock.patch.object(
+                        project_journal.os,
+                        "close",
+                        side_effect=track_close,
+                    ):
+                        sys.settrace(interrupt_before_drain)
+                        with self.assertRaises(LegacyInterrupt) as raised:
+                            with owner:
+                                owner.open(
+                                    self.root,
+                                    flags,
+                                    cleanup_context="ambient descriptor cleanup failed",
+                                )
+            finally:
+                sys.settrace(previous_trace)
+
+        self.assertTrue(injected)
+        self.assertIs(raised.exception, interruption)
+        self.assertIs(interruption.__context__, ambient)
+        self.assertCountEqual(close_calls, opened_fds)
+        self.assertEqual(len(close_calls), len(opened_fds))
+        self.assertEqual(owner.owned_fds, ())
+
+    def test_failed_discovery_resolution_fails_closed_without_required_flags(
+        self,
+    ) -> None:
+        cwd = self.root / "missing-descriptor-flag"
+        cwd.mkdir()
+        failure = subprocess.CompletedProcess(
+            [],
+            128,
+            "",
+            "fatal: injected Git failure",
+        )
+        actual_required_flag = project_journal._required_open_flag
+
+        def reject_cloexec(name: str) -> int:
+            if name == "O_CLOEXEC":
+                raise project_journal.UnsupportedPlatform("injected missing O_CLOEXEC")
+            return actual_required_flag(name)
+
+        with mock.patch.object(
+            project_journal,
+            "_run_git",
+            return_value=failure,
+        ):
+            with mock.patch.object(
+                project_journal,
+                "_required_open_flag",
+                side_effect=reject_cloexec,
+            ):
+                with mock.patch.object(
+                    project_journal.os,
+                    "open",
+                ) as opened:
+                    with self.assertRaises(
+                        project_journal.RepositoryResolutionError,
+                    ) as raised:
+                        project_journal._repo_root_for_existing_path(
+                            cwd,
+                            deadline=time.monotonic() + 5,
+                        )
+
+        opened.assert_not_called()
+        self.assertEqual(
+            raised.exception.resolution_reason,
+            "descriptor_traversal_unavailable",
+        )
+
+    def test_failed_discovery_resolution_classifies_every_git_marker_type(
+        self,
+    ) -> None:
+        failure = subprocess.CompletedProcess(
+            [],
+            128,
+            "",
+            "fatal: injected Git failure",
+        )
+        for marker_kind, expected_token, expected_label in (
+            ("directory", "directory", "directory"),
+            ("regular", "regular_file", "regular file"),
+            ("symlink", "symlink", "symlink"),
+            ("fifo", "other", "other filesystem object"),
+        ):
+            with self.subTest(marker_kind=marker_kind):
+                root = self.root / f"marker-{marker_kind}"
+                cwd = root / "nested"
+                cwd.mkdir(parents=True)
+                marker = root / ".git"
+                if marker_kind == "directory":
+                    marker.mkdir()
+                elif marker_kind == "regular":
+                    marker.write_text(
+                        "gitdir: ../private-git-dir\n",
+                        encoding="utf-8",
+                    )
+                elif marker_kind == "symlink":
+                    marker.symlink_to(self.root / "missing-marker-target")
+                else:
+                    os.mkfifo(marker)
+                observed_marker = cwd / ".." / ".git"
+                actual_open = project_journal.os.open
+                opened_paths: list[str] = []
+
+                def reject_marker_open(
+                    path: os.PathLike[str] | str,
+                    flags: int,
+                    mode: int = 0o777,
+                    *,
+                    dir_fd: int | None = None,
+                ) -> int:
+                    path_text = os.fspath(path)
+                    opened_paths.append(path_text)
+                    if pathlib.PurePath(path_text).name == ".git":
+                        raise AssertionError(
+                            ".git markers must not be opened or parsed"
+                        )
+                    return actual_open(
+                        path,
+                        flags,
+                        mode,
+                        dir_fd=dir_fd,
+                    )
+
+                with mock.patch.object(
+                    project_journal,
+                    "_run_git",
+                    return_value=failure,
+                ):
+                    with mock.patch.object(
+                        project_journal.os,
+                        "open",
+                        side_effect=reject_marker_open,
+                    ):
+                        with self.assertRaises(
+                            project_journal.RepositoryResolutionError,
+                        ) as raised:
+                            project_journal._repo_root_for_existing_path(
+                                cwd,
+                                deadline=time.monotonic() + 5,
+                            )
+
+                self.assertTrue(opened_paths)
+                self.assertNotIn(".git", opened_paths)
+                self.assertEqual(
+                    raised.exception.code,
+                    "repository_resolution_failed",
+                )
+                self.assertEqual(
+                    raised.exception.resolution_reason,
+                    "git_marker_present",
+                )
+                self.assertEqual(
+                    raised.exception.marker_kind,
+                    expected_token,
+                )
+                self.assertIsNone(raised.exception.marker_path)
+                self.assertEqual(
+                    raised.exception.marker_path_hint,
+                    observed_marker,
+                )
+                self.assertEqual(
+                    raised.exception.marker_path_status,
+                    "path_unverified",
+                )
+                self.assertEqual(raised.exception.marker_level, 1)
+                self.assertEqual(
+                    raised.exception.marker_directory_device,
+                    root.stat().st_dev,
+                )
+                self.assertEqual(
+                    raised.exception.marker_directory_inode,
+                    root.stat().st_ino,
+                )
+                self.assertIn(expected_label, str(raised.exception))
+                self.assertIn(str(observed_marker), str(raised.exception))
+
+    def test_failed_discovery_resolution_surfaces_marker_stat_errors(
+        self,
+    ) -> None:
+        failure = subprocess.CompletedProcess(
+            [],
+            128,
+            "",
+            "fatal: injected Git failure",
+        )
+        actual_stat = project_journal.os.stat
+        for error_number in (errno.EACCES, errno.EIO):
+            with self.subTest(error_number=error_number):
+                root = self.root / f"marker-error-{error_number}"
+                cwd = root / "nested"
+                cwd.mkdir(parents=True)
+
+                def fail_marker_stat(
+                    path: os.PathLike[str] | str,
+                    *,
+                    dir_fd: int | None = None,
+                    follow_symlinks: bool = True,
+                ) -> os.stat_result:
+                    if (
+                        os.fspath(path) == ".git"
+                        and dir_fd is not None
+                        and not follow_symlinks
+                    ):
+                        raise OSError(
+                            error_number,
+                            "injected marker inspection failure",
+                            str(path),
+                        )
+                    return actual_stat(
+                        path,
+                        dir_fd=dir_fd,
+                        follow_symlinks=follow_symlinks,
+                    )
+
+                with mock.patch.object(
+                    project_journal,
+                    "_run_git",
+                    return_value=failure,
+                ):
+                    with mock.patch.object(
+                        project_journal.os,
+                        "stat",
+                        side_effect=fail_marker_stat,
+                    ):
+                        with self.assertRaises(
+                            project_journal.RepositoryResolutionError,
+                        ) as raised:
+                            project_journal._repo_root_for_existing_path(
+                                cwd,
+                                deadline=time.monotonic() + 5,
+                            )
+
+                self.assertEqual(raised.exception.errno, error_number)
+                self.assertEqual(
+                    raised.exception.resolution_reason,
+                    "marker_inspection_failed",
+                )
+                self.assertIn(
+                    ".git inspection failed",
+                    str(raised.exception),
+                )
+                serialized = project_journal._discovery_error(
+                    raised.exception,
+                )
+                self.assertEqual(
+                    serialized["code"],
+                    "repository_resolution_failed",
+                )
+                self.assertEqual(
+                    serialized["resolution_reason"],
+                    "marker_inspection_failed",
+                )
+                self.assertEqual(serialized["errno"], error_number)
+                self.assertEqual(
+                    serialized["error_name"],
+                    errno.errorcode[error_number],
+                )
+
+    def test_failed_discovery_resolution_surfaces_ancestor_stat_errors(
+        self,
+    ) -> None:
+        failure = subprocess.CompletedProcess(
+            [],
+            128,
+            "",
+            "fatal: injected Git failure",
+        )
+        for phase, error_number in (
+            ("candidate", errno.EACCES),
+            ("parent", errno.EIO),
+        ):
+            with self.subTest(phase=phase):
+                cwd = self.root / f"ancestor-error-{phase}"
+                cwd.mkdir()
+                actual_open = project_journal.os.open
+                actual_stat = project_journal.os.stat
+
+                def fail_ancestor_stat(
+                    path: os.PathLike[str] | str,
+                    *,
+                    dir_fd: int | None = None,
+                    follow_symlinks: bool = True,
+                ) -> os.stat_result:
+                    if (
+                        phase == "candidate"
+                        and pathlib.Path(path) == cwd
+                        and follow_symlinks
+                    ):
+                        raise OSError(
+                            error_number,
+                            "injected ancestor inspection failure",
+                            str(path),
+                        )
+                    return actual_stat(
+                        path,
+                        dir_fd=dir_fd,
+                        follow_symlinks=follow_symlinks,
+                    )
+
+                def fail_parent_open(
+                    path: os.PathLike[str] | str,
+                    flags: int,
+                    mode: int = 0o777,
+                    *,
+                    dir_fd: int | None = None,
+                ) -> int:
+                    if (
+                        phase == "parent"
+                        and os.fspath(path) == ".."
+                        and dir_fd is not None
+                    ):
+                        raise OSError(
+                            error_number,
+                            "injected parent descriptor binding failure",
+                            os.fspath(path),
+                        )
+                    return actual_open(
+                        path,
+                        flags,
+                        mode,
+                        dir_fd=dir_fd,
+                    )
+
+                with mock.patch.object(
+                    project_journal,
+                    "_run_git",
+                    return_value=failure,
+                ) as run:
+                    with mock.patch.object(
+                        project_journal.os,
+                        "stat",
+                        side_effect=fail_ancestor_stat,
+                    ):
+                        with mock.patch.object(
+                            project_journal.os,
+                            "open",
+                            side_effect=fail_parent_open,
+                        ):
+                            with self.assertRaises(
+                                project_journal.RepositoryResolutionError,
+                            ) as raised:
+                                project_journal._repo_root_for_existing_path(
+                                    cwd,
+                                    deadline=time.monotonic() + 5,
+                                )
+
+                self.assertEqual(raised.exception.errno, error_number)
+                self.assertEqual(
+                    raised.exception.resolution_reason,
+                    "ancestor_inspection_failed",
+                )
+                if phase == "candidate":
+                    run.assert_not_called()
+                else:
+                    run.assert_called_once()
+
+    def test_failed_discovery_resolution_surfaces_parent_fstat_error(
+        self,
+    ) -> None:
+        cwd = self.root / "parent-fstat-error"
+        cwd.mkdir()
+        failure = subprocess.CompletedProcess(
+            [],
+            128,
+            "",
+            "fatal: injected Git failure",
+        )
+        actual_open = project_journal.os.open
+        actual_fstat = project_journal.os.fstat
+        actual_close = project_journal.os.close
+        parent_fd: int | None = None
+        opened_fds: set[int] = set()
+        closed_fds: set[int] = set()
+
+        def track_parent_open(
+            path: os.PathLike[str] | str,
+            flags: int,
+            mode: int = 0o777,
+            *,
+            dir_fd: int | None = None,
+        ) -> int:
+            nonlocal parent_fd
+            result = actual_open(
+                path,
+                flags,
+                mode,
+                dir_fd=dir_fd,
+            )
+            opened_fds.add(result)
+            if os.fspath(path) == ".." and dir_fd is not None:
+                parent_fd = result
+            return result
+
+        def fail_parent_fstat(fd: int) -> os.stat_result:
+            if fd == parent_fd:
+                raise OSError(
+                    errno.EIO,
+                    "injected parent fstat failure",
+                )
+            return actual_fstat(fd)
+
+        def track_close(fd: int) -> None:
+            closed_fds.add(fd)
+            actual_close(fd)
+
+        with mock.patch.object(
+            project_journal,
+            "_run_git",
+            return_value=failure,
+        ):
+            with mock.patch.object(
+                project_journal.os,
+                "open",
+                side_effect=track_parent_open,
+            ):
+                with mock.patch.object(
+                    project_journal.os,
+                    "fstat",
+                    side_effect=fail_parent_fstat,
+                ):
+                    with mock.patch.object(
+                        project_journal.os,
+                        "close",
+                        side_effect=track_close,
+                    ):
+                        with self.assertRaises(
+                            project_journal.RepositoryResolutionError,
+                        ) as raised:
+                            project_journal._repo_root_for_existing_path(
+                                cwd,
+                                deadline=time.monotonic() + 5,
+                            )
+
+        self.assertEqual(
+            raised.exception.resolution_reason,
+            "descriptor_binding_failed",
+        )
+        self.assertEqual(raised.exception.errno, errno.EIO)
+        self.assertEqual(closed_fds, opened_fds)
+
+    def test_failed_discovery_resolution_retries_proved_stale_enotdir(
+        self,
+    ) -> None:
+        root = self.root / "stale-enotdir"
+        root.mkdir()
+        failure = subprocess.CompletedProcess(
+            [],
+            128,
+            "",
+            "fatal: injected Git failure",
+        )
+        actual_stat = project_journal.os.stat
+        marker_fds: list[int] = []
+
+        def stale_marker_stat(
+            path: os.PathLike[str] | str,
+            *,
+            dir_fd: int | None = None,
+            follow_symlinks: bool = True,
+        ) -> os.stat_result:
+            if os.fspath(path) == ".git" and dir_fd is not None and not follow_symlinks:
+                marker_fds.append(dir_fd)
+                if len(marker_fds) == 1:
+                    raise NotADirectoryError(
+                        errno.ENOTDIR,
+                        "injected stale ENOTDIR",
+                        str(path),
+                    )
+            return actual_stat(
+                path,
+                dir_fd=dir_fd,
+                follow_symlinks=follow_symlinks,
+            )
+
+        with mock.patch.object(
+            project_journal,
+            "_run_git",
+            return_value=failure,
+        ):
+            with mock.patch.object(
+                project_journal.os,
+                "stat",
+                side_effect=stale_marker_stat,
+            ):
+                resolved = project_journal._repo_root_for_existing_path(
+                    root,
+                    deadline=time.monotonic() + 5,
+                )
+
+        self.assertIsNone(resolved)
+        self.assertGreaterEqual(len(marker_fds), 2)
+        self.assertEqual(marker_fds[0], marker_fds[1])
+
+    def test_failed_discovery_resolution_rejects_persistent_enotdir(
+        self,
+    ) -> None:
+        root = self.root / "persistent-enotdir"
+        root.mkdir()
+        failure = subprocess.CompletedProcess(
+            [],
+            128,
+            "",
+            "fatal: injected Git failure",
+        )
+        actual_stat = project_journal.os.stat
+
+        def persistent_enotdir(
+            path: os.PathLike[str] | str,
+            *,
+            dir_fd: int | None = None,
+            follow_symlinks: bool = True,
+        ) -> os.stat_result:
+            if os.fspath(path) == ".git" and dir_fd is not None and not follow_symlinks:
+                raise NotADirectoryError(
+                    errno.ENOTDIR,
+                    "injected persistent ENOTDIR",
+                    str(path),
+                )
+            return actual_stat(
+                path,
+                dir_fd=dir_fd,
+                follow_symlinks=follow_symlinks,
+            )
+
+        with mock.patch.object(
+            project_journal,
+            "_run_git",
+            return_value=failure,
+        ):
+            with mock.patch.object(
+                project_journal.os,
+                "stat",
+                side_effect=persistent_enotdir,
+            ):
+                with self.assertRaises(
+                    project_journal.RepositoryResolutionError,
+                ) as raised:
+                    project_journal._repo_root_for_existing_path(
+                        root,
+                        deadline=time.monotonic() + 5,
+                    )
+
+        self.assertEqual(
+            raised.exception.resolution_reason,
+            "marker_classification_incomplete",
+        )
+        self.assertEqual(raised.exception.errno, errno.ENOTDIR)
+
+    def test_failed_discovery_resolution_uses_one_deadline_for_marker_scan(
+        self,
+    ) -> None:
+        cwd = self.root / "deadline-candidate"
+        cwd.mkdir()
+        failure = subprocess.CompletedProcess(
+            [],
+            128,
+            "",
+            "fatal: injected Git failure",
+        )
+        actual_open = project_journal.os.open
+        actual_close = project_journal.os.close
+        actual_stat = project_journal.os.stat
+        observed_deadlines: list[float | None] = []
+        marker_probe_finished = False
+        opened_fds: set[int] = set()
+        closed_fds: set[int] = set()
+
+        def expire_during_marker_scan(
+            deadline: float | None,
+            error: str,
+        ) -> None:
+            observed_deadlines.append(deadline)
+            if marker_probe_finished:
+                raise project_journal.UserError(error)
+
+        def finish_marker_probe(
+            path: os.PathLike[str] | str,
+            *,
+            dir_fd: int | None = None,
+            follow_symlinks: bool = True,
+        ) -> os.stat_result:
+            nonlocal marker_probe_finished
+            try:
+                return actual_stat(
+                    path,
+                    dir_fd=dir_fd,
+                    follow_symlinks=follow_symlinks,
+                )
+            finally:
+                if (
+                    os.fspath(path) == ".git"
+                    and dir_fd is not None
+                    and not follow_symlinks
+                ):
+                    marker_probe_finished = True
+
+        def track_open(
+            path: os.PathLike[str] | str,
+            flags: int,
+            mode: int = 0o777,
+            *,
+            dir_fd: int | None = None,
+        ) -> int:
+            result = actual_open(
+                path,
+                flags,
+                mode,
+                dir_fd=dir_fd,
+            )
+            opened_fds.add(result)
+            return result
+
+        def track_close(fd: int) -> None:
+            closed_fds.add(fd)
+            actual_close(fd)
+
+        with mock.patch.object(
+            project_journal,
+            "_run_git",
+            return_value=failure,
+        ) as run:
+            with mock.patch.object(
+                project_journal,
+                "_check_deadline",
+                side_effect=expire_during_marker_scan,
+            ):
+                with mock.patch.object(
+                    project_journal.os,
+                    "stat",
+                    side_effect=finish_marker_probe,
+                ):
+                    with mock.patch.object(
+                        project_journal.os,
+                        "open",
+                        side_effect=track_open,
+                    ):
+                        with mock.patch.object(
+                            project_journal.os,
+                            "close",
+                            side_effect=track_close,
+                        ):
+                            with self.assertRaises(
+                                project_journal.RepositoryResolutionError,
+                            ) as raised:
+                                project_journal._repo_root_for_existing_path(
+                                    cwd,
+                                    deadline=123.0,
+                                )
+
+        self.assertTrue(marker_probe_finished)
+        self.assertTrue(observed_deadlines)
+        self.assertEqual(set(observed_deadlines), {123.0})
+        self.assertEqual(run.call_args.kwargs["deadline"], 123.0)
+        self.assertEqual(closed_fds, opened_fds)
+        self.assertEqual(
+            raised.exception.resolution_reason,
+            "deadline_exceeded",
+        )
+        self.assertIn("shared deadline", str(raised.exception))
+
+    def test_failed_discovery_resolution_fails_closed_at_marker_scan_limit(
+        self,
+    ) -> None:
+        cwd = self.root / "bounded-marker-scan/a/b/c"
+        cwd.mkdir(parents=True)
+        failure = subprocess.CompletedProcess(
+            [],
+            128,
+            "",
+            "fatal: injected Git failure",
+        )
+        actual_open = project_journal.os.open
+        actual_close = project_journal.os.close
+        actual_stat = project_journal.os.stat
+        active_fds: set[int] = set()
+        peak_active_fds = 0
+        marker_fds: list[int] = []
+        parent_open_count = 0
+
+        def track_open(
+            path: os.PathLike[str] | str,
+            flags: int,
+            mode: int = 0o777,
+            *,
+            dir_fd: int | None = None,
+        ) -> int:
+            nonlocal parent_open_count
+            nonlocal peak_active_fds
+            result = actual_open(
+                path,
+                flags,
+                mode,
+                dir_fd=dir_fd,
+            )
+            active_fds.add(result)
+            peak_active_fds = max(peak_active_fds, len(active_fds))
+            if os.fspath(path) == ".." and dir_fd is not None:
+                parent_open_count += 1
+            return result
+
+        def track_close(fd: int) -> None:
+            self.assertIn(fd, active_fds)
+            active_fds.remove(fd)
+            actual_close(fd)
+
+        def track_marker_stat(
+            path: os.PathLike[str] | str,
+            *,
+            dir_fd: int | None = None,
+            follow_symlinks: bool = True,
+        ) -> os.stat_result:
+            if os.fspath(path) == ".git" and dir_fd is not None and not follow_symlinks:
+                marker_fds.append(dir_fd)
+            return actual_stat(
+                path,
+                dir_fd=dir_fd,
+                follow_symlinks=follow_symlinks,
+            )
+
+        with mock.patch.object(
+            project_journal,
+            "MAX_DISCOVERY_CWD_COMPONENTS",
+            1,
+        ):
+            with mock.patch.object(
+                project_journal,
+                "_run_git",
+                return_value=failure,
+            ):
+                with mock.patch.object(
+                    project_journal.os,
+                    "open",
+                    side_effect=track_open,
+                ):
+                    with mock.patch.object(
+                        project_journal.os,
+                        "close",
+                        side_effect=track_close,
+                    ):
+                        with mock.patch.object(
+                            project_journal.os,
+                            "stat",
+                            side_effect=track_marker_stat,
+                        ):
+                            with self.assertRaises(
+                                project_journal.RepositoryResolutionError,
+                            ) as raised:
+                                project_journal._repo_root_for_existing_path(
+                                    cwd,
+                                    deadline=time.monotonic() + 5,
+                                )
+
+        self.assertEqual(
+            raised.exception.resolution_reason,
+            "marker_scan_limit",
+        )
+        self.assertIn("2-level bound", str(raised.exception))
+        self.assertEqual(peak_active_fds, 2)
+        self.assertEqual(active_fds, set())
+        self.assertEqual(len(marker_fds), 2)
+        self.assertEqual(parent_open_count, 2)
+
+    def test_failed_discovery_resolution_stops_at_device_boundary(self) -> None:
+        cwd = self.root / "device-candidate"
+        cwd.mkdir()
+        failure = subprocess.CompletedProcess(
+            [],
+            128,
+            "",
+            "fatal: injected Git failure",
+        )
+        actual_open = project_journal.os.open
+        actual_fstat = project_journal.os.fstat
+        actual_stat = project_journal.os.stat
+        parent_fd: int | None = None
+        marker_checks: list[tuple[str, int | None]] = []
+
+        def track_parent_open(
+            path: os.PathLike[str] | str,
+            flags: int,
+            mode: int = 0o777,
+            *,
+            dir_fd: int | None = None,
+        ) -> int:
+            nonlocal parent_fd
+            result = actual_open(
+                path,
+                flags,
+                mode,
+                dir_fd=dir_fd,
+            )
+            if os.fspath(path) == ".." and dir_fd is not None:
+                parent_fd = result
+            return result
+
+        def cross_device_parent_fstat(fd: int) -> os.stat_result:
+            value = actual_fstat(fd)
+            if fd == parent_fd:
+                return stat_with_dev(value, value.st_dev + 1)
+            return value
+
+        def cross_device_parent_stat(
+            path: os.PathLike[str] | str,
+            *,
+            dir_fd: int | None = None,
+            follow_symlinks: bool = True,
+        ) -> os.stat_result:
+            if os.fspath(path) == ".git" and not follow_symlinks:
+                marker_checks.append((os.fspath(path), dir_fd))
+            value = actual_stat(
+                path,
+                dir_fd=dir_fd,
+                follow_symlinks=follow_symlinks,
+            )
+            return value
+
+        with mock.patch.object(
+            project_journal,
+            "_run_git",
+            return_value=failure,
+        ):
+            with mock.patch.object(
+                project_journal.os, "open", side_effect=track_parent_open
+            ):
+                with mock.patch.object(
+                    project_journal.os,
+                    "fstat",
+                    side_effect=cross_device_parent_fstat,
+                ):
+                    with mock.patch.object(
+                        project_journal.os,
+                        "stat",
+                        side_effect=cross_device_parent_stat,
+                    ):
+                        resolved = project_journal._repo_root_for_existing_path(
+                            cwd,
+                            deadline=time.monotonic() + 5,
+                        )
+
+        self.assertIsNone(resolved)
+        self.assertEqual(len(marker_checks), 1)
+        self.assertEqual(marker_checks[0][0], ".git")
+        self.assertIsNotNone(marker_checks[0][1])
+
+    def test_failed_discovery_resolution_preserves_kernel_symlink_dotdot_semantics(
+        self,
+    ) -> None:
+        physical = self.root / "physical-marker-root"
+        nested = physical / "nested"
+        candidate = physical / "candidate"
+        nested.mkdir(parents=True)
+        candidate.mkdir()
+        marker = physical / ".git"
+        marker.mkdir()
+        link = self.root / "marker-link"
+        link.symlink_to(nested, target_is_directory=True)
+        kernel_path = link / ".." / "candidate"
+        failure = subprocess.CompletedProcess(
+            [],
+            128,
+            "",
+            "fatal: injected Git failure",
+        )
+
+        with mock.patch.object(
+            project_journal,
+            "_run_git",
+            return_value=failure,
+        ):
+            with mock.patch.object(
+                pathlib.Path,
+                "resolve",
+                side_effect=AssertionError("marker classification must not resolve"),
+            ):
+                with self.assertRaises(
+                    project_journal.RepositoryResolutionError,
+                ) as raised:
+                    project_journal._repo_root_for_existing_path(
+                        kernel_path,
+                        deadline=time.monotonic() + 5,
+                    )
+
+        self.assertIn(
+            "directory descriptor-relative .git entry",
+            str(raised.exception),
+        )
+        self.assertIn(".git", str(raised.exception))
+
+    def test_unsupported_git_does_not_bypass_marker_classification(self) -> None:
+        cwd = self.root / "unsupported-git-marker"
+        cwd.mkdir()
+        marker = cwd / ".git"
+        marker.mkdir()
+
+        with mock.patch.object(
+            project_journal,
+            "_run_git",
+            side_effect=project_journal.UnsupportedGitVersion(
+                "injected unsupported Git"
+            ),
+        ):
+            with self.assertRaises(
+                project_journal.RepositoryResolutionError,
+            ) as raised:
+                project_journal._repo_root_for_existing_path(
+                    cwd,
+                    deadline=time.monotonic() + 5,
+                )
+
+        self.assertEqual(
+            raised.exception.resolution_reason,
+            "git_marker_present",
+        )
+        self.assertEqual(raised.exception.marker_kind, "directory")
+        self.assertIsNone(raised.exception.marker_path)
+        self.assertEqual(raised.exception.marker_path_hint, marker)
+        self.assertEqual(
+            raised.exception.marker_path_status,
+            "path_unverified",
+        )
 
     def test_frontmatter_and_validation_semantic_caps_fail_closed(self) -> None:
         base_fields = {
@@ -8504,6 +10408,42 @@ class ProjectJournalTests(unittest.TestCase):
             skill,
         )
         self.assertIn("small `discovery_coverage_ref` to every partial row", skill)
+        self.assertIn(
+            "Buffer normalized distinct CWDs in first-seen order per rollout",
+            skill,
+        )
+        self.assertIn(
+            "Discard a failed rollout's pending buffer without rolling back aggregate counters",
+            skill,
+        )
+        self.assertIn(
+            "bind the retained lexical current path once with required `O_DIRECTORY|O_CLOEXEC|O_NONBLOCK`",
+            skill,
+        )
+        self.assertIn(
+            "inspect `.git` only with descriptor-relative no-follow `stat`",
+            skill,
+        )
+        self.assertIn(
+            "label any lexical marker hint `path_unverified`",
+            skill,
+        )
+        self.assertIn(
+            "Keep one descriptor owner authoritative",
+            skill,
+        )
+        self.assertIn(
+            "local current/parent variables are non-owning aliases",
+            skill,
+        )
+        self.assertIn(
+            "owner state distinguishes not-yet-closed from close-attempted descriptors",
+            skill,
+        )
+        self.assertIn(
+            "contextual error is not the identical ambient exception",
+            skill,
+        )
         self.assertIn("bounded three-line marker prefix", skill)
         self.assertIn(
             "Inaccessible journal, index, exclude, or hook paths remain null",
@@ -8692,6 +10632,36 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertIn("`coverage_status: complete`", readme)
         self.assertIn("one deterministic final-sort anchor", readme)
         self.assertIn("small `discovery_coverage_ref`", readme)
+        self.assertIn(
+            "first-seen order in a per-rollout buffer",
+            readme,
+        )
+        self.assertIn(
+            "failed rollout discards its pending buffer without rolling back aggregate byte, record, verification-byte, or distinct-CWD counters",
+            readme,
+        )
+        self.assertIn(
+            "descriptor-bound scan over at most `MAX_DISCOVERY_CWD_COMPONENTS + 1` existing ancestors",
+            readme,
+        )
+        self.assertIn(
+            'Every `.git` classification then uses only no-follow `stat(".git", dir_fd=current_fd)`',
+            readme,
+        )
+        self.assertIn(
+            "explicitly `path_unverified` lexical hint",
+            readme,
+        )
+        self.assertIn(
+            "One descriptor owner is authoritative",
+            readme,
+        )
+        self.assertIn(
+            "Context exit retries an interrupted drain",
+            readme,
+        )
+        self.assertIn("first uncertain close failure", readme)
+        self.assertIn("ambient exception recorded at close start", readme)
         self.assertIn("three-line marker prefix", readme)
         self.assertIn(
             "Inaccessible journal, index, exclude, or hook paths",
@@ -14123,7 +16093,24 @@ class ProjectJournalTests(unittest.TestCase):
         rollout_dir = codex_home / "sessions/2026/05/05"
         rollout_dir.mkdir(parents=True)
         rollout = rollout_dir / "rollout-content-change.jsonl"
-        rollout.write_bytes(b'{"value":"aaaa"}\n')
+        first_cwd = str(self.root / "candidate-a")
+        second_cwd = str(self.root / "candidate-b")
+        first_payload = (
+            json.dumps(
+                {"payload": {"cwd": first_cwd}},
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode()
+        second_payload = (
+            json.dumps(
+                {"payload": {"cwd": second_cwd}},
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode()
+        self.assertEqual(len(first_payload), len(second_payload))
+        rollout.write_bytes(first_payload)
         original_verifier = project_journal._read_rollout_verification_digest
         changed = False
 
@@ -14136,7 +16123,7 @@ class ProjectJournalTests(unittest.TestCase):
             nonlocal changed
             if not changed:
                 changed = True
-                candidate.path.write_bytes(b'{"value":"bbbb"}\n')
+                candidate.path.write_bytes(second_payload)
             return original_verifier(
                 fd,
                 candidate,
@@ -14149,11 +16136,26 @@ class ProjectJournalTests(unittest.TestCase):
             "_read_rollout_verification_digest",
             side_effect=mutate_before_verification,
         ):
-            rows = project_journal._discover_repos(codex_home, 9999)
+            with mock.patch.object(
+                project_journal,
+                "_repo_root_for_path",
+            ) as resolver:
+                with mock.patch.object(
+                    project_journal,
+                    "_enrich_discovered_repo",
+                ) as enrich:
+                    rows = project_journal._discover_repos(codex_home, 9999)
 
         self.assertTrue(changed)
+        resolver.assert_not_called()
+        enrich.assert_not_called()
+        self.assertIsNone(rows[0]["repo"])
+        self.assertIsNone(rows[0]["candidate_cwd"])
+        self.assertEqual(rows[0]["rollout_count"], 0)
         self.assertEqual(rows[0]["coverage_status"], "partial")
         self.assertEqual(rows[0]["discovery_status"], "inconclusive")
+        self.assertEqual(rows[0]["adoption_status"], "inconclusive")
+        self.assertIsNone(rows[0]["tracked_journal_adopted"])
         coverage = rows[0]["discovery_error"]["discovery_coverage"]
         self.assertEqual(
             coverage["code"],
@@ -14161,6 +16163,8 @@ class ProjectJournalTests(unittest.TestCase):
         )
         self.assertEqual(coverage["inspection_reason"], "content_changed")
         self.assertEqual(coverage["rollout_bytes_scanned"], rollout.stat().st_size)
+        self.assertEqual(coverage["distinct_cwds_scanned"], 1)
+        self.assertEqual(coverage["rollout_associations_counted"], 0)
 
     def test_discover_repos_classifies_append_and_truncation_as_content_change(
         self,
@@ -14384,7 +16388,7 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertEqual(coverage["inspection_reason"], "path_replaced")
         self.assertEqual(pathlib.Path(coverage["source"]), rollout)
 
-    def test_discover_repos_keeps_prior_rows_when_later_record_is_invalid(
+    def test_discover_repos_discards_pending_cwds_when_later_record_is_invalid(
         self,
     ) -> None:
         repo = self.init_repo()
@@ -14396,16 +16400,25 @@ class ProjectJournalTests(unittest.TestCase):
             first_record + b'{"payload":\n'
         )
 
-        rows = project_journal._discover_repos(codex_home, 9999)
+        with mock.patch.object(
+            project_journal,
+            "_repo_root_for_path",
+        ) as resolver:
+            rows = project_journal._discover_repos(codex_home, 9999)
 
+        resolver.assert_not_called()
         self.assertEqual(len(rows), 1)
-        self.assertTrue(os.path.samefile(rows[0]["repo"], repo))
-        self.assertEqual(rows[0]["rollout_count"], 1)
+        self.assertIsNone(rows[0]["repo"])
+        self.assertIsNone(rows[0]["candidate_cwd"])
+        self.assertEqual(rows[0]["rollout_count"], 0)
         self.assertEqual(rows[0]["coverage_status"], "partial")
+        self.assertEqual(rows[0]["adoption_status"], "inconclusive")
+        self.assertIsNone(rows[0]["tracked_journal_adopted"])
         coverage = rows[0]["discovery_error"]["discovery_coverage"]
         self.assertEqual(coverage["parse_reason"], "invalid_json")
         self.assertEqual(coverage["record_number"], 2)
         self.assertEqual(coverage["byte_offset"], len(first_record))
+        self.assertEqual(coverage["rollout_associations_counted"], 0)
 
     def test_normalize_discovery_cwd_applies_caps_before_path_construction(
         self,
@@ -14617,6 +16630,87 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["rollout_count"], 1)
 
+    def test_discover_repos_commits_distinct_cwds_after_rollout_revalidation(
+        self,
+    ) -> None:
+        codex_home = self.root / "codex-home"
+        rollout_dir = codex_home / "sessions/2026/05/05"
+        rollout_dir.mkdir(parents=True)
+        first = str(self.root / "candidate-b")
+        second = str(self.root / "candidate-a")
+        (rollout_dir / "rollout-buffered-cwds.jsonl").write_text(
+            "".join(
+                json.dumps({"payload": {"cwd": cwd}}) + "\n"
+                for cwd in (first, second, first)
+            ),
+            encoding="utf-8",
+        )
+        actual_open_candidate = project_journal._open_rollout_candidate
+        actual_revalidate = project_journal._revalidate_rollout_candidate
+        actual_close = project_journal.os.close
+        candidate_fd: int | None = None
+        events: list[str] = []
+
+        def capture_candidate_fd(
+            candidate: project_journal._RolloutCandidate,
+            state: project_journal._DiscoveryScanState,
+        ) -> int:
+            nonlocal candidate_fd
+            candidate_fd = actual_open_candidate(candidate, state)
+            return candidate_fd
+
+        def record_revalidation(*args: object, **kwargs: object) -> None:
+            events.append("revalidate")
+            actual_revalidate(*args, **kwargs)
+
+        def record_close(fd: int) -> None:
+            if candidate_fd is not None and fd == candidate_fd:
+                events.append("close")
+            actual_close(fd)
+
+        def resolve_candidate(
+            path_text: str,
+            *,
+            codex_home: pathlib.Path | None = None,
+            deadline: float | None = None,
+        ) -> None:
+            del codex_home, deadline
+            events.append(f"resolve:{path_text}")
+            return None
+
+        with mock.patch.object(
+            project_journal,
+            "_open_rollout_candidate",
+            side_effect=capture_candidate_fd,
+        ):
+            with mock.patch.object(
+                project_journal,
+                "_revalidate_rollout_candidate",
+                side_effect=record_revalidation,
+            ):
+                with mock.patch.object(
+                    project_journal.os,
+                    "close",
+                    side_effect=record_close,
+                ):
+                    with mock.patch.object(
+                        project_journal,
+                        "_repo_root_for_path",
+                        side_effect=resolve_candidate,
+                    ):
+                        rows = project_journal._discover_repos(codex_home, 9999)
+
+        self.assertEqual(rows, [])
+        self.assertEqual(
+            events,
+            [
+                "revalidate",
+                "close",
+                f"resolve:{first}",
+                f"resolve:{second}",
+            ],
+        )
+
     def test_discover_repos_bounds_distinct_cwds(self) -> None:
         codex_home = self.root / "codex-home"
         rollout_dir = codex_home / "sessions/2026/05/05"
@@ -14638,13 +16732,19 @@ class ProjectJournalTests(unittest.TestCase):
                 project_journal,
                 "_repo_root_for_path",
                 return_value=None,
-            ):
+            ) as resolver:
                 rows = project_journal._discover_repos(codex_home, 9999)
 
+        resolver.assert_not_called()
         coverage = rows[0]["discovery_error"]["discovery_coverage"]
+        self.assertIsNone(rows[0]["repo"])
+        self.assertIsNone(rows[0]["candidate_cwd"])
+        self.assertEqual(rows[0]["rollout_count"], 0)
         self.assertEqual(rows[0]["coverage_status"], "partial")
         self.assertEqual(coverage["limit_name"], "distinct CWD count")
         self.assertEqual(coverage["observed"], 3)
+        self.assertEqual(coverage["distinct_cwds_scanned"], 2)
+        self.assertEqual(coverage["rollout_associations_counted"], 0)
 
     def test_discover_repos_bounds_aggregate_rollout_associations(self) -> None:
         repo = self.init_repo("association-repo").resolve()
@@ -16043,6 +18143,79 @@ class ProjectJournalTests(unittest.TestCase):
             "access failure",
             failures["unreadable"]["discovery_error"]["repo_resolution"]["message"],
         )
+
+    def test_discover_repos_reports_failed_git_looking_candidate_as_unresolved(
+        self,
+    ) -> None:
+        candidate_root = self.root / "git-looking"
+        candidate = candidate_root / "nested" / "missing"
+        (candidate_root / "nested").mkdir(parents=True)
+        marker = candidate_root / ".git"
+        marker.write_text(
+            "gitdir: ../unavailable-private-git-dir\n",
+            encoding="utf-8",
+        )
+        observed_marker = candidate_root / "nested" / ".." / ".git"
+        codex_home = self.root / "codex-home"
+        rollout_dir = codex_home / "sessions/2026/05/05"
+        rollout_dir.mkdir(parents=True)
+        (rollout_dir / "rollout-git-looking-failure.jsonl").write_text(
+            json.dumps({"payload": {"cwd": str(candidate)}}) + "\n",
+            encoding="utf-8",
+        )
+        failure = subprocess.CompletedProcess(
+            [],
+            128,
+            "",
+            "fatal: injected Git resolution failure",
+        )
+
+        with mock.patch.object(
+            project_journal,
+            "_run_git",
+            return_value=failure,
+        ):
+            rows = project_journal._discover_repos(codex_home, 9999)
+
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertIsNone(row["repo"])
+        self.assertEqual(row["candidate_cwd"], str(candidate))
+        self.assertEqual(row["rollout_count"], 1)
+        self.assertEqual(row["coverage_status"], "complete")
+        self.assertEqual(row["discovery_status"], "inconclusive")
+        self.assertEqual(row["adoption_status"], "inconclusive")
+        self.assertEqual(
+            row["adoption_error"]["code"],
+            "repository_resolution_failed",
+        )
+        self.assertIsNone(row["tracked_journal_adopted"])
+        self.assertIsNone(row["tracked_non_generated_journal_count"])
+        self.assertIsNone(row["valid_tracked_journal_count"])
+        resolution_error = row["discovery_error"]["repo_resolution"]
+        self.assertEqual(
+            resolution_error["code"],
+            "repository_resolution_failed",
+        )
+        self.assertEqual(
+            resolution_error["resolution_reason"],
+            "git_marker_present",
+        )
+        self.assertEqual(resolution_error["marker_kind"], "regular_file")
+        self.assertNotIn("marker_path", resolution_error)
+        self.assertEqual(
+            resolution_error["marker_path_hint"],
+            str(observed_marker),
+        )
+        self.assertEqual(
+            resolution_error["marker_path_status"],
+            "path_unverified",
+        )
+        self.assertIn(
+            "regular file descriptor-relative .git entry",
+            resolution_error["message"],
+        )
+        self.assertIn(str(observed_marker), resolution_error["message"])
 
     def test_discover_repos_shares_resolution_budget_with_adoption(self) -> None:
         repo = self.init_repo("healthy").resolve()
