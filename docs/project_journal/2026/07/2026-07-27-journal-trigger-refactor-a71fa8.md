@@ -433,3 +433,30 @@ superseded_by:
   Each exact directory was verified empty, current-user-owned, and free of
   open process references before `rmdir`; a bounded follow-up inventory found
   no remaining recent `project-journal-git-launch-*` directory.
+- Signed head `e620980` passed exact-secret admission with a clean result and
+  complete temporary cleanup, then was pushed to PR #5. Its first
+  fresh-context named-single workspace materialized and validated cleanly,
+  but the lane was intentionally interrupted and not counted after the
+  head-bound GitHub Actions run exposed a test-harness portability failure.
+  The interrupted workspace passed terminal revalidation, the trusted SKILL
+  and guard hashes remained unchanged, and the exact private workspace was
+  removed after proving it had no open process references.
+- GitHub Actions used Linux Python 3.14.6 and failed only
+  `test_non_utf8_repo_generate_and_hooks_use_exact_raw_path`: the shared
+  `run_git()` test helper requested strict text decoding, while `git init`
+  correctly emitted the repository's raw `0xff` path byte. The resulting
+  `UnicodeDecodeError` occurred in `subprocess` before the product assertions.
+  The helper now fixes its text contract to UTF-8 plus `surrogateescape`, so
+  existing string-based callers remain unchanged while arbitrary Git path
+  bytes round-trip. The Linux integration itself remains the regression for
+  this exact failure.
+- An independent read-only audit checked all 84 `run_git()` call sites.
+  Except for two callers that parse ASCII object IDs, they inspect only return
+  codes or failure diagnostics; none relies on strict UTF-8 rejection.
+  Therefore valid UTF-8 behavior is unchanged and `surrogateescape` is the
+  minimal lossless portability fix. The audit returned `No findings.`
+- Final exact-state full suites after the CI portability fix passed all 420
+  tests in both supported local runtimes: Python 3.13.0 completed in 1016.834
+  seconds with 4 platform skips, and Xcode Python 3.9.6 completed in 1041.244
+  seconds with 5 platform skips. A bounded follow-up inventory found no
+  retained recent Git-launch directory.
