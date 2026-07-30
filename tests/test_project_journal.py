@@ -7734,6 +7734,95 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertIn("\\udcff", decoded)
         self.assertEqual(json.loads(decoded), rows)
 
+    def test_discovery_error_sanitizes_nested_non_utf8_display_fields(
+        self,
+    ) -> None:
+        undecodable_byte = os.fsdecode(b"\xff")
+        error = project_journal.RepositoryResolutionError(
+            pathlib.Path("/repo"),
+            "injected resolution failure",
+            resolution_reason="marker_unreadable",
+            marker_path=pathlib.Path(f"/marker-{undecodable_byte}"),
+            marker_path_hint=pathlib.Path(f"/hint-{undecodable_byte}"),
+        )
+        error.cleanup_errors.append(
+            {
+                "context": f"cleanup-{undecodable_byte}",
+                "error_type": "OSError",
+                "message": f"failure-{undecodable_byte}",
+                "details": [
+                    f"detail-{undecodable_byte}",
+                    {"nested": f"value-{undecodable_byte}"},
+                ],
+            }
+        )
+
+        rendered = project_journal._discovery_error(error)
+        encoded = json.dumps(rendered, ensure_ascii=False).encode(
+            "utf-8",
+            errors="strict",
+        )
+        decoded = encoded.decode("utf-8", errors="strict")
+
+        self.assertEqual(rendered["code"], "repository_resolution_failed")
+        self.assertEqual(rendered["resolution_reason"], "marker_unreadable")
+        self.assertNotIn(undecodable_byte, decoded)
+        self.assertGreaterEqual(decoded.count("\\\\udcff"), 5)
+
+    def test_discovery_json_output_writes_non_utf8_rollout_error_to_strict_sink(
+        self,
+    ) -> None:
+        codex_home = self.root / "codex-home"
+        source = pathlib.Path(os.fsdecode(b"/sessions/rollout-invalid-name-\xff.jsonl"))
+        rollout = project_journal._RolloutCandidate(
+            path=source,
+            object_identity=(1, 2),
+            access_policy=(os.getuid(), os.getgid(), 0o600),
+            size=16,
+            mtime=time.time(),
+            observed_date=project_journal.dt.date(2026, 5, 5),
+        )
+
+        raw_stdout = io.BytesIO()
+        strict_stdout = io.TextIOWrapper(
+            raw_stdout,
+            encoding="utf-8",
+            errors="strict",
+        )
+        args = mock.Mock(
+            codex_home=str(codex_home),
+            since_days=9999,
+            json_output=True,
+        )
+
+        with (
+            mock.patch.object(
+                project_journal,
+                "_iter_rollout_paths",
+                side_effect=([rollout], []),
+            ),
+            mock.patch.object(
+                project_journal,
+                "_extract_cwds",
+                side_effect=project_journal.DiscoveryRolloutParseError(
+                    parse_reason="invalid_json",
+                    record_number=1,
+                    byte_offset=0,
+                    detail="injected parse failure",
+                ),
+            ),
+            mock.patch.object(project_journal.sys, "stdout", strict_stdout),
+        ):
+            project_journal.command_discover_repos(args)
+            strict_stdout.flush()
+
+        rows = json.loads(raw_stdout.getvalue().decode("utf-8", errors="strict"))
+        coverage = rows[0]["discovery_error"]["discovery_coverage"]
+        self.assertEqual(coverage["code"], "discovery_rollout_parse_failed")
+        self.assertEqual(coverage["parse_reason"], "invalid_json")
+        self.assertIn("\\udcff", coverage["source"])
+        self.assertNotIn(os.fsdecode(b"\xff"), coverage["source"])
+
     def test_frontmatter_line_cap_does_not_count_long_body(self) -> None:
         body = "\n".join(
             f"Body line {index}"

@@ -2253,6 +2253,21 @@ def _utf8_safe_display(value: str) -> str:
     return value.encode("utf-8", errors="backslashreplace").decode("utf-8")
 
 
+def _utf8_safe_json_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return _utf8_safe_display(value)
+    if isinstance(value, dict):
+        return {
+            (
+                _utf8_safe_display(key) if isinstance(key, str) else key
+            ): _utf8_safe_json_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_utf8_safe_json_value(item) for item in value]
+    return value
+
+
 def _bounded_journal_path_label(path: str | bytes) -> str:
     raw_path = path if isinstance(path, bytes) else os.fsencode(path)
     display = _utf8_safe_display(os.fsdecode(raw_path))
@@ -11578,7 +11593,7 @@ def _discovery_error(
         error_name = errno.errorcode.get(error_number)
         if error_name is not None:
             error["error_name"] = error_name
-    return error
+    return _utf8_safe_json_value(error)
 
 
 def _enrich_discovered_repo(
@@ -11744,7 +11759,7 @@ def _discovery_coverage_error(
             dict(cleanup_error) for cleanup_error in cleanup_errors
         ]
     error.update(state.coverage_counters())
-    return error
+    return _utf8_safe_json_value(error)
 
 
 def _discovery_row_sort_key(row: dict[str, Any]) -> tuple[str, int]:
