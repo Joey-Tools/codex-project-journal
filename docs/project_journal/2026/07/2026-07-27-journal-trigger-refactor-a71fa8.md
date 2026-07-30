@@ -268,3 +268,50 @@ superseded_by:
   `/bin/sh -n`, `bash -n`, and ShellCheck validation, the installed skill
   validator, project-journal validation, and `git diff --check` passed against
   the same frozen implementation.
+- The fresh whole-range review of signed head `17314a7` found that persistent
+  diagnostic append could follow a symlink or block on a FIFO, and that
+  `dd bs=4096 count=16` counted short pipe reads rather than exact retained
+  bytes. Red evidence reproduced all three failures: the FIFO hook exceeded
+  its five-second bound, the symlink target received the diagnostic, and a
+  fragmented producer lost every fragment after number 14 despite remaining
+  below 64 KiB.
+- Persistent append now opens and binds the resolved Git-path parent and leaf
+  with required no-follow, nonblocking, close-on-exec, directory, and append
+  flags. It requires current-user ownership, no group/world write access, no
+  extended ACL, a regular-file leaf, and stable parent/leaf object identities
+  plus owner/group/mode policies before and after descriptor-only writes.
+  Special targets, unsafe policy, replacement, or inspection uncertainty fail
+  immediately into the hook's independent stderr fallback. The retained
+  diagnostic stage now counts one-byte `dd` input records while batching
+  output into 4 KiB blocks, preserving exactly the first
+  `min(stream bytes, 64 KiB)` despite fragmented pipe writes and still draining
+  the producer.
+- A subsequent read-only implementation audit found that the first fix could
+  still issue a write-mode open against a stable character or block special
+  file before rejecting its type. It also found that the fragmented-stream
+  regression checked only unordered substring presence and that the 64 KiB
+  assertion did not prove the producer was drained. Persistent append now
+  performs a descriptor-relative no-follow leaf stat first, rejects every
+  stable non-regular target before a leaf write-open, and uses
+  `O_CREAT|O_EXCL` when that stat proves the leaf absent.
+- Ten finding-focused tests passed in both supported runtimes: Python 3.13.0
+  completed in 31.008 seconds and Xcode Python 3.9.6 in 31.453 seconds. They
+  cover ordinary append, append-dispatch failure, required parent/leaf and
+  exclusive-create flags, FIFO rejection before leaf open, end-to-end FIFO,
+  symlink, group-writable and post-write-replaced log targets, exact ordered
+  fragmented bytes, and a differentiated 100 KiB producer. The last
+  regression requires an out-of-band producer-completion marker and compares
+  the capture byte-for-byte with its exact 64 KiB prefix, proving both the
+  ceiling and downstream drain.
+- The exact-state Python 3.13.0 full suite passed all 403 tests in 1029.497
+  seconds with 4 platform skips. The simultaneously launched Xcode Python
+  3.9.6 suite reached all 403 tests but recorded one five-second outer timeout
+  in the symlink-log hook regression after 1056.150 seconds; that test then
+  passed three consecutive isolated runs in 6.836 seconds total. A clean
+  non-competing Xcode Python 3.9.6 full rerun passed all 403 tests in 641.546
+  seconds with 5 platform skips, superseding the parallel-load timeout.
+- A final independent read-only implementation audit of stable-special
+  rejection, missing/existing leaf races, descriptor/path revalidation, close
+  precedence, exact truncation, and producer-drain evidence returned
+  `No findings.` It was an informal pre-commit audit, not the formal named
+  review.

@@ -13618,6 +13618,314 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertEqual(list(hook_tmp.iterdir()), [])
         self.assertFalse((repo / ".git/project-journal-index.log").exists())
 
+    @unittest.skipUnless(os.name == "posix", "POSIX FIFO contract")
+    def test_hook_fifo_log_target_falls_back_without_blocking(self) -> None:
+        repo = self.init_repo()
+        journal = self.write_journal(
+            repo,
+            "docs/project_journal/2026/05/2026-05-05-alpha-a1b2c3.md",
+            entry_id="20260505-a1b2c3",
+            title="Alpha Work",
+            status="active",
+            updated="2026-05-05",
+        )
+        journal.write_text(
+            journal.read_text(encoding="utf-8").replace(
+                "status: active",
+                "status: invalid",
+            ),
+            encoding="utf-8",
+        )
+        log = repo / ".git/project-journal-index.log"
+        os.mkfifo(log, 0o600)
+
+        result, hook_tmp = self.run_hook_body(repo, project_journal._hook_body())
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(stat.S_ISFIFO(log.lstat().st_mode))
+        self.assertIn(
+            "index refresh and persistent diagnostic append failed",
+            result.stderr,
+        )
+        self.assertIn("invalid status", result.stderr)
+        self.assertIn("end bounded diagnostic", result.stderr)
+        self.assertEqual(list(hook_tmp.iterdir()), [])
+
+    def test_hook_symlink_log_target_falls_back_without_touching_target(
+        self,
+    ) -> None:
+        repo = self.init_repo()
+        journal = self.write_journal(
+            repo,
+            "docs/project_journal/2026/05/2026-05-05-alpha-a1b2c3.md",
+            entry_id="20260505-a1b2c3",
+            title="Alpha Work",
+            status="active",
+            updated="2026-05-05",
+        )
+        journal.write_text(
+            journal.read_text(encoding="utf-8").replace(
+                "status: active",
+                "status: invalid",
+            ),
+            encoding="utf-8",
+        )
+        target = self.root / "append-target"
+        target.write_text("unchanged\n", encoding="utf-8")
+        log = repo / ".git/project-journal-index.log"
+        log.symlink_to(target)
+
+        result, hook_tmp = self.run_hook_body(repo, project_journal._hook_body())
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(log.is_symlink())
+        self.assertEqual(target.read_text(encoding="utf-8"), "unchanged\n")
+        self.assertIn(
+            "index refresh and persistent diagnostic append failed",
+            result.stderr,
+        )
+        self.assertIn("invalid status", result.stderr)
+        self.assertIn("end bounded diagnostic", result.stderr)
+        self.assertEqual(list(hook_tmp.iterdir()), [])
+
+    def test_hook_group_writable_log_target_falls_back_without_appending(
+        self,
+    ) -> None:
+        repo = self.init_repo()
+        journal = self.write_journal(
+            repo,
+            "docs/project_journal/2026/05/2026-05-05-alpha-a1b2c3.md",
+            entry_id="20260505-a1b2c3",
+            title="Alpha Work",
+            status="active",
+            updated="2026-05-05",
+        )
+        journal.write_text(
+            journal.read_text(encoding="utf-8").replace(
+                "status: active",
+                "status: invalid",
+            ),
+            encoding="utf-8",
+        )
+        log = repo / ".git/project-journal-index.log"
+        log.write_text("unchanged\n", encoding="utf-8")
+        log.chmod(0o620)
+
+        result, hook_tmp = self.run_hook_body(repo, project_journal._hook_body())
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(log.read_text(encoding="utf-8"), "unchanged\n")
+        self.assertIn(
+            "index refresh and persistent diagnostic append failed",
+            result.stderr,
+        )
+        self.assertIn("invalid status", result.stderr)
+        self.assertIn("end bounded diagnostic", result.stderr)
+        self.assertEqual(list(hook_tmp.iterdir()), [])
+
+    @unittest.skipUnless(os.name == "posix", "POSIX FIFO contract")
+    def test_append_hook_log_rejects_fifo_before_leaf_open(self) -> None:
+        repo = self.init_repo()
+        log = repo / ".git/project-journal-index.log"
+        os.mkfifo(log, 0o600)
+        actual_open = os.open
+        open_calls: list[tuple[object, int, int, int | None]] = []
+
+        def capture_open(
+            path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+            flags: int,
+            mode: int = 0o777,
+            *,
+            dir_fd: int | None = None,
+        ) -> int:
+            open_calls.append((path, flags, mode, dir_fd))
+            return actual_open(path, flags, mode, dir_fd=dir_fd)
+
+        args = mock.Mock(repo=str(repo))
+        with (
+            mock.patch.object(project_journal, "_resolve_repo", return_value=repo),
+            mock.patch.object(project_journal, "_git_path", return_value=log),
+            mock.patch.object(project_journal.os, "open", side_effect=capture_open),
+        ):
+            with self.assertRaisesRegex(
+                project_journal.UserError,
+                "not a regular file",
+            ):
+                project_journal.command_append_hook_log(args)
+
+        self.assertEqual(len(open_calls), 1)
+        self.assertEqual(open_calls[0][0], log.parent)
+        self.assertIsNone(open_calls[0][3])
+        self.assertTrue(stat.S_ISFIFO(log.lstat().st_mode))
+
+    def test_append_hook_log_detects_target_replacement_after_write(self) -> None:
+        repo = self.init_repo()
+        log = repo / ".git/project-journal-index.log"
+        log.write_text("original\n", encoding="utf-8")
+        log.chmod(0o600)
+        replacement = log.with_name("replacement-log")
+        replacement.write_text("replacement\n", encoding="utf-8")
+        replacement.chmod(0o600)
+        actual_stat = os.stat
+        leaf_stats = 0
+
+        def replace_before_final_leaf_stat(
+            path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+            *,
+            dir_fd: int | None = None,
+            follow_symlinks: bool = True,
+        ) -> os.stat_result:
+            nonlocal leaf_stats
+            if path == log.name and dir_fd is not None and not follow_symlinks:
+                leaf_stats += 1
+                if leaf_stats == 2:
+                    os.replace(replacement, log)
+            return actual_stat(
+                path,
+                dir_fd=dir_fd,
+                follow_symlinks=follow_symlinks,
+            )
+
+        strict_stdin = io.TextIOWrapper(
+            io.BytesIO(b"new diagnostic\n"),
+            encoding="utf-8",
+        )
+        args = mock.Mock(repo=str(repo))
+        with (
+            mock.patch.object(project_journal, "_resolve_repo", return_value=repo),
+            mock.patch.object(project_journal, "_git_path", return_value=log),
+            mock.patch.object(
+                project_journal.os,
+                "stat",
+                side_effect=replace_before_final_leaf_stat,
+            ),
+            mock.patch.object(project_journal.sys, "stdin", strict_stdin),
+        ):
+            with self.assertRaisesRegex(
+                project_journal.UserError,
+                "identity or access policy changed",
+            ):
+                project_journal.command_append_hook_log(args)
+
+        self.assertEqual(leaf_stats, 2)
+        self.assertEqual(log.read_text(encoding="utf-8"), "replacement\n")
+
+    def test_append_hook_log_requires_secure_parent_and_leaf_open_flags(
+        self,
+    ) -> None:
+        repo = self.init_repo()
+        log = repo / ".git/project-journal-index.log"
+        actual_open = os.open
+        open_calls: list[tuple[object, int, int, int | None]] = []
+
+        def capture_open(
+            path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+            flags: int,
+            mode: int = 0o777,
+            *,
+            dir_fd: int | None = None,
+        ) -> int:
+            open_calls.append((path, flags, mode, dir_fd))
+            return actual_open(path, flags, mode, dir_fd=dir_fd)
+
+        strict_stdin = io.TextIOWrapper(
+            io.BytesIO(b"diagnostic\n"),
+            encoding="utf-8",
+        )
+        args = mock.Mock(repo=str(repo))
+        with (
+            mock.patch.object(project_journal, "_resolve_repo", return_value=repo),
+            mock.patch.object(project_journal, "_git_path", return_value=log),
+            mock.patch.object(project_journal.os, "open", side_effect=capture_open),
+            mock.patch.object(project_journal.sys, "stdin", strict_stdin),
+        ):
+            self.assertEqual(project_journal.command_append_hook_log(args), 0)
+
+        self.assertEqual(len(open_calls), 2)
+        parent_path, parent_flags, _parent_mode, parent_dir_fd = open_calls[0]
+        self.assertEqual(parent_path, log.parent)
+        self.assertIsNone(parent_dir_fd)
+        for flag_name in ("O_CLOEXEC", "O_DIRECTORY", "O_NOFOLLOW", "O_NONBLOCK"):
+            self.assertTrue(
+                parent_flags & getattr(os, flag_name),
+                flag_name,
+            )
+        leaf_path, leaf_flags, leaf_mode, leaf_dir_fd = open_calls[1]
+        self.assertEqual(leaf_path, log.name)
+        self.assertIsNotNone(leaf_dir_fd)
+        self.assertEqual(leaf_mode, 0o600)
+        for flag_name in ("O_APPEND", "O_CLOEXEC", "O_NOFOLLOW", "O_NONBLOCK"):
+            self.assertTrue(
+                leaf_flags & getattr(os, flag_name),
+                flag_name,
+            )
+        self.assertTrue(leaf_flags & os.O_CREAT)
+        self.assertTrue(leaf_flags & os.O_EXCL)
+        self.assertEqual(log.read_bytes(), b"diagnostic\n")
+
+    def test_hook_fragmented_diagnostic_retains_every_byte_below_limit(
+        self,
+    ) -> None:
+        repo = self.init_repo()
+        fake_python = self.root / "fragmented-python"
+        fake_python.write_text(
+            textwrap.dedent(
+                """\
+                #!/bin/sh
+                if [ "$2" = "generate" ]; then
+                  count=0
+                  while [ "$count" -lt 24 ]; do
+                    printf 'fragment-%02d|' "$count"
+                    /bin/sleep 0.01
+                    count=$((count + 1))
+                  done
+                  printf 'fragment-tail-marker'
+                  exit 1
+                fi
+                exit 1
+                """
+            ),
+            encoding="utf-8",
+        )
+        fake_python.chmod(0o700)
+        body = project_journal._hook_body().replace(
+            shlex.quote(sys.executable),
+            shlex.quote(str(fake_python)),
+        )
+
+        result, hook_tmp = self.run_hook_body(repo, body)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "index refresh and persistent diagnostic append failed",
+            result.stderr,
+        )
+        header = (
+            "project-journal: index refresh and persistent diagnostic append "
+            "failed; bounded diagnostic follows\n"
+        )
+        footer = "project-journal: end bounded diagnostic\n"
+        before_capture, header_separator, after_header = result.stderr.partition(header)
+        capture, footer_separator, after_capture = after_header.partition(footer)
+        self.assertEqual(before_capture, "")
+        self.assertEqual(header_separator, header)
+        self.assertEqual(footer_separator, footer)
+        self.assertEqual(after_capture, "")
+        date_line, date_separator, retained_payload = capture.partition("\n")
+        self.assertEqual(date_separator, "\n")
+        time.strptime(date_line, "%Y-%m-%dT%H:%M:%SZ")
+        expected_payload = (
+            "".join(f"fragment-{index:02d}|" for index in range(24))
+            + "fragment-tail-marker"
+        )
+        self.assertEqual(retained_payload, expected_payload)
+        self.assertLessEqual(
+            len(result.stderr.encode("utf-8")),
+            project_journal.MAX_HOOK_DIAGNOSTIC_BYTES + 2048,
+        )
+        self.assertEqual(list(hook_tmp.iterdir()), [])
+        self.assertFalse((repo / ".git/project-journal-index.log").exists())
+
     def test_hook_git_preflight_failure_reports_stderr_and_cleans_buffer(
         self,
     ) -> None:
@@ -13653,28 +13961,48 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertEqual(list(hook_tmp.iterdir()), [])
         self.assertFalse((repo / ".git/project-journal-index.log").exists())
 
-    def test_hook_terminal_diagnostic_is_hard_bounded(self) -> None:
+    def test_hook_terminal_diagnostic_is_hard_bounded_and_drains_producer(
+        self,
+    ) -> None:
         repo = self.init_repo()
         self.assertEqual(
             project_journal.MAX_HOOK_DIAGNOSTIC_BYTES
             % project_journal.HOOK_DIAGNOSTIC_COPY_BLOCK_BYTES,
             0,
         )
+        completion_marker = self.root / "noisy-producer-complete"
+        payload_pattern = (
+            b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz|"
+        )
+        payload_size = 100 * 1024
+        payload = (
+            payload_pattern
+            * ((payload_size + len(payload_pattern) - 1) // len(payload_pattern))
+        )[:payload_size]
         fake_python = self.root / "noisy-python"
         fake_python.write_text(
-            textwrap.dedent(
-                """\
-                #!/bin/sh
-                if [ "$2" = "generate" ]; then
-                  block=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-                  count=0
-                  while [ "$count" -lt 4096 ]; do
-                    printf '%s' "$block"
-                    count=$((count + 1))
-                  done
-                  exit 1
-                fi
-                exit 1
+            f"#!{sys.executable}\n"
+            + textwrap.dedent(
+                f"""\
+                import os
+                import sys
+
+                if len(sys.argv) > 2 and sys.argv[2] == "generate":
+                    pattern = {payload_pattern!r}
+                    size = {payload_size}
+                    payload = (
+                        pattern * ((size + len(pattern) - 1) // len(pattern))
+                    )[:size]
+                    remaining = memoryview(payload)
+                    while remaining:
+                        written = os.write(1, remaining)
+                        if written <= 0:
+                            raise OSError("producer write made no progress")
+                        remaining = remaining[written:]
+                    with open({str(completion_marker)!r}, "xb") as marker:
+                        marker.write(b"complete")
+                    raise SystemExit(1)
+                raise SystemExit(1)
                 """
             ),
             encoding="utf-8",
@@ -13692,7 +14020,29 @@ class ProjectJournalTests(unittest.TestCase):
             "index refresh and persistent diagnostic append failed",
             result.stderr,
         )
-        self.assertIn("end bounded diagnostic", result.stderr)
+        header = (
+            "project-journal: index refresh and persistent diagnostic append "
+            "failed; bounded diagnostic follows\n"
+        )
+        footer = "project-journal: end bounded diagnostic\n"
+        before_capture, header_separator, after_header = result.stderr.partition(header)
+        capture, footer_separator, after_capture = after_header.partition(footer)
+        self.assertEqual(before_capture, "")
+        self.assertEqual(header_separator, header)
+        self.assertEqual(footer_separator, footer)
+        self.assertEqual(after_capture, "")
+        capture_bytes = capture.encode("utf-8")
+        self.assertEqual(len(capture_bytes), project_journal.MAX_HOOK_DIAGNOSTIC_BYTES)
+        date_line, date_separator, _retained_payload = capture.partition("\n")
+        self.assertEqual(date_separator, "\n")
+        time.strptime(date_line, "%Y-%m-%dT%H:%M:%SZ")
+        date_prefix = date_line.encode("utf-8") + b"\n"
+        expected_capture = (
+            date_prefix
+            + payload[: project_journal.MAX_HOOK_DIAGNOSTIC_BYTES - len(date_prefix)]
+        )
+        self.assertEqual(capture_bytes, expected_capture)
+        self.assertEqual(completion_marker.read_bytes(), b"complete")
         self.assertLessEqual(
             len(result.stderr.encode("utf-8")),
             project_journal.MAX_HOOK_DIAGNOSTIC_BYTES + 2048,

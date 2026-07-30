@@ -6576,22 +6576,257 @@ def command_adoption_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _hook_log_directory_identity(
+    path: pathlib.Path,
+    value: os.stat_result,
+) -> tuple[int, int, int, int, int]:
+    if not stat.S_ISDIR(value.st_mode):
+        raise UserError(f"project journal hook log parent is not a directory: {path}")
+    mode = stat.S_IMODE(value.st_mode)
+    if value.st_uid != os.geteuid() or mode & 0o022:
+        raise UserError(
+            "project journal hook log parent must be owned by the current "
+            f"user and not group/world writable: {path}"
+        )
+    return _directory_identity(value)
+
+
+def _hook_log_identity(
+    path: pathlib.Path,
+    value: os.stat_result,
+) -> tuple[int, int, int, int, int, int]:
+    if not stat.S_ISREG(value.st_mode):
+        raise UserError(f"project journal hook log is not a regular file: {path}")
+    mode = stat.S_IMODE(value.st_mode)
+    if value.st_uid != os.geteuid() or mode & 0o022:
+        raise UserError(
+            "project journal hook log must be owned by the current user and "
+            f"not group/world writable: {path}"
+        )
+    return (
+        value.st_dev,
+        value.st_ino,
+        stat.S_IFMT(value.st_mode),
+        value.st_uid,
+        value.st_gid,
+        mode,
+    )
+
+
+def _revalidate_hook_log_directory(
+    parent_fd: int,
+    parent_path: pathlib.Path,
+    expected: tuple[int, int, int, int, int],
+) -> None:
+    try:
+        descriptor_stat = os.fstat(parent_fd)
+        path_stat = os.stat(parent_path, follow_symlinks=False)
+    except OSError as exc:
+        raise UserError(
+            "project journal hook log parent became unavailable during "
+            f"append: {parent_path}: {exc}"
+        ) from exc
+    descriptor_identity = _hook_log_directory_identity(
+        parent_path,
+        descriptor_stat,
+    )
+    path_identity = _hook_log_directory_identity(parent_path, path_stat)
+    _reject_extended_acl(
+        parent_fd,
+        parent_path,
+        "project journal hook log parent",
+    )
+    if descriptor_identity != expected or path_identity != expected:
+        raise UserError(
+            "project journal hook log parent identity or access policy "
+            f"changed during append: {parent_path}"
+        )
+
+
+def _revalidate_hook_log_target(
+    log_fd: int,
+    parent_fd: int,
+    log_path: pathlib.Path,
+    expected: tuple[int, int, int, int, int, int],
+) -> None:
+    try:
+        descriptor_stat = os.fstat(log_fd)
+        path_stat = os.stat(
+            log_path.name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+    except OSError as exc:
+        raise UserError(
+            "project journal hook log became unavailable during append: "
+            f"{log_path}: {exc}"
+        ) from exc
+    descriptor_identity = _hook_log_identity(log_path, descriptor_stat)
+    path_identity = _hook_log_identity(log_path, path_stat)
+    _reject_extended_acl(
+        log_fd,
+        log_path,
+        "project journal hook log",
+    )
+    if descriptor_identity != expected or path_identity != expected:
+        raise UserError(
+            "project journal hook log identity or access policy changed "
+            f"during append: {log_path}"
+        )
+
+
+def _write_hook_log_all(fd: int, content: bytes) -> None:
+    remaining = memoryview(content)
+    while remaining:
+        written = os.write(fd, remaining)
+        if written <= 0:
+            raise OSError(errno.EIO, "hook log append made no progress")
+        remaining = remaining[written:]
+
+
 def command_append_hook_log(args: argparse.Namespace) -> int:
     repo = _resolve_repo(args.repo)
     log_path = _git_path(repo, "project-journal-index.log")
+    parent_flags = (
+        os.O_RDONLY
+        | _required_open_flag("O_CLOEXEC")
+        | _required_open_flag("O_DIRECTORY")
+        | _required_open_flag("O_NOFOLLOW")
+        | _required_open_flag("O_NONBLOCK")
+    )
     try:
-        with log_path.open("ab") as log:
-            while chunk := sys.stdin.buffer.read(64 * 1024):
-                log.write(chunk)
+        parent_fd = os.open(log_path.parent, parent_flags)
     except OSError as exc:
-        raise UserError(f"failed to append project journal hook log: {exc}") from exc
+        raise UserError(
+            "failed to open project journal hook log parent without following "
+            f"links: {log_path.parent}: {exc}"
+        ) from exc
+
+    parent_error: BaseException | None = None
+    try:
+        parent_stat = os.fstat(parent_fd)
+        parent_identity = _hook_log_directory_identity(
+            log_path.parent,
+            parent_stat,
+        )
+        _reject_extended_acl(
+            parent_fd,
+            log_path.parent,
+            "project journal hook log parent",
+        )
+        _revalidate_hook_log_directory(
+            parent_fd,
+            log_path.parent,
+            parent_identity,
+        )
+
+        log_exists = True
+        try:
+            path_before_open = os.stat(
+                log_path.name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            log_exists = False
+        except OSError as exc:
+            raise UserError(
+                "project journal hook log could not be inspected before "
+                f"append: {log_path}: {exc}"
+            ) from exc
+        if log_exists:
+            _hook_log_identity(log_path, path_before_open)
+        _revalidate_hook_log_directory(
+            parent_fd,
+            log_path.parent,
+            parent_identity,
+        )
+
+        log_flags = (
+            os.O_WRONLY
+            | _required_open_flag("O_APPEND")
+            | _required_open_flag("O_CLOEXEC")
+            | _required_open_flag("O_NOFOLLOW")
+            | _required_open_flag("O_NONBLOCK")
+        )
+        if not log_exists:
+            log_flags |= os.O_CREAT | os.O_EXCL
+        try:
+            log_fd = os.open(
+                log_path.name,
+                log_flags,
+                0o600,
+                dir_fd=parent_fd,
+            )
+        except OSError as exc:
+            detail = (
+                "target is a symlink"
+                if exc.errno in {errno.ELOOP, errno.EMLINK}
+                else str(exc)
+            )
+            raise UserError(
+                f"failed to open project journal hook log {log_path}: {detail}"
+            ) from exc
+
+        log_error: BaseException | None = None
+        try:
+            log_stat = os.fstat(log_fd)
+            log_identity = _hook_log_identity(log_path, log_stat)
+            _reject_extended_acl(
+                log_fd,
+                log_path,
+                "project journal hook log",
+            )
+            _revalidate_hook_log_directory(
+                parent_fd,
+                log_path.parent,
+                parent_identity,
+            )
+            _revalidate_hook_log_target(
+                log_fd,
+                parent_fd,
+                log_path,
+                log_identity,
+            )
+            while chunk := sys.stdin.buffer.read(PROCESS_READ_CHUNK_BYTES):
+                _write_hook_log_all(log_fd, chunk)
+            _revalidate_hook_log_target(
+                log_fd,
+                parent_fd,
+                log_path,
+                log_identity,
+            )
+            _revalidate_hook_log_directory(
+                parent_fd,
+                log_path.parent,
+                parent_identity,
+            )
+        except BaseException as error:
+            log_error = error
+            raise
+        finally:
+            _close_descriptor_preserving_error(
+                log_fd,
+                active_error=log_error,
+                context="project journal hook log descriptor cleanup failed",
+                wrap_close_error=lambda message, _error_number: UserError(message),
+            )
+    except BaseException as error:
+        parent_error = error
+        raise
+    finally:
+        _close_descriptor_preserving_error(
+            parent_fd,
+            active_error=parent_error,
+            context="project journal hook log parent descriptor cleanup failed",
+            wrap_close_error=lambda message, _error_number: UserError(message),
+        )
     return 0
 
 
 def _hook_body() -> str:
     python_exe = shlex.quote(sys.executable)
     script_path = shlex.quote(str(pathlib.Path(__file__).resolve()))
-    diagnostic_blocks = MAX_HOOK_DIAGNOSTIC_BYTES // HOOK_DIAGNOSTIC_COPY_BLOCK_BYTES
     return f"""#!/bin/sh
 {HOOK_BEGIN}
 hook_name=${{0##*/}}
@@ -6640,7 +6875,7 @@ if [ -n "$tmp_dir" ] && [ -d "$tmp_dir" ] && [ ! -L "$tmp_dir" ]; then
         printf '%s\n' "$generation_status" >&7
       }} 2>&1
     }} | {{
-      LC_ALL=C dd bs={HOOK_DIAGNOSTIC_COPY_BLOCK_BYTES} count={diagnostic_blocks} >&4 2>/dev/null
+      LC_ALL=C dd ibs=1 obs={HOOK_DIAGNOSTIC_COPY_BLOCK_BYTES} count={MAX_HOOK_DIAGNOSTIC_BYTES} >&4 2>/dev/null
       cat >/dev/null
     }}
     exec 4>&-
@@ -6656,7 +6891,7 @@ if [ -n "$tmp_dir" ] && [ -d "$tmp_dir" ] && [ ! -L "$tmp_dir" ]; then
         trap '' PIPE
         printf '%s\n' \
           'project-journal: index refresh and persistent diagnostic append failed; bounded diagnostic follows' >&2 || true
-        LC_ALL=C dd bs={HOOK_DIAGNOSTIC_COPY_BLOCK_BYTES} count={diagnostic_blocks} <&5 >&2 2>/dev/null || true
+        LC_ALL=C dd ibs=1 obs={HOOK_DIAGNOSTIC_COPY_BLOCK_BYTES} count={MAX_HOOK_DIAGNOSTIC_BYTES} <&5 >&2 2>/dev/null || true
         printf '%s\n' 'project-journal: end bounded diagnostic' >&2 || true
       fi
     fi
