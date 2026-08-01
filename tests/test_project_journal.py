@@ -17758,6 +17758,79 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertIn("type=KeyboardInterrupt", notes)
         self.assertEqual(notes.count("type=KeyboardInterrupt"), 1)
 
+    def test_hook_binding_cleanup_drains_and_retires_after_interclose_interrupt(
+        self,
+    ) -> None:
+        first_ancestor = mock.Mock(fd=757, path=pathlib.Path("/bound/first"))
+        final_ancestor = mock.Mock(fd=758, path=pathlib.Path("/bound/final"))
+        binding = project_journal._HookDirectoryBinding(
+            repo=self.root,
+            plan=project_journal._HookPathPlan(self.root, ()),
+            path=self.root,
+            fd=final_ancestor.fd,
+            identity=(1, 2, 3, 4, 5),
+            ancestors=(first_ancestor, final_ancestor),
+            targets=(),
+            install_lock_fd=756,
+            install_lock_identity=(6, 7, 8, 9, 10, 11),
+        )
+        primary = LegacyInterrupt("injected active hook installation failure")
+        interclose_interrupt = KeyboardInterrupt(
+            "injected interruption between hook descriptor closes"
+        )
+        actual_close_descriptor = project_journal._close_descriptor_preserving_error
+        closed: list[int] = []
+
+        def close_then_interrupt(
+            fd: int,
+            *,
+            active_error: BaseException | None,
+            context: str,
+            wrap_close_error: object,
+        ) -> None:
+            actual_close_descriptor(
+                fd,
+                active_error=active_error,
+                context=context,
+                wrap_close_error=wrap_close_error,
+            )
+            if len(closed) == 1:
+                raise interclose_interrupt
+
+        with (
+            mock.patch.object(
+                project_journal.os,
+                "close",
+                side_effect=closed.append,
+            ),
+            mock.patch.object(
+                project_journal,
+                "_close_descriptor_preserving_error",
+                side_effect=close_then_interrupt,
+            ),
+        ):
+            with self.assertRaises(LegacyInterrupt) as raised:
+                try:
+                    raise primary
+                except LegacyInterrupt as active_error:
+                    project_journal._close_hook_binding(
+                        binding,
+                        active_error=active_error,
+                    )
+                    raise
+
+            self.assertIs(raised.exception, primary)
+            self.assertEqual(closed, [756, 758, 757])
+            self.assertIsNone(binding.install_lock_fd)
+            self.assertIsNone(binding.install_lock_identity)
+            self.assertEqual(binding.ancestors, ())
+            notes = "\n".join(getattr(primary, "__notes__", ()))
+            self.assertIn("type=KeyboardInterrupt", notes)
+            self.assertIn("between hook descriptor closes", notes)
+
+            project_journal._close_hook_binding(binding)
+            self.assertEqual(closed, [756, 758, 757])
+
     def test_hook_binding_cleanup_reports_signal_fence_acquisition_failure(
         self,
     ) -> None:

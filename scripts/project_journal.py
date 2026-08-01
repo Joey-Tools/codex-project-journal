@@ -2211,7 +2211,7 @@ class _BoundHookDirectory:
     access_policy_required: bool
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass
 class _HookDirectoryBinding:
     repo: pathlib.Path
     plan: _HookPathPlan
@@ -7989,8 +7989,10 @@ def _close_hook_binding(
     active_error: BaseException | None = None,
 ) -> None:
     cleanup_error: BaseException | None = None
-    descriptor_count = len(binding.ancestors) + (
-        1 if binding.install_lock_fd is not None else 0
+    owned_ancestors = binding.ancestors
+    owned_install_lock_fd = binding.install_lock_fd
+    descriptor_count = len(owned_ancestors) + (
+        1 if owned_install_lock_fd is not None else 0
     )
 
     try:
@@ -8023,21 +8025,28 @@ def _close_hook_binding(
                 wrap_close_error=lambda message, _error_number: UserError(message),
             )
         except BaseException as error:
-            if evidence_owner is not None:
-                raise
-            cleanup_error = error
+            if evidence_owner is None:
+                cleanup_error = error
+            elif error is not evidence_owner:
+                _add_exception_details(
+                    evidence_owner,
+                    _exception_evidence_details(
+                        error,
+                        context=context,
+                    ),
+                )
 
     restore_error: BaseException | None = None
     try:
         # One fence covers the complete entry-time owner set. Every numeric FD
         # receives one close dispatch before pending SIGINT can run Python.
         # POSIX close failure leaves reuse state uncertain, so never retry it.
-        if binding.install_lock_fd is not None:
+        if owned_install_lock_fd is not None:
             close_descriptor(
-                binding.install_lock_fd,
+                owned_install_lock_fd,
                 context="hook installation lock descriptor cleanup failed",
             )
-        for ancestor in reversed(binding.ancestors):
+        for ancestor in reversed(owned_ancestors):
             close_descriptor(
                 ancestor.fd,
                 context=(
@@ -8045,6 +8054,13 @@ def _close_hook_binding(
                 ),
             )
     finally:
+        # Every entry-time owner is now close-dispatched or represented by the
+        # selected cleanup error. Retire the persistent owner fields before a
+        # mask restore can deliver pending SIGINT and before callers can retry
+        # cleanup against a reused numeric descriptor.
+        binding.install_lock_fd = None
+        binding.install_lock_identity = None
+        binding.ancestors = ()
         try:
             signal_fence.restore()
         except BaseException as error:

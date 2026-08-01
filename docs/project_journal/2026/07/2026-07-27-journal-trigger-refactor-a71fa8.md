@@ -41,6 +41,7 @@ superseded_by:
 - Partial discovery now retains the full coverage/error aggregate on one deterministic anchor only, gives every partial row a stable reference to it, and preserves row-local errors without multiplying the aggregate by the row count.
 - The final GitHub Codex finding is closed by requiring secondary Git metadata to prove that a repository beneath `$CODEX_HOME/worktrees` is standalone or maps to one distinct source root; every unverified mapping is now an inconclusive repository-resolution row without install/generate commands.
 - The subsequent fresh named-single finding is closed by making the discovery caller explicitly own both yielded iterators, surfacing generator-close failures, and delaying coverage serialization until ordered inner/outer cleanup evidence has attached to the frozen primary.
+- The final hook-binding follow-up is closed by retiring the complete entry-time descriptor-owner set before restoring the signal mask, preserving the active error across an inter-close interruption, and making repeated cleanup unable to re-close reused numeric descriptors.
 
 ## Current State
 
@@ -654,3 +655,26 @@ superseded_by:
 - Final exact-state full suites passed all 443 tests in both supported local
   runtimes: Python 3.13.0 completed in 446.961 seconds with 4 platform skips,
   and Xcode Python 3.9.6 completed in 569.791 seconds with 5 platform skips.
+- A final fresh named-single review of signed head `d6d0bf7` found one P2 in
+  `_close_hook_binding()`: its complete close drain was signal-fenced, but the
+  binding retained stale descriptor ownership after dispatch. An interruption
+  between owner close helpers could also escape the local aggregator, skip the
+  remaining entry-time owners, and replace the active operation error.
+- Hook binding ownership is now mutable only for terminal retirement. The
+  function snapshots the complete entry-time owner set, keeps the existing
+  POSIX fence through every single close dispatch, catches and records an
+  inter-close `BaseException` without abandoning the drain, clears the lock and
+  ancestor owner fields before mask restoration, and preserves the priority
+  order active operation -> first close -> restoration. A failed fence
+  acquisition still leaves the owner state intact and performs no unprotected
+  close.
+- The new regression injects `KeyboardInterrupt` after the first close helper
+  returns, proves all three entry-time descriptors are dispatched once, keeps
+  the exact active `LegacyInterrupt` primary with bounded interruption
+  evidence, observes retired lock/ancestor ownership, and proves a second
+  cleanup call performs no repeated close. All 10 focused hook-binding cleanup
+  tests passed in Python 3.13.0 in 0.032 seconds and Xcode Python 3.9.6 in
+  0.021 seconds.
+- Final exact-state full suites passed all 444 tests: Python 3.13.0 completed in
+  579.430 seconds with 4 platform skips, and Xcode Python 3.9.6 completed in
+  571.828 seconds with 5 platform skips.
