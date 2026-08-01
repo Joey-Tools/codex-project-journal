@@ -11179,49 +11179,92 @@ def _source_root_from_linked_worktree(
     repo: pathlib.Path,
     *,
     deadline: float | None = None,
-) -> pathlib.Path | None:
+) -> pathlib.Path:
     deadline_error = "repository discovery exceeded its shared deadline"
-    try:
-        git_dir = _run_git(
-            repo,
-            "rev-parse",
-            "--git-dir",
-            deadline=deadline,
-            deadline_error=deadline_error,
-            operation="Git repository discovery",
-        )
-        common_dir = _run_git(
-            repo,
-            "rev-parse",
-            "--git-common-dir",
-            deadline=deadline,
-            deadline_error=deadline_error,
-            operation="Git repository discovery",
-        )
-    except UnsupportedGitVersion:
-        return None
-    if git_dir.returncode != 0 or common_dir.returncode != 0:
-        return None
 
-    git_dir_path = _git_output_path(
-        repo,
-        git_dir.stdout,
-        label="Git directory lookup",
-    )
-    common_dir_path = _git_output_path(
-        repo,
-        common_dir.stdout,
-        label="Git common-directory lookup",
+    def metadata_path(argument: str, label: str) -> pathlib.Path:
+        try:
+            result = _run_git(
+                repo,
+                "rev-parse",
+                argument,
+                deadline=deadline,
+                deadline_error=deadline_error,
+                operation="Git repository discovery",
+            )
+        except (OSError, UserError) as exc:
+            error = RepositoryResolutionError(
+                repo,
+                "Codex worktree mapping could not be verified because "
+                f"{label} failed: {exc}",
+                resolution_reason="codex_worktree_mapping_unverified",
+                error_number=getattr(exc, "errno", None),
+            )
+            _propagate_bounded_exception_notes(
+                error,
+                exc,
+                context=f"{label} failed",
+            )
+            raise error from exc
+        if result.returncode != 0:
+            raise RepositoryResolutionError(
+                repo,
+                "Codex worktree mapping could not be verified because "
+                f"{label} failed: "
+                f"{_git_result_detail(result, 'Git rev-parse returned a nonzero status')}",
+                resolution_reason="codex_worktree_mapping_unverified",
+            )
+        try:
+            return _git_output_path(repo, result.stdout, label=label)
+        except (OSError, UserError) as exc:
+            error = RepositoryResolutionError(
+                repo,
+                "Codex worktree mapping could not be verified because "
+                f"{label} returned malformed metadata: {exc}",
+                resolution_reason="codex_worktree_mapping_unverified",
+                error_number=getattr(exc, "errno", None),
+            )
+            _propagate_bounded_exception_notes(
+                error,
+                exc,
+                context=f"{label} returned malformed metadata",
+            )
+            raise error from exc
+
+    git_dir_path = metadata_path("--git-dir", "Git directory lookup")
+    common_dir_path = metadata_path(
+        "--git-common-dir",
+        "Git common-directory lookup",
     )
     if git_dir_path == common_dir_path:
-        return None
+        return repo
 
     source = (
         common_dir_path.parent if common_dir_path.name == ".git" else common_dir_path
     )
-    source_root = _repo_root_for_existing_path(source, deadline=deadline)
+    try:
+        source_root = _repo_root_for_existing_path(source, deadline=deadline)
+    except (OSError, UserError) as exc:
+        error = RepositoryResolutionError(
+            repo,
+            "Git metadata identified a linked Codex worktree, but its source "
+            f"repository could not be verified: {exc}",
+            resolution_reason="codex_worktree_mapping_unverified",
+            error_number=getattr(exc, "errno", None),
+        )
+        _propagate_bounded_exception_notes(
+            error,
+            exc,
+            context="Codex worktree source repository lookup failed",
+        )
+        raise error from exc
     if source_root is None or source_root == repo:
-        return None
+        raise RepositoryResolutionError(
+            repo,
+            "Git metadata identified a linked Codex worktree, but its common "
+            "directory did not resolve to a distinct source repository",
+            resolution_reason="codex_worktree_mapping_unverified",
+        )
     return source_root
 
 
@@ -11935,9 +11978,7 @@ def _repo_root_for_path(
     if root is None:
         return None
     if codex_home is not None and _is_relative_to(root, codex_home / "worktrees"):
-        source_root = _source_root_from_linked_worktree(root, deadline=deadline)
-        if source_root is not None:
-            return source_root
+        return _source_root_from_linked_worktree(root, deadline=deadline)
     return root
 
 

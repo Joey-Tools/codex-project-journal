@@ -3,7 +3,7 @@ id: 20260727-a71fa8
 title: Project Journal Trigger Refactor
 status: completed
 created: 2026-07-23
-updated: 2026-07-30
+updated: 2026-07-31
 branch: codex/journal-trigger-refactor
 pr: https://github.com/Joey-Tools/codex-project-journal/pull/5
 supersedes: []
@@ -39,6 +39,7 @@ superseded_by:
 - The repository-resolution owner now distinguishes registered/uncommitted descriptors from close-dispatched descriptors. Its close handoff first queries the entry signal mask without changing it, blocks `SIGINT` plus managed termination signals, commits ownership and dispatches `close(2)`, retires the numeric FD, and only then restores the mask. A second-step mask exception attempts one best-effort rollback to the known entry mask before ownership commits; if rollback also fails, the original failure reports the thread mask state as unverified. Persistent acquisition failure leaves ownership explicit and a drain visits its entry-time FD snapshot once rather than spinning. This exact-once property is deliberately scoped to already-registered FDs and ordinary selected POSIX signal delivery in the single-threaded CLI path, not the `open(2)`-return-to-registration window, trace/thread-state `BaseException` injection, or a pre-kernel mocked close.
 - Indexed-path diagnostics now share one raw-byte-stable 4 KiB display-label rule across validation, `cat-file`, frontmatter, and semantic failures; failed `ls-files` stdout is represented by byte-count/SHA-256 evidence rather than echoed.
 - Partial discovery now retains the full coverage/error aggregate on one deterministic anchor only, gives every partial row a stable reference to it, and preserves row-local errors without multiplying the aggregate by the row count.
+- The final GitHub Codex finding is closed by requiring secondary Git metadata to prove that a repository beneath `$CODEX_HOME/worktrees` is standalone or maps to one distinct source root; every unverified mapping is now an inconclusive repository-resolution row without install/generate commands.
 
 ## Current State
 
@@ -575,3 +576,47 @@ superseded_by:
   `py_compile`, the installed Joey/OpenAI skill validator, both runtimes'
   project journal validation, and `git diff --check`. The two task-scoped
   bytecode caches were removed with the protected cleanup helper.
+- Signed head `bccf397` passed exact-secret admission with complete temporary
+  cleanup, was pushed to PR #5, and passed Linux Python 3.14.6 CI. A fresh
+  independently materialized, strictly read-only whole-range named-single
+  review returned `No findings.`; terminal guard validation passed, the
+  trusted skill/guard digests remained unchanged, and the owner-private review
+  workspace was removed only after proving no process held it.
+- A fully paginated request-ledger race close proved zero requests on
+  `bccf397` and no unresolved historical run. The one exact `@codex review`
+  request was comment `5137568215`. Exact-bot terminal review `4824321375`,
+  bound to `bccf397`, returned one P2: secondary `--git-dir` or
+  `--git-common-dir` failure beneath `$CODEX_HOME/worktrees` returned `None`,
+  so discovery could publish an unverifiable disposable worktree as a normal
+  repository.
+- Secondary metadata lookup now has only two successful outcomes: equal
+  normalized Git/common directories prove and return the standalone root, or
+  a distinct common directory independently resolves to a distinct source
+  root. Unsupported/runtime errors, nonzero exits, malformed framing,
+  unresolved or self-mapped sources, and source-resolution errors all emit
+  `repository_resolution_failed` with
+  `codex_worktree_mapping_unverified`; source cause, errno, and bounded notes
+  remain attached. The unresolved row contains no repository or install/
+  generate command.
+- Seven focused positive, fail-closed, evidence-preservation, user-visible
+  row, and documentation regressions passed in both supported runtimes:
+  Python 3.13.0 completed in 10.198 seconds and Xcode Python 3.9.6 in 9.533
+  seconds. Ruff check/format and `git diff --check` passed. An independent
+  read-only audit checked both positive branches, every failure family,
+  deadline reuse, exception priority, and row output and returned
+  `No findings.`
+- The exact-state Python 3.13.0 full suite passed all 437 tests in 1008.005
+  seconds with 4 platform skips. A concurrent Xcode Python 3.9.6 run exposed
+  one failure in the pre-existing descendant-process-group timeout regression;
+  after the concurrent load ended, that exact test passed once and then three
+  consecutive repetitions. The authoritative sequential Xcode Python 3.9.6
+  full suite then passed all 437 tests in 709.152 seconds with 5 platform
+  skips.
+- Final post-evidence verification passed Ruff check/format, both runtimes'
+  `py_compile`, both runtimes' project journal validation,
+  `agents/openai.yaml` parsing, SKILL frontmatter/body and referenced-resource
+  checks, and `git diff --check`. The installed OpenAI quick validator could
+  not import its unbundled PyYAML dependency in the selected runtime, so the
+  documented explicit fallback checks were used without installing a new
+  dependency. The task-scoped bytecode cache was removed after owner/mode and
+  no-open-holder checks.

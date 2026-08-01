@@ -8457,6 +8457,185 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertEqual(rendered[0]["repo"], "/source-\\udcff")
         self.assertEqual(rendered[0]["adoption_status"], "unadopted")
 
+    def test_codex_worktree_mapping_failures_are_repository_errors(self) -> None:
+        codex_home = self.root / "codex-home"
+        worktree = codex_home / "worktrees/c122/repo"
+        git_dir = worktree / ".git/worktrees/repo"
+        common_dir = self.root / "source/.git"
+        git_dir_success = subprocess.CompletedProcess(
+            [],
+            0,
+            f"{git_dir}\n",
+            "",
+        )
+        failure = subprocess.CompletedProcess(
+            [],
+            128,
+            "",
+            "fatal: injected mapping failure",
+        )
+        cases: tuple[tuple[str, list[object]], ...] = (
+            (
+                "unsupported_git_dir",
+                [project_journal.UnsupportedGitVersion("injected unsupported Git")],
+            ),
+            ("git_dir_nonzero", [failure]),
+            (
+                "unsupported_common_dir",
+                [
+                    git_dir_success,
+                    project_journal.UnsupportedGitVersion("injected unsupported Git"),
+                ],
+            ),
+            ("common_dir_nonzero", [git_dir_success, failure]),
+            (
+                "malformed_git_dir",
+                [subprocess.CompletedProcess([], 0, str(git_dir), "")],
+            ),
+            (
+                "malformed_common_dir",
+                [
+                    git_dir_success,
+                    subprocess.CompletedProcess([], 0, str(common_dir), ""),
+                ],
+            ),
+        )
+
+        for name, git_results in cases:
+            with self.subTest(name=name):
+                with (
+                    mock.patch.object(
+                        project_journal,
+                        "_repo_root_for_existing_path",
+                        return_value=worktree,
+                    ),
+                    mock.patch.object(
+                        project_journal,
+                        "_run_git",
+                        side_effect=list(git_results),
+                    ),
+                    self.assertRaises(
+                        project_journal.RepositoryResolutionError
+                    ) as raised,
+                ):
+                    project_journal._repo_root_for_path(
+                        str(worktree),
+                        codex_home=codex_home,
+                        deadline=time.monotonic() + 1,
+                    )
+
+                self.assertEqual(
+                    raised.exception.resolution_reason,
+                    "codex_worktree_mapping_unverified",
+                )
+
+    def test_codex_linked_worktree_requires_verified_source_root(self) -> None:
+        codex_home = self.root / "codex-home"
+        worktree = codex_home / "worktrees/c122/repo"
+        source = self.root / "source"
+        git_results = [
+            subprocess.CompletedProcess(
+                [],
+                0,
+                f"{worktree / '.git/worktrees/repo'}\n",
+                "",
+            ),
+            subprocess.CompletedProcess([], 0, f"{source / '.git'}\n", ""),
+        ]
+
+        for source_result in (None, worktree):
+            with self.subTest(source_result=source_result):
+
+                def existing_root(
+                    path: pathlib.Path,
+                    *,
+                    deadline: float | None = None,
+                ) -> pathlib.Path | None:
+                    del deadline
+                    if path == worktree:
+                        return worktree
+                    if path == source:
+                        return source_result
+                    self.fail(f"unexpected repository root probe: {path!r}")
+
+                with (
+                    mock.patch.object(
+                        project_journal,
+                        "_repo_root_for_existing_path",
+                        side_effect=existing_root,
+                    ),
+                    mock.patch.object(
+                        project_journal,
+                        "_run_git",
+                        side_effect=list(git_results),
+                    ),
+                    self.assertRaises(
+                        project_journal.RepositoryResolutionError
+                    ) as raised,
+                ):
+                    project_journal._repo_root_for_path(
+                        str(worktree),
+                        codex_home=codex_home,
+                        deadline=time.monotonic() + 1,
+                    )
+
+                self.assertEqual(
+                    raised.exception.resolution_reason,
+                    "codex_worktree_mapping_unverified",
+                )
+                self.assertIn(
+                    "did not resolve to a distinct source repository",
+                    str(raised.exception),
+                )
+
+    def test_codex_linked_worktree_source_error_preserves_evidence(self) -> None:
+        codex_home = self.root / "codex-home"
+        worktree = codex_home / "worktrees/c122/repo"
+        source = self.root / "source"
+        source_error = OSError(errno.EACCES, "injected source lookup failure")
+        source_error.__notes__ = ["injected cleanup evidence"]
+        git_results = [
+            subprocess.CompletedProcess(
+                [],
+                0,
+                f"{worktree / '.git/worktrees/repo'}\n",
+                "",
+            ),
+            subprocess.CompletedProcess([], 0, f"{source / '.git'}\n", ""),
+        ]
+
+        with (
+            mock.patch.object(
+                project_journal,
+                "_repo_root_for_existing_path",
+                side_effect=[worktree, source_error],
+            ),
+            mock.patch.object(
+                project_journal,
+                "_run_git",
+                side_effect=git_results,
+            ),
+            self.assertRaises(project_journal.RepositoryResolutionError) as raised,
+        ):
+            project_journal._repo_root_for_path(
+                str(worktree),
+                codex_home=codex_home,
+                deadline=time.monotonic() + 1,
+            )
+
+        self.assertIs(raised.exception.__cause__, source_error)
+        self.assertEqual(raised.exception.errno, errno.EACCES)
+        self.assertEqual(
+            raised.exception.resolution_reason,
+            "codex_worktree_mapping_unverified",
+        )
+        self.assertTrue(
+            any(
+                "injected cleanup evidence" in note
+                for note in getattr(raised.exception, "__notes__", ())
+            )
+        )
+
     def test_discovery_json_output_writes_non_utf8_hooks_path_error_to_strict_sink(
         self,
     ) -> None:
@@ -13146,6 +13325,19 @@ class ProjectJournalTests(unittest.TestCase):
         )
         self.assertIn("<target-repo>/scripts/project_journal.py", skill)
         self.assertNotIn("Use `scripts/project_journal.py validate", skill)
+
+    def test_codex_worktree_mapping_fail_closed_contract_is_documented(
+        self,
+    ) -> None:
+        for document in (
+            SKILL_MD.read_text(encoding="utf-8"),
+            README_MD.read_text(encoding="utf-8"),
+        ):
+            self.assertIn("$CODEX_HOME/worktrees", document)
+            self.assertIn("--git-dir", document)
+            self.assertIn("--git-common-dir", document)
+            self.assertIn("codex_worktree_mapping_unverified", document)
+            self.assertIn("disposable Codex worktree", document)
 
     def test_skill_limits_auto_trigger_and_requires_first_adoption_need(self) -> None:
         skill = SKILL_MD.read_text(encoding="utf-8")
@@ -23942,6 +24134,60 @@ class ProjectJournalTests(unittest.TestCase):
         rows = json.loads(result.stdout)
         self.assertEqual(len(rows), 1)
         self.assertEqual(pathlib.Path(rows[0]["repo"]), repo.resolve())
+
+    def test_discover_repos_does_not_publish_unverified_codex_worktree(
+        self,
+    ) -> None:
+        codex_home = (self.root / "codex-home").resolve()
+        repo_parent = codex_home / "worktrees/c122"
+        repo_parent.mkdir(parents=True)
+        repo = self.init_repo("codex-home/worktrees/c122/repo").resolve()
+        rollout_dir = codex_home / "sessions/2026/05/05"
+        rollout_dir.mkdir(parents=True)
+        (rollout_dir / "rollout-unverified-worktree.jsonl").write_text(
+            json.dumps({"payload": {"cwd": str(repo)}}) + "\n",
+            encoding="utf-8",
+        )
+        original_run_git = project_journal._run_git
+
+        def fail_mapping_lookup(
+            candidate: pathlib.Path,
+            *args: str,
+            **kwargs: object,
+        ) -> subprocess.CompletedProcess[str]:
+            if candidate == repo and args == ("rev-parse", "--git-dir"):
+                return subprocess.CompletedProcess(
+                    [],
+                    128,
+                    "",
+                    "fatal: injected mapping failure",
+                )
+            return original_run_git(candidate, *args, **kwargs)
+
+        with mock.patch.object(
+            project_journal,
+            "_run_git",
+            side_effect=fail_mapping_lookup,
+        ):
+            rows = project_journal._discover_repos(codex_home, 9999)
+
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertIsNone(row["repo"])
+        self.assertEqual(row["candidate_cwd"], str(repo))
+        self.assertEqual(row["discovery_status"], "inconclusive")
+        self.assertEqual(row["adoption_status"], "inconclusive")
+        self.assertIsNone(row["install_command"])
+        self.assertIsNone(row["generate_command"])
+        resolution_error = row["discovery_error"]["repo_resolution"]
+        self.assertEqual(
+            resolution_error["code"],
+            "repository_resolution_failed",
+        )
+        self.assertEqual(
+            resolution_error["resolution_reason"],
+            "codex_worktree_mapping_unverified",
+        )
 
     def test_discover_repos_deduplicates_cwd_resolution(self) -> None:
         repo = self.init_repo()
