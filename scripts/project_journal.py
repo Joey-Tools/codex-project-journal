@@ -9610,6 +9610,7 @@ def _record_rollout_cleanup_error(
     *,
     context: str,
     cleanup_error: BaseException,
+    include_cleanup_notes: bool = True,
 ) -> None:
     message = str(cleanup_error).replace("\0", "\\0")
     if len(message) > MAX_DISCOVERY_ERROR_DETAIL_CHARS:
@@ -9625,11 +9626,15 @@ def _record_rollout_cleanup_error(
         error_name = errno.errorcode.get(error_number)
         if error_name is not None:
             evidence["error_name"] = error_name
-    cleanup_notes = [
-        _bounded_signal_report_detail(note)
-        for note in getattr(cleanup_error, "__notes__", ())
-        if isinstance(note, str)
-    ][:MAX_DEFERRED_SIGNAL_REPORT_DETAILS]
+    cleanup_notes = (
+        [
+            _bounded_signal_report_detail(note)
+            for note in getattr(cleanup_error, "__notes__", ())
+            if isinstance(note, str)
+        ][:MAX_DEFERRED_SIGNAL_REPORT_DETAILS]
+        if include_cleanup_notes
+        else []
+    )
     if cleanup_notes:
         evidence["details"] = cleanup_notes
     cleanup_errors = getattr(error, "cleanup_errors", None)
@@ -9653,19 +9658,49 @@ def _record_rollout_cleanup_error(
     )
 
 
-def _inherit_rollout_cleanup_errors(
-    primary: _RolloutInspectionFailure,
-    superseded: _RolloutInspectionFailure,
+def _mark_rollout_iterator_cleanup_error(
+    error: BaseException,
+    *,
+    context: str,
 ) -> None:
-    primary_errors = getattr(primary.error, "cleanup_errors", None)
+    if isinstance(
+        getattr(error, "rollout_iterator_cleanup_context", None),
+        str,
+    ):
+        return
+    try:
+        error.rollout_iterator_cleanup_context = context
+    except (AttributeError, TypeError):
+        _add_exception_detail(
+            error,
+            f"rollout iterator cleanup context: {context}",
+        )
+
+
+def _detach_discovery_coverage_exception(error: BaseException) -> None:
+    error.__traceback__ = None
+    error.__context__ = None
+    error.__cause__ = None
+
+
+def _inherit_rollout_cleanup_error_details(
+    primary_error: BaseException,
+    superseded_error: BaseException,
+) -> None:
+    primary_errors = getattr(primary_error, "cleanup_errors", None)
     if not isinstance(primary_errors, list):
         primary_errors = []
-        primary.error.cleanup_errors = primary_errors
-    superseded_errors = getattr(superseded.error, "cleanup_errors", ())
+        try:
+            primary_error.cleanup_errors = primary_errors
+        except (AttributeError, TypeError):
+            primary_errors = None
+    superseded_errors = getattr(superseded_error, "cleanup_errors", ())
     if not isinstance(superseded_errors, (list, tuple)):
         superseded_errors = ()
     for cleanup_error in superseded_errors:
-        if len(primary_errors) >= MAX_DEFERRED_SIGNAL_REPORT_DETAILS:
+        if primary_errors is None or (
+            len(primary_errors) >= MAX_DEFERRED_SIGNAL_REPORT_DETAILS
+        ):
             break
         inherited = dict(cleanup_error)
         details = inherited.get("details")
@@ -9673,8 +9708,18 @@ def _inherit_rollout_cleanup_errors(
             inherited["details"] = list(details)
         primary_errors.append(inherited)
     _add_exception_details(
+        primary_error,
+        getattr(superseded_error, "__notes__", ()),
+    )
+
+
+def _inherit_rollout_cleanup_errors(
+    primary: _RolloutInspectionFailure,
+    superseded: _RolloutInspectionFailure,
+) -> None:
+    _inherit_rollout_cleanup_error_details(
         primary.error,
-        getattr(superseded.error, "__notes__", ()),
+        superseded.error,
     )
 
 
@@ -9687,6 +9732,31 @@ def _close_rollout_descriptor_preserving_error(
     try:
         os.close(fd)
     except BaseException as cleanup_error:
+        _record_rollout_cleanup_error(
+            error,
+            context=context,
+            cleanup_error=cleanup_error,
+        )
+
+
+def _close_rollout_iterator_preserving_error(
+    iterator: Any,
+    error: BaseException | None,
+    *,
+    context: str,
+) -> None:
+    close = getattr(iterator, "close", None)
+    if not callable(close):
+        return
+    try:
+        close()
+    except BaseException as cleanup_error:
+        if error is None:
+            _mark_rollout_iterator_cleanup_error(
+                cleanup_error,
+                context=context,
+            )
+            raise
         _record_rollout_cleanup_error(
             error,
             context=context,
@@ -10341,11 +10411,16 @@ def _close_rollout_directory_frame(frame: _RolloutDirectoryFrame) -> None:
         if cleanup_error is None:
             cleanup_error = exc
         else:
-            _add_exception_detail(
+            _record_rollout_cleanup_error(
                 cleanup_error,
-                f"rollout directory descriptor cleanup also failed: {exc}",
+                context="rollout directory descriptor cleanup also failed",
+                cleanup_error=exc,
             )
     if cleanup_error is not None:
+        _mark_rollout_iterator_cleanup_error(
+            cleanup_error,
+            context="rollout directory frame cleanup",
+        )
         raise cleanup_error
 
 
@@ -10369,9 +10444,12 @@ def _close_rollout_directory_frames(
         return
     if active_error is None:
         raise cleanup_error
-    _add_exception_detail(
+    if isinstance(active_error, GeneratorExit):
+        raise cleanup_error
+    _record_rollout_cleanup_error(
         active_error,
-        f"rollout directory frame cleanup failed: {cleanup_error}",
+        context="rollout directory frame cleanup after iteration failure",
+        cleanup_error=cleanup_error,
     )
 
 
@@ -11104,6 +11182,16 @@ def _extract_cwds(
             first_bytes,
             state,
         )
+    except GeneratorExit:
+        try:
+            os.close(fd)
+        except BaseException as cleanup_error:
+            _mark_rollout_iterator_cleanup_error(
+                cleanup_error,
+                context="rollout descriptor cleanup after generator close",
+            )
+            raise
+        raise
     except BaseException as exc:
         _close_rollout_descriptor_preserving_error(
             fd,
@@ -11112,7 +11200,14 @@ def _extract_cwds(
         )
         raise
     else:
-        os.close(fd)
+        try:
+            os.close(fd)
+        except BaseException as cleanup_error:
+            _mark_rollout_iterator_cleanup_error(
+                cleanup_error,
+                context="rollout descriptor cleanup after extraction",
+            )
+            raise
 
 
 def _normalize_discovery_cwd(cwd: str) -> str:
@@ -12498,6 +12593,7 @@ def _discovery_coverage_error(
     state: _DiscoveryScanState,
     *,
     source: pathlib.Path,
+    coverage_counters: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     error = _discovery_error(exc)
     error["source"] = str(source)
@@ -12526,7 +12622,9 @@ def _discovery_coverage_error(
         error["cleanup_errors"] = [
             dict(cleanup_error) for cleanup_error in cleanup_errors
         ]
-    error.update(state.coverage_counters())
+    error.update(
+        state.coverage_counters() if coverage_counters is None else coverage_counters
+    )
     return _utf8_safe_json_value(error)
 
 
@@ -12621,34 +12719,54 @@ def _discover_repos(codex_home: pathlib.Path, since_days: int) -> list[dict[str,
     known_rollouts: set[str] = set()
     counted_repo_rollouts: set[tuple[str, pathlib.Path]] = set()
     counted_unresolved_rollouts: set[tuple[str, str]] = set()
-    coverage_errors: list[dict[str, Any]] = []
+    pending_coverage_errors: list[
+        tuple[BaseException, pathlib.Path, dict[str, int]]
+    ] = []
     coverage_error_count = 0
     stop_all_sources = False
 
     def record_coverage_error(
         exc: BaseException,
         source: pathlib.Path,
-    ) -> None:
+    ) -> BaseException:
         nonlocal coverage_error_count, stop_all_sources
         coverage_error_count += 1
-        error = _discovery_coverage_error(exc, state, source=source)
-        if len(coverage_errors) < MAX_DISCOVERY_ERRORS:
-            coverage_errors.append(error)
+        counters = state.coverage_counters()
+        selected_error = exc
+        if len(pending_coverage_errors) < MAX_DISCOVERY_ERRORS:
+            pending_coverage_errors.append((exc, source, counters))
         if coverage_error_count > MAX_DISCOVERY_ERRORS:
-            limit_error = _discovery_coverage_error(
-                DiscoveryLimitExceeded(
-                    "coverage error count",
-                    MAX_DISCOVERY_ERRORS,
-                    coverage_error_count,
-                ),
-                state,
-                source=source,
+            selected_error = DiscoveryLimitExceeded(
+                "coverage error count",
+                MAX_DISCOVERY_ERRORS,
+                coverage_error_count,
             )
-            if coverage_errors:
-                coverage_errors[-1] = limit_error
+            cleanup_context = getattr(
+                exc,
+                "rollout_iterator_cleanup_context",
+                None,
+            )
+            if isinstance(cleanup_context, str):
+                _record_rollout_cleanup_error(
+                    selected_error,
+                    context=cleanup_context,
+                    cleanup_error=exc,
+                    include_cleanup_notes=False,
+                )
+            _inherit_rollout_cleanup_error_details(selected_error, exc)
+            if pending_coverage_errors:
+                pending_coverage_errors[-1] = (
+                    selected_error,
+                    source,
+                    counters,
+                )
             else:
-                coverage_errors.append(limit_error)
+                pending_coverage_errors.append((selected_error, source, counters))
             stop_all_sources = True
+        _detach_discovery_coverage_exception(exc)
+        if selected_error is not exc:
+            _detach_discovery_coverage_exception(selected_error)
+        return selected_error
 
     def count_rollout_association(
         associations: set[tuple[str, Any]],
@@ -12667,11 +12785,14 @@ def _discover_repos(codex_home: pathlib.Path, since_days: int) -> list[dict[str,
     ):
         if stop_all_sources:
             break
+        rollouts: Any = None
         try:
-            rollouts = _iter_rollout_paths(
-                rollout_root,
-                state,
-                recurse_directories=recurse_directories,
+            rollouts = iter(
+                _iter_rollout_paths(
+                    rollout_root,
+                    state,
+                    recurse_directories=recurse_directories,
+                )
             )
             for rollout_value in rollouts:
                 if stop_all_sources:
@@ -12707,14 +12828,31 @@ def _discover_repos(codex_home: pathlib.Path, since_days: int) -> list[dict[str,
                     last_seen = _rollout_last_seen(rollout)
                     pending_cwds: list[str] = []
                     cwds_for_rollout: set[str] = set()
-                    for raw_cwd in _extract_cwds(rollout, state):
-                        state.check_deadline()
-                        cwd = _normalize_discovery_cwd(raw_cwd)
-                        state.add_cwd(cwd)
-                        if cwd in cwds_for_rollout:
-                            continue
-                        cwds_for_rollout.add(cwd)
-                        pending_cwds.append(cwd)
+                    cwd_values = iter(_extract_cwds(rollout, state))
+                    try:
+                        for raw_cwd in cwd_values:
+                            state.check_deadline()
+                            cwd = _normalize_discovery_cwd(raw_cwd)
+                            state.add_cwd(cwd)
+                            if cwd in cwds_for_rollout:
+                                continue
+                            cwds_for_rollout.add(cwd)
+                            pending_cwds.append(cwd)
+                    except BaseException as exc:
+                        _close_rollout_iterator_preserving_error(
+                            cwd_values,
+                            exc,
+                            context=(
+                                "rollout CWD iterator cleanup after consumer failure"
+                            ),
+                        )
+                        raise
+                    else:
+                        _close_rollout_iterator_preserving_error(
+                            cwd_values,
+                            None,
+                            context="rollout CWD iterator cleanup",
+                        )
                     for cwd in pending_cwds:
                         state.check_deadline()
                         if cwd not in resolved_roots:
@@ -12812,20 +12950,67 @@ def _discover_repos(codex_home: pathlib.Path, since_days: int) -> list[dict[str,
                         )
                     state.check_deadline()
                 except (DiscoveryDeadlineExceeded, DiscoveryLimitExceeded) as exc:
-                    record_coverage_error(exc, rollout_path)
+                    selected_error = record_coverage_error(exc, rollout_path)
                     stop_all_sources = True
+                    _close_rollout_iterator_preserving_error(
+                        rollouts,
+                        selected_error,
+                        context=(
+                            "rollout path iterator cleanup after terminal "
+                            "rollout failure"
+                        ),
+                    )
+                    break
                 except (
                     DiscoveryCwdValidationError,
                     DiscoveryRolloutInspectionError,
                     DiscoveryRolloutParseError,
                     OSError,
                 ) as exc:
-                    record_coverage_error(exc, rollout_path)
+                    selected_error = record_coverage_error(exc, rollout_path)
+                    if stop_all_sources:
+                        _close_rollout_iterator_preserving_error(
+                            rollouts,
+                            selected_error,
+                            context=(
+                                "rollout path iterator cleanup after "
+                                "coverage error limit"
+                            ),
+                        )
+                        break
         except (DiscoveryDeadlineExceeded, DiscoveryLimitExceeded) as exc:
+            _close_rollout_iterator_preserving_error(
+                rollouts,
+                exc,
+                context=(
+                    "rollout path iterator cleanup after terminal enumeration failure"
+                ),
+            )
             record_coverage_error(exc, rollout_root)
             stop_all_sources = True
         except OSError as exc:
+            _close_rollout_iterator_preserving_error(
+                rollouts,
+                exc,
+                context="rollout path iterator cleanup after enumeration failure",
+            )
             record_coverage_error(exc, rollout_root)
+        except BaseException as exc:
+            _close_rollout_iterator_preserving_error(
+                rollouts,
+                exc,
+                context="rollout path iterator cleanup after unexpected failure",
+            )
+            raise
+        else:
+            try:
+                _close_rollout_iterator_preserving_error(
+                    rollouts,
+                    None,
+                    context="rollout path iterator cleanup",
+                )
+            except OSError as exc:
+                record_coverage_error(exc, rollout_root)
 
     if not stop_all_sources:
         try:
@@ -12833,6 +13018,15 @@ def _discover_repos(codex_home: pathlib.Path, since_days: int) -> list[dict[str,
         except DiscoveryDeadlineExceeded as exc:
             record_coverage_error(exc, codex_home)
 
+    coverage_errors = [
+        _discovery_coverage_error(
+            exc,
+            state,
+            source=source,
+            coverage_counters=coverage_counters,
+        )
+        for exc, source, coverage_counters in pending_coverage_errors
+    ]
     rows = [*seen.values(), *unresolved.values()]
     if coverage_errors:
         rows = _mark_partial_discovery_coverage(

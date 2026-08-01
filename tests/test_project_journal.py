@@ -13606,6 +13606,18 @@ class ProjectJournalTests(unittest.TestCase):
             skill,
         )
         self.assertIn(
+            "explicitly owns and closes both the rollout-path and rollout-CWD iterators",
+            skill,
+        )
+        self.assertIn(
+            "Freeze each primary's coverage counters when it is selected",
+            skill,
+        )
+        self.assertIn(
+            "clear its traceback/context/cause after the handled error is no longer re-raised",
+            skill,
+        )
+        self.assertIn(
             "bind the retained lexical current path once with required `O_DIRECTORY|O_CLOEXEC|O_NONBLOCK`",
             skill,
         )
@@ -13891,6 +13903,18 @@ class ProjectJournalTests(unittest.TestCase):
         )
         self.assertIn(
             "failed rollout discards its pending buffer without rolling back aggregate byte, record, verification-byte, or distinct-CWD counters",
+            readme,
+        )
+        self.assertIn(
+            "caller explicitly owns and closes both yielded iterators before coverage serialization",
+            readme,
+        )
+        self.assertIn(
+            "cannot disappear with `GeneratorExit`",
+            readme,
+        )
+        self.assertIn(
+            "sheds traceback/context/cause references once it will no longer be re-raised",
             readme,
         )
         self.assertIn(
@@ -20015,7 +20039,9 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertEqual(cleanup["errno"], errno.EIO)
         self.assertIn("extraction close failure", cleanup["message"])
 
-    def test_rollout_generator_cleanup_preserves_generator_exit(self) -> None:
+    def test_rollout_generator_close_surfaces_descriptor_cleanup_failure(
+        self,
+    ) -> None:
         path = self.root / "rollout-generator-close.jsonl"
         path.write_text(
             json.dumps({"payload": {"cwd": str(self.root)}}) + "\n",
@@ -20045,20 +20071,401 @@ class ProjectJournalTests(unittest.TestCase):
             "close",
             side_effect=close_then_fail,
         ):
-            with mock.patch.object(
-                project_journal,
-                "_record_rollout_cleanup_error",
-                wraps=project_journal._record_rollout_cleanup_error,
-            ) as recorder:
+            with self.assertRaisesRegex(
+                OSError,
+                "generator cleanup close failure",
+            ) as raised:
                 generator.close()
 
-        self.assertEqual(recorder.call_count, 1)
-        primary = recorder.call_args.args[0]
-        self.assertIsInstance(primary, GeneratorExit)
-        self.assertEqual(len(primary.cleanup_errors), 1)
-        cleanup = primary.cleanup_errors[0]
+        self.assertEqual(raised.exception.errno, errno.EIO)
+
+    def test_rollout_path_generator_close_surfaces_frame_cleanup_failures(
+        self,
+    ) -> None:
+        rollout_root = self.root / "sessions"
+        rollout_dir = rollout_root / "2099/01/01"
+        rollout_dir.mkdir(parents=True)
+        (rollout_dir / "rollout-close.jsonl").write_text(
+            "{}\n",
+            encoding="utf-8",
+        )
+        state = project_journal._DiscoveryScanState(
+            deadline=time.monotonic() + 5,
+        )
+        generator = iter(
+            project_journal._iter_rollout_paths(
+                rollout_root,
+                state,
+                recurse_directories=True,
+            )
+        )
+        self.assertIsInstance(
+            next(generator),
+            project_journal._RolloutCandidate,
+        )
+        actual_close_frame = project_journal._close_rollout_directory_frame
+        close_count = 0
+
+        def close_then_fail(
+            frame: project_journal._RolloutDirectoryFrame,
+        ) -> None:
+            nonlocal close_count
+            actual_close_frame(frame)
+            close_count += 1
+            if close_count == 1:
+                raise OSError(errno.EIO, "injected first frame close failure")
+            if close_count == 2:
+                raise OSError(errno.EBADF, "injected second frame close failure")
+
+        with mock.patch.object(
+            project_journal,
+            "_close_rollout_directory_frame",
+            side_effect=close_then_fail,
+        ):
+            with self.assertRaisesRegex(
+                OSError,
+                "first frame close failure",
+            ) as raised:
+                generator.close()
+
+        self.assertGreaterEqual(close_count, 4)
+        notes = "\n".join(getattr(raised.exception, "__notes__", ()))
+        self.assertIn("another rollout directory frame cleanup failed", notes)
+        self.assertIn("second frame close failure", notes)
+
+    def test_discover_repos_preserves_invalid_cwd_when_close_fails(self) -> None:
+        codex_home = self.root / "codex-home-invalid-cwd-close"
+        rollout_dir = codex_home / "sessions/2099/01/01"
+        rollout_dir.mkdir(parents=True)
+        rollout = rollout_dir / "rollout-invalid-cwd-close.jsonl"
+        rollout.write_text(
+            "".join(
+                (
+                    json.dumps({"payload": {"cwd": "/repo/\x00"}}) + "\n",
+                    json.dumps({"payload": {"cwd": "/not-consumed"}}) + "\n",
+                )
+            ),
+            encoding="utf-8",
+        )
+        actual_open = project_journal._open_rollout_candidate
+        actual_close = project_journal.os.close
+        candidate_fd: int | None = None
+        close_failed = False
+
+        def capture_candidate_fd(
+            candidate: project_journal._RolloutCandidate,
+            state: project_journal._DiscoveryScanState,
+        ) -> int:
+            nonlocal candidate_fd
+            candidate_fd = actual_open(candidate, state)
+            return candidate_fd
+
+        def close_candidate_then_fail(fd: int) -> None:
+            nonlocal close_failed
+            actual_close(fd)
+            if fd == candidate_fd and not close_failed:
+                close_failed = True
+                raise OSError(
+                    errno.EIO,
+                    "injected invalid-CWD descriptor close failure",
+                )
+
+        with mock.patch.object(
+            project_journal,
+            "_open_rollout_candidate",
+            side_effect=capture_candidate_fd,
+        ):
+            with mock.patch.object(
+                project_journal.os,
+                "close",
+                side_effect=close_candidate_then_fail,
+            ):
+                with mock.patch.object(
+                    project_journal,
+                    "_repo_root_for_path",
+                ) as resolver:
+                    rows = project_journal._discover_repos(codex_home, 9999)
+
+        self.assertTrue(close_failed)
+        resolver.assert_not_called()
+        coverage = rows[0]["discovery_error"]["discovery_coverage"]
+        self.assertEqual(coverage["code"], "discovery_cwd_invalid")
+        self.assertEqual(coverage["validation_reason"], "nul_byte")
+        self.assertEqual(len(coverage["cleanup_errors"]), 1)
+        cleanup = coverage["cleanup_errors"][0]
         self.assertEqual(cleanup["errno"], errno.EIO)
-        self.assertIn("generator cleanup close failure", cleanup["message"])
+        self.assertIn("invalid-CWD descriptor close failure", cleanup["message"])
+
+    def test_discover_repos_preserves_limit_across_inner_and_outer_close_failures(
+        self,
+    ) -> None:
+        codex_home = self.root / "codex-home-limit-close"
+        rollout_dir = codex_home / "sessions/2099/01/01"
+        rollout_dir.mkdir(parents=True)
+        rollout = rollout_dir / "rollout-limit-close.jsonl"
+        rollout.write_text(
+            "".join(
+                json.dumps({"payload": {"cwd": f"/candidate-{index}"}}) + "\n"
+                for index in range(3)
+            ),
+            encoding="utf-8",
+        )
+        actual_open = project_journal._open_rollout_candidate
+        actual_close = project_journal.os.close
+        actual_close_frame = project_journal._close_rollout_directory_frame
+        candidate_fd: int | None = None
+        candidate_close_failed = False
+        frame_close_failed = False
+
+        def capture_candidate_fd(
+            candidate: project_journal._RolloutCandidate,
+            state: project_journal._DiscoveryScanState,
+        ) -> int:
+            nonlocal candidate_fd
+            candidate_fd = actual_open(candidate, state)
+            return candidate_fd
+
+        def close_candidate_then_fail(fd: int) -> None:
+            nonlocal candidate_close_failed
+            actual_close(fd)
+            if fd == candidate_fd and not candidate_close_failed:
+                candidate_close_failed = True
+                raise OSError(
+                    errno.EIO,
+                    "injected limit descriptor close failure",
+                )
+
+        def close_frame_then_fail(
+            frame: project_journal._RolloutDirectoryFrame,
+        ) -> None:
+            nonlocal frame_close_failed
+            actual_close_frame(frame)
+            if not frame_close_failed:
+                frame_close_failed = True
+                raise OSError(
+                    errno.EBUSY,
+                    "injected limit frame close failure",
+                )
+
+        with mock.patch.object(
+            project_journal,
+            "MAX_DISCOVERY_DISTINCT_CWDS",
+            2,
+        ):
+            with mock.patch.object(
+                project_journal,
+                "_open_rollout_candidate",
+                side_effect=capture_candidate_fd,
+            ):
+                with mock.patch.object(
+                    project_journal.os,
+                    "close",
+                    side_effect=close_candidate_then_fail,
+                ):
+                    with mock.patch.object(
+                        project_journal,
+                        "_close_rollout_directory_frame",
+                        side_effect=close_frame_then_fail,
+                    ):
+                        with mock.patch.object(
+                            project_journal,
+                            "_repo_root_for_path",
+                        ) as resolver:
+                            rows = project_journal._discover_repos(
+                                codex_home,
+                                9999,
+                            )
+
+        self.assertTrue(candidate_close_failed)
+        self.assertTrue(frame_close_failed)
+        resolver.assert_not_called()
+        coverage = rows[0]["discovery_error"]["discovery_coverage"]
+        self.assertEqual(coverage["code"], "discovery_limit_exceeded")
+        self.assertEqual(coverage["limit_name"], "distinct CWD count")
+        self.assertEqual(coverage["observed"], 3)
+        self.assertEqual(len(coverage["cleanup_errors"]), 2)
+        self.assertIn(
+            "limit descriptor close failure",
+            coverage["cleanup_errors"][0]["message"],
+        )
+        self.assertIn(
+            "limit frame close failure",
+            coverage["cleanup_errors"][1]["message"],
+        )
+
+    def test_discover_repos_preserves_outer_close_failure_on_error_count_limit(
+        self,
+    ) -> None:
+        codex_home = self.root / "codex-home-error-count-close"
+        rollout_dir = codex_home / "sessions/2099/01/01"
+        rollout_dir.mkdir(parents=True)
+        for index in range(2):
+            (rollout_dir / f"rollout-invalid-{index}.jsonl").write_text(
+                json.dumps({"payload": {"cwd": f"/repo-{index}/\x00"}}) + "\n",
+                encoding="utf-8",
+            )
+        actual_normalize = project_journal._normalize_discovery_cwd
+        actual_close_frame = project_journal._close_rollout_directory_frame
+        invalid_count = 0
+        frame_close_failed = False
+
+        def count_invalid_cwd(cwd: str) -> str:
+            nonlocal invalid_count
+            invalid_count += 1
+            return actual_normalize(cwd)
+
+        def close_frame_then_fail(
+            frame: project_journal._RolloutDirectoryFrame,
+        ) -> None:
+            nonlocal frame_close_failed
+            actual_close_frame(frame)
+            if invalid_count >= 2 and not frame_close_failed:
+                frame_close_failed = True
+                raise OSError(
+                    errno.EIO,
+                    "injected error-count frame close failure",
+                )
+
+        with mock.patch.object(project_journal, "MAX_DISCOVERY_ERRORS", 1):
+            with mock.patch.object(
+                project_journal,
+                "_normalize_discovery_cwd",
+                side_effect=count_invalid_cwd,
+            ):
+                with mock.patch.object(
+                    project_journal,
+                    "_close_rollout_directory_frame",
+                    side_effect=close_frame_then_fail,
+                ):
+                    rows = project_journal._discover_repos(codex_home, 9999)
+
+        self.assertEqual(invalid_count, 2)
+        self.assertTrue(frame_close_failed)
+        coverage = rows[0]["discovery_error"]["discovery_coverage"]
+        self.assertEqual(coverage["error_count"], 2)
+        self.assertEqual(len(coverage["errors"]), 1)
+        terminal = coverage["errors"][0]
+        self.assertEqual(terminal["code"], "discovery_limit_exceeded")
+        self.assertEqual(terminal["limit_name"], "coverage error count")
+        self.assertEqual(terminal["observed"], 2)
+        self.assertEqual(len(terminal["cleanup_errors"]), 1)
+        self.assertIn(
+            "error-count frame close failure",
+            terminal["cleanup_errors"][0]["message"],
+        )
+
+    def test_discover_repos_preserves_ordered_standalone_close_failures_at_cap(
+        self,
+    ) -> None:
+        codex_home = self.root / "codex-home-standalone-close-cap"
+        rollout_dir = codex_home / "sessions/2099/01/01"
+        rollout_dir.mkdir(parents=True)
+        (rollout_dir / "rollout-invalid.jsonl").write_text(
+            json.dumps({"payload": {"cwd": "/repo/\x00"}}) + "\n",
+            encoding="utf-8",
+        )
+        actual_close_frame = project_journal._close_rollout_directory_frame
+        actual_close = project_journal.os.close
+        descriptor_failure_fd: int | None = None
+        entry_close_failed = False
+        descriptor_close_failed = False
+
+        def inject_same_frame_close_failures(
+            frame: project_journal._RolloutDirectoryFrame,
+        ) -> None:
+            nonlocal descriptor_failure_fd, entry_close_failed
+            if entry_close_failed:
+                actual_close_frame(frame)
+                return
+            frame.entries.close()
+            failing_entries = mock.Mock()
+            failing_entries.close.side_effect = OSError(
+                errno.EIO,
+                "injected standalone entry close failure",
+            )
+            frame.entries = failing_entries
+            descriptor_failure_fd = frame.binding.fd
+            entry_close_failed = True
+            actual_close_frame(frame)
+
+        def close_descriptor_then_fail(fd: int) -> None:
+            nonlocal descriptor_close_failed
+            actual_close(fd)
+            if fd == descriptor_failure_fd and not descriptor_close_failed:
+                descriptor_close_failed = True
+                raise OSError(
+                    errno.EBADF,
+                    "injected standalone descriptor close failure",
+                )
+
+        with mock.patch.object(project_journal, "MAX_DISCOVERY_ERRORS", 1):
+            with mock.patch.object(
+                project_journal,
+                "_close_rollout_directory_frame",
+                side_effect=inject_same_frame_close_failures,
+            ):
+                with mock.patch.object(
+                    project_journal.os,
+                    "close",
+                    side_effect=close_descriptor_then_fail,
+                ):
+                    rows = project_journal._discover_repos(codex_home, 9999)
+
+        self.assertTrue(entry_close_failed)
+        self.assertTrue(descriptor_close_failed)
+        coverage = rows[0]["discovery_error"]["discovery_coverage"]
+        self.assertEqual(coverage["error_count"], 2)
+        self.assertEqual(len(coverage["errors"]), 1)
+        terminal = coverage["errors"][0]
+        self.assertEqual(terminal["code"], "discovery_limit_exceeded")
+        self.assertEqual(terminal["limit_name"], "coverage error count")
+        self.assertEqual(terminal["observed"], 2)
+        self.assertEqual(len(terminal["cleanup_errors"]), 2)
+        primary_cleanup, secondary_cleanup = terminal["cleanup_errors"]
+        self.assertEqual(primary_cleanup["errno"], errno.EIO)
+        self.assertEqual(
+            primary_cleanup["context"],
+            "rollout directory frame cleanup",
+        )
+        self.assertIn("entry close failure", primary_cleanup["message"])
+        self.assertNotIn("details", primary_cleanup)
+        self.assertEqual(secondary_cleanup["errno"], errno.EBADF)
+        self.assertIn("descriptor close failure", secondary_cleanup["message"])
+
+    def test_discover_repos_detaches_retained_error_tracebacks(self) -> None:
+        codex_home = self.root / "codex-home-detached-coverage-errors"
+        rollout_dir = codex_home / "sessions/2099/01/01"
+        rollout_dir.mkdir(parents=True)
+        (rollout_dir / "rollout-invalid.jsonl").write_bytes(b'{"payload":\n')
+        actual_coverage_error = project_journal._discovery_coverage_error
+        retained_chains: list[tuple[object | None, object | None, object | None]] = []
+
+        def capture_retained_chain(
+            exc: BaseException,
+            state: project_journal._DiscoveryScanState,
+            *,
+            source: pathlib.Path,
+            coverage_counters: dict[str, int] | None = None,
+        ) -> dict[str, object]:
+            retained_chains.append((exc.__traceback__, exc.__context__, exc.__cause__))
+            return actual_coverage_error(
+                exc,
+                state,
+                source=source,
+                coverage_counters=coverage_counters,
+            )
+
+        with mock.patch.object(
+            project_journal,
+            "_discovery_coverage_error",
+            side_effect=capture_retained_chain,
+        ):
+            rows = project_journal._discover_repos(codex_home, 9999)
+
+        self.assertEqual(retained_chains, [(None, None, None)])
+        coverage = rows[0]["discovery_error"]["discovery_coverage"]
+        self.assertEqual(coverage["code"], "discovery_rollout_parse_failed")
+        self.assertEqual(coverage["parse_reason"], "invalid_json")
 
     def test_discover_repos_reads_archive_without_active_sessions(self) -> None:
         repo = self.init_repo()

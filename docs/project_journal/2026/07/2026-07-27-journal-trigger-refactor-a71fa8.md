@@ -3,7 +3,7 @@ id: 20260727-a71fa8
 title: Project Journal Trigger Refactor
 status: completed
 created: 2026-07-23
-updated: 2026-07-31
+updated: 2026-08-01
 branch: codex/journal-trigger-refactor
 pr: https://github.com/Joey-Tools/codex-project-journal/pull/5
 supersedes: []
@@ -40,6 +40,7 @@ superseded_by:
 - Indexed-path diagnostics now share one raw-byte-stable 4 KiB display-label rule across validation, `cat-file`, frontmatter, and semantic failures; failed `ls-files` stdout is represented by byte-count/SHA-256 evidence rather than echoed.
 - Partial discovery now retains the full coverage/error aggregate on one deterministic anchor only, gives every partial row a stable reference to it, and preserves row-local errors without multiplying the aggregate by the row count.
 - The final GitHub Codex finding is closed by requiring secondary Git metadata to prove that a repository beneath `$CODEX_HOME/worktrees` is standalone or maps to one distinct source root; every unverified mapping is now an inconclusive repository-resolution row without install/generate commands.
+- The subsequent fresh named-single finding is closed by making the discovery caller explicitly own both yielded iterators, surfacing generator-close failures, and delaying coverage serialization until ordered inner/outer cleanup evidence has attached to the frozen primary.
 
 ## Current State
 
@@ -620,3 +621,36 @@ superseded_by:
   documented explicit fallback checks were used without installing a new
   dependency. The task-scoped bytecode cache was removed after owner/mode and
   no-open-holder checks.
+- A fresh independently materialized named-single review of signed head
+  `b22676b` found one P2: invalid-CWD or terminal deadline/limit exits could
+  abandon the rollout-CWD and rollout-path generators without an explicit
+  close, allowing cleanup evidence attached to `GeneratorExit` to disappear.
+- The discovery caller now explicitly closes both iterators. The exact scan
+  error remains primary; rollout-descriptor and directory-frame close failures
+  are retained in order as bounded `cleanup_errors`. Retained coverage errors
+  keep counters frozen at selection time and are serialized only after cleanup,
+  including when the retained-error cap selects its synthetic terminal limit.
+- Five new resource-ownership regressions and all 64 `discover-repos` tests
+  passed in both supported runtimes. Python 3.13.0 completed the discovery set
+  in 54.660 seconds and Xcode Python 3.9.6 in 59.357 seconds; all 30 rollout
+  tests passed in 15.879 and 16.253 seconds respectively. Full-suite and final
+  delivery evidence are recorded in the later checkpoints below.
+- A parallel read-only implementation audit then found two bounded-state
+  follow-ups: a standalone close failure selected as the `MAX+1` coverage
+  error could disappear behind the synthetic error-count primary, and retained
+  live tracebacks could pin the large rollout parser frame until final
+  serialization. Close-only provenance now promotes that exact failure into
+  the synthetic primary's cleanup evidence, while every handled retained error
+  sheds traceback/context/cause references without losing its bounded fields,
+  notes, or later cleanup attachments. The two new regressions and all 66
+  `discover-repos` tests passed in both supported runtimes before the final
+  full-suite gates below.
+- The final audit found and closed two evidence-order refinements: a standalone
+  close primary now precedes its nested frame cleanup under the synthetic cap,
+  and same-frame entry-iterator plus descriptor failures are both structured
+  rather than leaving the second only in an unserialized note. The exact
+  same-frame two-fault regression passed under both runtimes, and the final
+  read-only implementation audit returned `No findings.`
+- Final exact-state full suites passed all 443 tests in both supported local
+  runtimes: Python 3.13.0 completed in 446.961 seconds with 4 platform skips,
+  and Xcode Python 3.9.6 completed in 569.791 seconds with 5 platform skips.
