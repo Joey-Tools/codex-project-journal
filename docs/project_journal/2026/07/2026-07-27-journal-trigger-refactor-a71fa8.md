@@ -3,7 +3,7 @@ id: 20260727-a71fa8
 title: Project Journal Trigger Refactor
 status: completed
 created: 2026-07-23
-updated: 2026-08-01
+updated: 2026-08-03
 branch: codex/journal-trigger-refactor
 pr: https://github.com/Joey-Tools/codex-project-journal/pull/5
 supersedes: []
@@ -678,3 +678,19 @@ superseded_by:
 - Final exact-state full suites passed all 444 tests: Python 3.13.0 completed in
   579.430 seconds with 4 platform skips, and Xcode Python 3.9.6 completed in
   571.828 seconds with 5 platform skips.
+- The local CrashReporter follow-up separates the real default-action SIGQUIT
+  case from ordinary discovery. Local SIGHUP/SIGTERM coverage still proves
+  deferred process-group cleanup with real signals, while a custom-handler
+  SIGQUIT test proves action return, cleanup, and propagation ordering without
+  terminating the local test runner. The fatal integration remains in the
+  repository and runs only when
+  `PROJECT_JOURNAL_RUN_FATAL_SIGNAL_TESTS=1`; GitHub Actions fails closed when
+  the repository variable is missing or differs from that exact value.
+- The exact local state passed all 446 tests in 478.015 seconds with the fatal
+  opt-in explicitly absent, plus Ruff, actionlint 1.7.12, Python compilation,
+  and `git diff --check`. Signed commit `573f349` then passed hosted Python
+  3.14.6 CI: all 446 ordinary tests passed, the workflow observed the exact
+  repository variable value `1`, and the separately selected fatal SIGQUIT
+  integration ran one test in 2.794 seconds and returned `OK` rather than a
+  skip. An independent read-only audit found no default-action local SIGQUIT
+  path or CI false-positive route.
