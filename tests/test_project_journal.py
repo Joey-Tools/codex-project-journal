@@ -11590,195 +11590,273 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertEqual(marker.read_text(encoding="utf-8"), "terminal")
         self.assertIn("received SIGTERM", process.stderr)
 
+    def _assert_helper_defers_terminal_signal_until_git_group_cleanup(
+        self,
+        signum: int,
+    ) -> None:
+        case = self.root / f"deferred-{signal.Signals(signum).name.lower()}"
+        fake_bin = case / "bin"
+        fake_bin.mkdir(parents=True)
+        temp_root = case / "tmp"
+        temp_root.mkdir()
+        ready = case / "descendant.ready"
+        survived = case / "descendant.survived"
+        fake_git = fake_bin / "git"
+        fake_git.write_text(
+            f"#!{sys.executable}\n"
+            f"PJ_SIGNAL_READY = {str(ready)!r}\n"
+            f"PJ_SIGNAL_SURVIVED = {str(survived)!r}\n"
+            + textwrap.dedent(
+                """\
+                import os
+                import pathlib
+                import signal
+                import subprocess
+                import sys
+                import time
+
+                if sys.argv[1:] == ["--version"]:
+                    print("git version 2.45.1")
+                    raise SystemExit(0)
+
+                if sys.argv[1:] == ["--project-journal-descendant"]:
+                    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                    pathlib.Path(PJ_SIGNAL_READY).write_text(
+                        str(os.getpid()),
+                        encoding="utf-8",
+                    )
+                    time.sleep(0.75)
+                    pathlib.Path(PJ_SIGNAL_SURVIVED).write_text(
+                        "survived",
+                        encoding="utf-8",
+                    )
+                    raise SystemExit(0)
+
+                subprocess.Popen(
+                    [sys.executable, __file__, "--project-journal-descendant"],
+                    stdin=subprocess.DEVNULL,
+                )
+                deadline = time.monotonic() + 5
+                ready = pathlib.Path(PJ_SIGNAL_READY)
+                while not ready.exists():
+                    if time.monotonic() >= deadline:
+                        raise SystemExit("descendant did not become ready")
+                    time.sleep(0.005)
+                time.sleep(30)
+                """
+            ),
+            encoding="utf-8",
+        )
+        fake_git.chmod(0o755)
+        driver = case / "signal-git-driver.py"
+        driver.write_text(
+            textwrap.dedent(
+                """\
+                import importlib.util
+                import pathlib
+                import sys
+                import time
+
+                repo, source_text, script_text = sys.argv[1:]
+                spec = importlib.util.spec_from_file_location(
+                    "project_journal_signal_git_driver",
+                    script_text,
+                )
+                assert spec is not None
+                assert spec.loader is not None
+                module = importlib.util.module_from_spec(spec)
+                sys.modules[spec.name] = module
+                spec.loader.exec_module(module)
+                old_runtime = module._GIT_RUNTIME
+                if old_runtime is not None:
+                    old_runtime.snapshot_owner.cleanup()
+                source = pathlib.Path(source_text)
+                (
+                    snapshot,
+                    digest,
+                    snapshot_identity,
+                    directory_identity,
+                    _launcher_kind,
+                    snapshot_owner,
+                ) = module._snapshot_git_executable(
+                    source,
+                    expected_source_identity=module._git_source_identity(
+                        source.stat()
+                    ),
+                    deadline=time.monotonic() + 5,
+                )
+                module._GIT_RUNTIME = module._GitRuntime(
+                    executable=snapshot,
+                    source_executable=source,
+                    launcher_kind="test-script",
+                    version=(2, 45, 1),
+                    digest=digest,
+                    file_identity=snapshot_identity,
+                    directory_identity=directory_identity,
+                    snapshot_owner=snapshot_owner,
+                )
+                module._GIT_RUNTIME_ERROR = None
+                raise SystemExit(
+                    module.main(
+                        ["adoption-status", "--repo", repo]
+                    )
+                )
+                """
+            ),
+            encoding="utf-8",
+        )
+        env = {
+            "PATH": os.environ.get("PATH", ""),
+            "HOME": str(self.home),
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "TMPDIR": str(temp_root),
+        }
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                str(driver),
+                str(case),
+                str(fake_git),
+                str(SCRIPT),
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+        )
+        try:
+            deadline = time.monotonic() + 8
+            while not ready.exists():
+                if process.poll() is not None:
+                    stdout, stderr = process.communicate()
+                    self.fail(
+                        "helper exited before its Git descendant was ready: "
+                        f"stdout={stdout!r} stderr={stderr!r}"
+                    )
+                if time.monotonic() >= deadline:
+                    self.fail("helper Git descendant did not become ready")
+                time.sleep(0.01)
+
+            process.send_signal(signum)
+            stdout, stderr = process.communicate(timeout=8)
+            self.assertEqual(stdout, "")
+            self.assertEqual(process.returncode, -signum, stderr)
+            self.assertIn(
+                f"received {signal.Signals(signum).name}",
+                stderr,
+            )
+            self.assertIn(
+                "protected cleanup reached a terminal state",
+                stderr,
+            )
+            time.sleep(0.9)
+            self.assertFalse(
+                survived.exists(),
+                "launch-owned descendant survived deferred cleanup",
+            )
+            self.assertEqual(
+                list(temp_root.glob("project-journal-git-runtime-*")),
+                [],
+            )
+            self.assertEqual(
+                list(temp_root.glob("project-journal-git-launch-*")),
+                [],
+            )
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.communicate()
+            if ready.exists():
+                try:
+                    os.kill(
+                        int(ready.read_text(encoding="utf-8")), signal.SIGKILL
+                    )
+                except (ProcessLookupError, ValueError):
+                    pass
+
     @unittest.skipUnless(
         os.name == "posix"
-        and all(hasattr(signal, name) for name in ("SIGHUP", "SIGTERM", "SIGQUIT")),
+        and all(hasattr(signal, name) for name in ("SIGHUP", "SIGTERM")),
         "POSIX deferred termination contract",
     )
     def test_helper_defers_terminal_signals_until_git_group_cleanup(self) -> None:
-        for signum in (signal.SIGHUP, signal.SIGTERM, signal.SIGQUIT):
+        for signum in (signal.SIGHUP, signal.SIGTERM):
             with self.subTest(signal=signal.Signals(signum).name):
-                case = self.root / f"deferred-{signal.Signals(signum).name.lower()}"
-                fake_bin = case / "bin"
-                fake_bin.mkdir(parents=True)
-                temp_root = case / "tmp"
-                temp_root.mkdir()
-                ready = case / "descendant.ready"
-                survived = case / "descendant.survived"
-                fake_git = fake_bin / "git"
-                fake_git.write_text(
-                    f"#!{sys.executable}\n"
-                    f"PJ_SIGNAL_READY = {str(ready)!r}\n"
-                    f"PJ_SIGNAL_SURVIVED = {str(survived)!r}\n"
-                    + textwrap.dedent(
-                        """\
-                        import os
-                        import pathlib
-                        import signal
-                        import subprocess
-                        import sys
-                        import time
-
-                        if sys.argv[1:] == ["--version"]:
-                            print("git version 2.45.1")
-                            raise SystemExit(0)
-
-                        if sys.argv[1:] == ["--project-journal-descendant"]:
-                            signal.signal(signal.SIGTERM, signal.SIG_IGN)
-                            pathlib.Path(PJ_SIGNAL_READY).write_text(
-                                str(os.getpid()),
-                                encoding="utf-8",
-                            )
-                            time.sleep(0.75)
-                            pathlib.Path(PJ_SIGNAL_SURVIVED).write_text(
-                                "survived",
-                                encoding="utf-8",
-                            )
-                            raise SystemExit(0)
-
-                        subprocess.Popen(
-                            [sys.executable, __file__, "--project-journal-descendant"],
-                            stdin=subprocess.DEVNULL,
-                        )
-                        deadline = time.monotonic() + 5
-                        ready = pathlib.Path(PJ_SIGNAL_READY)
-                        while not ready.exists():
-                            if time.monotonic() >= deadline:
-                                raise SystemExit("descendant did not become ready")
-                            time.sleep(0.005)
-                        time.sleep(30)
-                        """
-                    ),
-                    encoding="utf-8",
+                self._assert_helper_defers_terminal_signal_until_git_group_cleanup(
+                    signum
                 )
-                fake_git.chmod(0o755)
-                driver = case / "signal-git-driver.py"
-                driver.write_text(
-                    textwrap.dedent(
-                        """\
-                        import importlib.util
-                        import pathlib
-                        import sys
-                        import time
 
-                        repo, source_text, script_text = sys.argv[1:]
-                        spec = importlib.util.spec_from_file_location(
-                            "project_journal_signal_git_driver",
-                            script_text,
-                        )
-                        assert spec is not None
-                        assert spec.loader is not None
-                        module = importlib.util.module_from_spec(spec)
-                        sys.modules[spec.name] = module
-                        spec.loader.exec_module(module)
-                        old_runtime = module._GIT_RUNTIME
-                        if old_runtime is not None:
-                            old_runtime.snapshot_owner.cleanup()
-                        source = pathlib.Path(source_text)
-                        (
-                            snapshot,
-                            digest,
-                            snapshot_identity,
-                            directory_identity,
-                            _launcher_kind,
-                            snapshot_owner,
-                        ) = module._snapshot_git_executable(
-                            source,
-                            expected_source_identity=module._git_source_identity(
-                                source.stat()
-                            ),
-                            deadline=time.monotonic() + 5,
-                        )
-                        module._GIT_RUNTIME = module._GitRuntime(
-                            executable=snapshot,
-                            source_executable=source,
-                            launcher_kind="test-script",
-                            version=(2, 45, 1),
-                            digest=digest,
-                            file_identity=snapshot_identity,
-                            directory_identity=directory_identity,
-                            snapshot_owner=snapshot_owner,
-                        )
-                        module._GIT_RUNTIME_ERROR = None
-                        raise SystemExit(
-                            module.main(
-                                ["adoption-status", "--repo", repo]
-                            )
-                        )
-                        """
-                    ),
-                    encoding="utf-8",
-                )
-                env = {
-                    "PATH": os.environ.get("PATH", ""),
-                    "HOME": str(self.home),
-                    "GIT_CONFIG_NOSYSTEM": "1",
-                    "PYTHONDONTWRITEBYTECODE": "1",
-                    "TMPDIR": str(temp_root),
-                }
-                process = subprocess.Popen(
-                    [
-                        sys.executable,
-                        str(driver),
-                        str(case),
-                        str(fake_git),
-                        str(SCRIPT),
-                    ],
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    env=env,
-                )
-                try:
-                    deadline = time.monotonic() + 8
-                    while not ready.exists():
-                        if process.poll() is not None:
-                            stdout, stderr = process.communicate()
-                            self.fail(
-                                "helper exited before its Git descendant was ready: "
-                                f"stdout={stdout!r} stderr={stderr!r}"
-                            )
-                        if time.monotonic() >= deadline:
-                            self.fail("helper Git descendant did not become ready")
-                        time.sleep(0.01)
+    def test_helper_defers_sigquit_until_git_group_cleanup_fatal_integration(
+        self,
+    ) -> None:
+        if os.environ.get("PROJECT_JOURNAL_RUN_FATAL_SIGNAL_TESTS") != "1":
+            self.skipTest("fatal SIGQUIT integration test requires explicit opt-in")
+        if os.name != "posix" or not hasattr(signal, "SIGQUIT"):
+            self.fail("fatal SIGQUIT integration test requires POSIX SIGQUIT")
+        self._assert_helper_defers_terminal_signal_until_git_group_cleanup(
+            signal.SIGQUIT
+        )
 
-                    process.send_signal(signum)
-                    stdout, stderr = process.communicate(timeout=8)
-                    self.assertEqual(stdout, "")
-                    self.assertEqual(process.returncode, -signum, stderr)
-                    self.assertIn(
-                        f"received {signal.Signals(signum).name}",
-                        stderr,
-                    )
-                    self.assertIn(
-                        "protected cleanup reached a terminal state",
-                        stderr,
-                    )
-                    time.sleep(0.9)
-                    self.assertFalse(
-                        survived.exists(),
-                        "launch-owned descendant survived deferred cleanup",
-                    )
-                    self.assertEqual(
-                        list(temp_root.glob("project-journal-git-runtime-*")),
-                        [],
-                    )
-                    self.assertEqual(
-                        list(temp_root.glob("project-journal-git-launch-*")),
-                        [],
-                    )
-                finally:
-                    if process.poll() is None:
-                        process.kill()
-                        process.communicate()
-                    if ready.exists():
-                        try:
-                            os.kill(
-                                int(ready.read_text(encoding="utf-8")), signal.SIGKILL
-                            )
-                        except (ProcessLookupError, ValueError):
-                            pass
+    @unittest.skipUnless(
+        os.name == "posix"
+        and hasattr(signal, "SIGQUIT")
+        and hasattr(signal, "pthread_sigmask")
+        and hasattr(signal, "sigpending")
+        and hasattr(signal, "sigwait"),
+        "POSIX deferred termination SIGQUIT contract",
+    )
+    def test_sigquit_cleanup_precedes_custom_handler_propagation(self) -> None:
+        signum = signal.SIGQUIT
+        events: list[str] = []
+        stderr = io.StringIO()
+        previous_handler = signal.getsignal(signum)
+        previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        if signum in signal.sigpending():
+            self.skipTest("caller already has a pending SIGQUIT")
+
+        def custom_handler(_signum: int, _frame: object) -> None:
+            events.append("propagated")
+
+        def cleanup() -> None:
+            events.append("cleanup")
+
+        def request_signal() -> None:
+            events.append("action-started")
+            os.kill(os.getpid(), signum)
+            events.append("action-returned")
+
+        try:
+            signal.signal(signum, custom_handler)
+            signal.pthread_sigmask(signal.SIG_UNBLOCK, {signum})
+            with mock.patch.object(
+                project_journal,
+                "_termination_signals",
+                return_value=(signum,),
+            ):
+                with mock.patch.object(
+                    project_journal,
+                    "_cleanup_git_runtime_at_terminal",
+                    side_effect=cleanup,
+                ):
+                    with mock.patch.object(project_journal.sys, "stderr", stderr):
+                        status = project_journal._run_with_deferred_termination(
+                            request_signal
+                        )
+        finally:
+            signal.pthread_sigmask(signal.SIG_BLOCK, {signum})
+            if signum in signal.sigpending():
+                signal.sigwait({signum})
+            signal.signal(signum, previous_handler)
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+
+        self.assertEqual(status, 128 + signum)
+        self.assertEqual(
+            events,
+            ["action-started", "action-returned", "cleanup", "propagated"],
+        )
+        self.assertIn("received SIGQUIT", stderr.getvalue())
 
     @unittest.skipUnless(
         os.name == "posix" and hasattr(signal, "SIGHUP"),
