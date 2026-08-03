@@ -42,6 +42,7 @@ superseded_by:
 - The final GitHub Codex finding is closed by requiring secondary Git metadata to prove that a repository beneath `$CODEX_HOME/worktrees` is standalone or maps to one distinct source root; every unverified mapping is now an inconclusive repository-resolution row without install/generate commands.
 - The subsequent fresh named-single finding is closed by making the discovery caller explicitly own both yielded iterators, surfacing generator-close failures, and delaying coverage serialization until ordered inner/outer cleanup evidence has attached to the frozen primary.
 - The final hook-binding follow-up is closed by retiring the complete entry-time descriptor-owner set before restoring the signal mask, preserving the active error across an inter-close interruption, and making repeated cleanup unable to re-close reused numeric descriptors.
+- The current-head GitHub Codex CWD finding is closed by treating rollout CWDs as literal filesystem paths, so relative and tilde-prefixed values remain unexpanded non-repository evidence instead of allowing an unknown-user alias to abort discovery.
 
 ## Current State
 
@@ -70,6 +71,7 @@ superseded_by:
 - Git snapshot creation closes its source, destination, and directory descriptors through the same bounded precedence helper. Copy, verification, deadline, or other active failures retain their exact object, arguments, and traceback with close evidence attached; an unaccompanied close fault becomes primary and the temporary snapshot is removed or its retained locator is reported.
 - The credential-free Git version probe now consumes the remainder of the existing five-second initialization deadline instead of a separate two-second cap. Timeout, nonzero exit, and malformed output raise non-cacheable `git_version_probe_failed`, so a later initialization retries; only a successfully parsed version below 2.45 is cached as `unsupported_git_version`.
 - Hook finalization protects three distinct properties. The descriptor-relative target snapshot binds the installed hook's object identity, exact content, and access policy inside the held directory. A strict bounded Git query re-resolves the effective local/worktree configuration before atomic rename and after that final snapshot, comparing only the initial and current semantic plan root/components; destination drift is `effective_hook_destination_changed`, while query, parse, or safety uncertainty is `effective_hook_configuration_unverified`. Both effective-configuration wrappers copy bounded source exception notes, so a top-level CLI error preserves retained launch locators and cleanup-incomplete evidence. The held ancestor chain and owner-private lock are then revalidated for object identity and access policy before `mark_verified()`. That transition enters a distinct `verified` terminal phase rather than leaving the state classified as post-commit verification pending, so a deferred terminal signal observed in the final checkpoint propagates without false incomplete/recovery evidence. A post-commit effective-destination failure remains explicitly committed with final effective-destination verification incomplete; failures at earlier post-commit boundaries report their applicable pending step instead. These checks are point-in-time proofs, not a continuous configuration lock; they accept equivalent config scope/text that resolves to the same plan and ignore benign timestamps or child-entry churn.
+- Repository resolution never applies shell-style home expansion to rollout CWDs. Absolute CWDs retain the existing repository-resolution path; relative values, including every leading-tilde spelling, remain ignored as non-repository evidence.
 - This is the repository's intentional first journal entry because the finalization task explicitly requires durable repo-owned validation and handoff evidence; no top-level tracker, generated index, or local hook is introduced.
 
 ## Next Steps
@@ -694,3 +696,16 @@ superseded_by:
   integration ran one test in 2.794 seconds and returned `OK` rather than a
   skip. An independent read-only audit found no default-action local SIGQUIT
   path or CI false-positive route.
+- Exact-bot current-head review `4848531435` and inline comment `3707653887`
+  identified that `Path.expanduser()` could raise for an unknown-user rollout
+  CWD. Repository resolution now treats those values as literal paths and the
+  regression proves both ordinary relative and leading-tilde spellings remain
+  ignored without expansion.
+- Python 3.14.0 passed the two exact regressions in 0.387 seconds, all 15 CWD
+  tests in 5.138 seconds, and the complete 447-test suite in 392.201 seconds
+  with five platform skips and the fatal SIGQUIT opt-in absent. Ruff 0.13.2
+  check, Python compilation, project-journal validation, OpenAI quick skill
+  validation through isolated PyYAML, and `git diff --check` passed. Ruff
+  0.13.2's whole-file format check reports only the pre-existing HEAD line at
+  `tests/test_project_journal.py:11770`; the current change adds no formatter
+  diff of its own.

@@ -12077,7 +12077,9 @@ def _repo_root_for_path(
     codex_home: pathlib.Path | None = None,
     deadline: float | None = None,
 ) -> pathlib.Path | None:
-    path = pathlib.Path(path_text).expanduser()
+    # Rollout CWDs are literal filesystem paths, not shell input. Keeping
+    # home aliases unexpanded also leaves every tilde spelling non-absolute.
+    path = pathlib.Path(path_text)
     if not path.is_absolute():
         return None
     source = _known_source_root_from_temp_path(path)

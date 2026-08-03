@@ -24595,12 +24595,15 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(pathlib.Path(rows[0]["repo"]), repo.resolve())
 
-    def test_discover_repos_ignores_relative_cwd_values(self) -> None:
+    def test_discover_repos_ignores_relative_and_tilde_cwd_values(self) -> None:
         codex_home = self.root / "codex-home"
         rollout_dir = codex_home / "sessions/2026/05/05"
         rollout_dir.mkdir(parents=True)
         (rollout_dir / "rollout-relative.jsonl").write_text(
-            json.dumps({"payload": {"cwd": "."}}) + "\n",
+            "".join(
+                json.dumps({"payload": {"cwd": cwd}}) + "\n"
+                for cwd in (".", "~project-journal-user-that-must-not-exist/repo")
+            ),
             encoding="utf-8",
         )
 
@@ -24615,6 +24618,19 @@ class ProjectJournalTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         rows = json.loads(result.stdout)
         self.assertEqual(rows, [])
+
+    def test_repo_root_for_path_does_not_expand_tilde_cwd(self) -> None:
+        with mock.patch.object(
+            project_journal.pathlib.Path,
+            "expanduser",
+            side_effect=RuntimeError("injected missing user"),
+        ) as expanduser:
+            root = project_journal._repo_root_for_path(
+                "~project-journal-user-that-must-not-exist/repo"
+            )
+
+        self.assertIsNone(root)
+        expanduser.assert_not_called()
 
     def test_discover_repos_maps_codex_worktree_to_source_repo(self) -> None:
         repo = self.init_repo()
