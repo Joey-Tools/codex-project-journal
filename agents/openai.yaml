@@ -1,4 +1,4 @@
 interface:
   display_name: "Project Journal"
-  short_description: "Maintain project journal entrypoints, workstream notes, and local indexes."
-  default_prompt: "Use $project-journal to recover or update this repo's short PROJECT_STATE / PROJECT_TODO entrypoints, per-workstream docs/project_journal notes, and ignored local journal index."
+  short_description: "Maintain adopted journals and durable workstream state."
+  default_prompt: "Use $project-journal to update the smallest applicable journal layer when repo policy requires journaling, a valid tracked non-generated journal entry proves adoption, or the task has an explicit durable-state need. Run its bundled helper only on supported macOS or Linux hosts, and treat partial active/archive discovery coverage as inconclusive."

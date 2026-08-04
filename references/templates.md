@@ -1,5 +1,9 @@
 # Project Journal Templates
 
+Use these templates only after repo policy requires project journals, at least one valid tracked non-generated journal entry establishes adoption, or an explicit product need justifies first adoption.
+An empty journal directory, untracked entry, or generated `INDEX.md` does not establish adoption.
+Choose templates independently: do not create `PROJECT_STATE`, `PROJECT_TODO`, and a workstream journal as a bundle when a smaller layer satisfies the need.
+
 ## Minimal `docs/PROJECT_STATE.md`
 
 ```md
@@ -80,9 +84,11 @@ superseded_by:
 
 ## Writing Rules
 
-- `PROJECT_STATE` is the short repo memory for "where things stand now".
-- `PROJECT_TODO` is the cross-workstream actionable backlog for repo-root visibility.
-- `docs/project_journal/YYYY/MM/*.md` is the durable per-workstream source of truth and the default place for ordinary PR/thread state.
+- When repo policy requires the workflow or a valid tracked non-generated entry establishes adoption, `PROJECT_STATE` is the short repo memory for repo-wide state and recovery.
+- When repo policy requires the workflow or a valid tracked non-generated entry establishes adoption, `PROJECT_TODO` is the cross-workstream actionable backlog for repo-root visibility.
+- `docs/project_journal/YYYY/MM/*.md` is the durable per-workstream source of truth and the default place for ordinary PR/thread state once the workflow applies.
+- An unadopted repo needs an explicit product need before any of these trackers is introduced; general preference for journaling is not enough.
+- Create or update only the smallest applicable layer. Do not create both top-level trackers merely because one or a workstream journal is needed.
 - `docs/project_journal/INDEX.md` is generated locally and should not be committed.
 - Do not update top-level trackers for ordinary PR-local progress; update the relevant per-workstream journal instead.
 - Prefer updating existing workstream journal bullets over appending a new dated section every time.
@@ -92,5 +98,6 @@ superseded_by:
 - Use a focused note when a blocker set or closure plan would make the top-level trackers noisy.
 - For squash-merge PRs, write tracked journal docs as the target-branch state after the PR lands, preferring the relevant per-workstream journal over top-level entrypoints. If the PR fully completes the workstream, `status: completed` is appropriate before merge; use the PR link as evidence and keep transient review or merge states in the PR body, checklist, or comments.
 - Run the bundled `project_journal.py validate --repo <path>` helper when using journal frontmatter.
-- Run the bundled `project_journal.py generate --repo <path> --output docs/project_journal/INDEX.md --ensure-exclude` helper to refresh the ignored local index.
+- Run the bundled `project_journal.py generate --repo <path> --output docs/project_journal/INDEX.md --ensure-exclude` helper only when the active workflow needs an index refresh or multi-entry navigation.
+- Install local hooks only for an explicitly opted-in automatic-index workflow.
 - If the repo already has task IDs or status labels, keep them consistent.

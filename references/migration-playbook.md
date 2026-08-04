@@ -4,11 +4,23 @@ Use this reference when converting existing repositories from large tracked
 `docs/PROJECT_STATE.md` / `docs/PROJECT_TODO.md` files to short entrypoints plus
 per-workstream journal files. Prefer changing future write behavior over
 performing a second broad file migration.
+Treat this as an explicit adoption or maintenance workflow. Do not start a
+migration merely because a repository belongs to Joey or lacks the current
+journal layout.
+An empty `docs/project_journal/` directory or generated `INDEX.md` is not
+adoption evidence; require repo policy or a valid tracked non-generated entry.
 
 ## Candidate Filtering
 
 - Start with the bundled `project_journal.py discover-repos` helper; do not crawl the full
   filesystem.
+- Treat `coverage_status: partial` as incomplete candidate evidence. Resolve
+  each row's `discovery_coverage_ref.coverage_id` to the one deterministic row
+  carrying the matching full `discovery_error.discovery_coverage` object; keep
+  row-local discovery errors separate. A sentinel row carries both the full
+  object and its own reference.
+- Treat discovery output and historical tracker presence as candidate evidence,
+  not as authorization to introduce or migrate trackers.
 - For each discovered repo, check git history for committed trackers:
   `git log --all -- docs/PROJECT_STATE.md docs/PROJECT_TODO.md`.
 - Skip repos with no tracker history unless the user explicitly asks to start
