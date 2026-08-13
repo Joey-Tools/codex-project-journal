@@ -6,12 +6,6 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 REQUIRED_CALL_INPUTS = """on:
   workflow_call:
     inputs:
-      repository:
-        required: true
-        type: string
-      ref:
-        required: true
-        type: string
       run_fatal_signal_tests:
         required: true
         type: string
@@ -19,8 +13,8 @@ REQUIRED_CALL_INPUTS = """on:
 permissions:"""
 CHECKOUT_BINDING = """- uses: actions/checkout@v4
         with:
-          repository: ${{ inputs.repository }}
-          ref: ${{ inputs.ref }}
+          repository: ${{ github.repository }}
+          ref: ${{ github.sha }}
           persist-credentials: false"""
 
 
@@ -66,14 +60,19 @@ class RequiredCiWorkflowTests(unittest.TestCase):
         )
 
         self.assertIn(REQUIRED_CALL_INPUTS, workflow)
+        workflow_call_header = workflow.split("permissions:", 1)[0]
+        self.assertNotIn("\n      repository:\n", workflow_call_header)
+        self.assertNotIn("\n      ref:\n", workflow_call_header)
         checkout = checkout_steps(workflow)
         self.assertGreater(len(checkout), 0)
         self.assertTrue(all(CHECKOUT_BINDING in step for step in checkout))
         self.assertEqual(
-            workflow.count("repository: ${{ inputs.repository }}"), len(checkout)
+            workflow.count("repository: ${{ github.repository }}"), len(checkout)
         )
-        self.assertEqual(workflow.count("ref: ${{ inputs.ref }}"), len(checkout))
+        self.assertEqual(workflow.count("ref: ${{ github.sha }}"), len(checkout))
         self.assertEqual(workflow.count("persist-credentials: false"), len(checkout))
+        self.assertNotIn("inputs.repository", workflow)
+        self.assertNotIn("inputs.ref", workflow)
         self.assertIn("permissions:\n  contents: read\n", workflow)
         self.assertEqual(top_level_job_ids(workflow), ["test"])
         self.assertIn("python3 -m unittest discover -s tests", workflow)
