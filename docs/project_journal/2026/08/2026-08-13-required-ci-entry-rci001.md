@@ -23,6 +23,8 @@ superseded_by:
 - None in this repository slice.
 
 ## Evidence
+
+- The reusable entry receives the fatal-signal opt-in as a required closed input from the central router. It does not read a repository variable through the cross-repository caller context.
 - `python3 -m unittest tests.test_required_ci_workflow`
 - `python3 -m unittest discover -s tests`
 - `PROJECT_JOURNAL_RUN_FATAL_SIGNAL_TESTS=1 python3 -m unittest -v tests.test_project_journal.ProjectJournalTests.test_helper_defers_sigquit_until_git_group_cleanup_fatal_integration`

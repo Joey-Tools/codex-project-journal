@@ -12,6 +12,9 @@ REQUIRED_CALL_INPUTS = """on:
       ref:
         required: true
         type: string
+      run_fatal_signal_tests:
+        required: true
+        type: string
 
 permissions:"""
 CHECKOUT_BINDING = """- uses: actions/checkout@v4
@@ -75,6 +78,13 @@ class RequiredCiWorkflowTests(unittest.TestCase):
         self.assertIn(
             'PROJECT_JOURNAL_RUN_FATAL_SIGNAL_TESTS" != "1"', workflow
         )
+        self.assertEqual(
+            workflow.count(
+                "PROJECT_JOURNAL_RUN_FATAL_SIGNAL_TESTS: "
+                "${{ inputs.run_fatal_signal_tests }}"
+            ),
+            2,
+        )
         self.assertIn(
             "tests.test_project_journal.ProjectJournalTests."
             "test_helper_defers_sigquit_until_git_group_cleanup_fatal_integration",
@@ -85,6 +95,7 @@ class RequiredCiWorkflowTests(unittest.TestCase):
             "pull_request_target:",
             "push:",
             "secrets.",
+            "vars.",
             "contents: write",
             "id-" + "token: write",
             "statuses: write",

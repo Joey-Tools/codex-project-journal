@@ -9,6 +9,9 @@ on:
       ref:
         required: true
         type: string
+      run_fatal_signal_tests:
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -28,7 +31,7 @@ jobs:
         run: python3 -m unittest discover -s tests
       - name: Verify fatal signal integration opt-in
         env:
-          PROJECT_JOURNAL_RUN_FATAL_SIGNAL_TESTS: ${{ vars.PROJECT_JOURNAL_RUN_FATAL_SIGNAL_TESTS }}
+          PROJECT_JOURNAL_RUN_FATAL_SIGNAL_TESTS: ${{ inputs.run_fatal_signal_tests }}
         run: |
           if [ "$PROJECT_JOURNAL_RUN_FATAL_SIGNAL_TESTS" != "1" ]; then
             echo "PROJECT_JOURNAL_RUN_FATAL_SIGNAL_TESTS must be exactly 1" >&2
@@ -36,7 +39,7 @@ jobs:
           fi
       - name: Run fatal SIGQUIT integration test
         env:
-          PROJECT_JOURNAL_RUN_FATAL_SIGNAL_TESTS: ${{ vars.PROJECT_JOURNAL_RUN_FATAL_SIGNAL_TESTS }}
+          PROJECT_JOURNAL_RUN_FATAL_SIGNAL_TESTS: ${{ inputs.run_fatal_signal_tests }}
         run: >-
           python3 -m unittest -v
           tests.test_project_journal.ProjectJournalTests.test_helper_defers_sigquit_until_git_group_cleanup_fatal_integration
