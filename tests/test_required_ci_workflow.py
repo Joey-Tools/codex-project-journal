@@ -20,7 +20,8 @@ permissions:"""
 CHECKOUT_BINDING = """- uses: actions/checkout@v4
         with:
           repository: ${{ inputs.repository }}
-          ref: ${{ inputs.ref }}"""
+          ref: ${{ inputs.ref }}
+          persist-credentials: false"""
 
 
 def top_level_job_ids(workflow: str) -> list[str]:
@@ -72,6 +73,7 @@ class RequiredCiWorkflowTests(unittest.TestCase):
             workflow.count("repository: ${{ inputs.repository }}"), len(checkout)
         )
         self.assertEqual(workflow.count("ref: ${{ inputs.ref }}"), len(checkout))
+        self.assertEqual(workflow.count("persist-credentials: false"), len(checkout))
         self.assertIn("permissions:\n  contents: read\n", workflow)
         self.assertEqual(top_level_job_ids(workflow), ["test"])
         self.assertIn("python3 -m unittest discover -s tests", workflow)
