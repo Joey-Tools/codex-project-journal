@@ -1,0 +1,43 @@
+name: Required CI
+
+on:
+  workflow_call:
+    inputs:
+      run_fatal_signal_tests:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Reject unexpected repository
+        if: ${{ github.repository != 'Joey-Tools/codex-project-journal' }}
+        run: exit 1
+      - uses: actions/checkout@v4
+        with:
+          repository: Joey-Tools/codex-project-journal
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Run tests
+        run: python3 -m unittest discover -s tests
+      - name: Verify fatal signal integration opt-in
+        env:
+          PROJECT_JOURNAL_RUN_FATAL_SIGNAL_TESTS: ${{ inputs.run_fatal_signal_tests }}
+        run: |
+          if [ "$PROJECT_JOURNAL_RUN_FATAL_SIGNAL_TESTS" != "1" ]; then
+            echo "PROJECT_JOURNAL_RUN_FATAL_SIGNAL_TESTS must be exactly 1" >&2
+            exit 1
+          fi
+      - name: Run fatal SIGQUIT integration test
+        env:
+          PROJECT_JOURNAL_RUN_FATAL_SIGNAL_TESTS: ${{ inputs.run_fatal_signal_tests }}
+        run: >-
+          python3 -m unittest -v
+          tests.test_project_journal.ProjectJournalTests.test_helper_defers_sigquit_until_git_group_cleanup_fatal_integration
