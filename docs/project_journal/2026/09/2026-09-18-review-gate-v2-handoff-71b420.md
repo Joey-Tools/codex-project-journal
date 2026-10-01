@@ -3,7 +3,7 @@ id: 20260918-71b420
 title: Review Gate v2 Handoff
 status: completed
 created: 2026-09-18
-updated: 2026-09-29
+updated: 2026-10-01
 branch: codex/organization-v2-handoff
 pr:
 supersedes: []
@@ -18,6 +18,7 @@ superseded_by:
 
 ## Current State
 - PR 工作流继续通过 `JoeyTeng/codex-review-gate-action@v2` 产生 `codex/github-review-gate` check。
+- Verifier 工作流显式授予 `actions: read`，保留其余现有权限与运行行为。
 - controller 仅处理新建评论；v2 工作流的请求者权限策略为 `any`。
 - 临时 bridge 已删除，不再由本仓库产生 `codex/review-gate` legacy status。
 
