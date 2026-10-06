@@ -6,8 +6,8 @@ on:
     types: [opened, reopened, synchronize, ready_for_review]
 
 permissions:
-  contents: read
   actions: read
+  contents: read
   issues: read
   pull-requests: read
 
