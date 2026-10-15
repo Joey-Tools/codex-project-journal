@@ -13031,12 +13031,14 @@ class ProjectJournalTests(unittest.TestCase):
         time.sleep(0.4)
         self.assertFalse(marker.exists())
 
-    def test_cat_file_batch_timeout_kills_descendant_process_group(self) -> None:
-        repo = self.init_repo()
-        marker = self.root / "batch-timeout-child-survived"
-        ready = self.root / "batch-timeout-child-started"
-        release = self.root / "batch-timeout-child-release"
-        child = self.root / "batch-timeout-delayed-marker.py"
+    def _batch_timeout_descendant_fixture(
+        self,
+        name: str,
+    ) -> tuple[list[str], pathlib.Path, pathlib.Path, pathlib.Path]:
+        marker = self.root / f"{name}-marker"
+        ready = self.root / f"{name}-ready"
+        release = self.root / f"{name}-release"
+        child = self.root / f"{name}-child.py"
         child.write_text(
             textwrap.dedent(
                 """\
@@ -13044,53 +13046,67 @@ class ProjectJournalTests(unittest.TestCase):
                 import sys
                 import time
 
-                release = pathlib.Path(sys.argv[2])
-                while not release.exists():
+                marker = pathlib.Path(sys.argv[1])
+                ready = pathlib.Path(sys.argv[2])
+                release = pathlib.Path(sys.argv[3])
+                ready.write_text("ready", encoding="utf-8")
+                deadline = time.monotonic() + 5
+                while not release.exists() and time.monotonic() < deadline:
                     time.sleep(0.005)
-                time.sleep(0.3)
-                pathlib.Path(sys.argv[1]).write_text("survived", encoding="utf-8")
+                if release.exists():
+                    marker.write_text("survived", encoding="utf-8")
+                else:
+                    marker.write_text("expired-before-release", encoding="utf-8")
                 """
             ),
             encoding="utf-8",
         )
-        producer = self.root / "batch-timeout-producer.py"
+        producer = self.root / f"{name}-producer.py"
         producer.write_text(
             textwrap.dedent(
                 """\
-                import pathlib
                 import subprocess
                 import sys
                 import time
 
                 subprocess.Popen(
-                    [sys.executable, sys.argv[1], sys.argv[2], sys.argv[4]]
+                    [sys.executable, sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]]
                 )
-                pathlib.Path(sys.argv[3]).write_text("started", encoding="utf-8")
                 time.sleep(30)
                 """
             ),
             encoding="utf-8",
         )
-        argv = [
-            sys.executable,
-            str(producer),
-            str(child),
-            str(marker),
-            str(ready),
-            str(release),
-        ]
-        process = subprocess.Popen(
-            argv,
-            env={"PATH": os.environ.get("PATH", "")},
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=True,
+        return (
+            [
+                sys.executable,
+                str(producer),
+                str(child),
+                str(marker),
+                str(ready),
+                str(release),
+            ],
+            marker,
+            ready,
+            release,
         )
 
-        def cleanup_process() -> None:
-            if process.returncode is not None:
-                return
+    def _wait_for_batch_timeout_child(
+        self,
+        ready: pathlib.Path,
+        process: subprocess.Popen[bytes],
+    ) -> None:
+        ready_deadline = time.monotonic() + 5
+        while not ready.exists() and time.monotonic() < ready_deadline:
+            self.assertIsNone(process.poll())
+            time.sleep(0.01)
+        self.assertTrue(ready.exists())
+
+    def _cleanup_batch_timeout_fixture_process_group(
+        self,
+        process: subprocess.Popen[bytes],
+    ) -> None:
+        if process.returncode is None:
             project_journal._signal_process_group(
                 process,
                 getattr(
@@ -13103,14 +13119,32 @@ class ProjectJournalTests(unittest.TestCase):
                 process.wait(timeout=1)
             except subprocess.TimeoutExpired:
                 process.kill()
+                process.wait(timeout=1)
+        for stream in (process.stdin, process.stdout, process.stderr):
+            if stream is not None:
+                stream.close()
 
-        self.addCleanup(cleanup_process)
-        ready_deadline = time.monotonic() + 5
-        while not ready.exists() and time.monotonic() < ready_deadline:
-            self.assertIsNone(process.poll())
-            time.sleep(0.01)
-        self.assertTrue(ready.exists())
-        release.write_text("go", encoding="utf-8")
+    def test_cat_file_batch_timeout_kills_descendant_process_group(self) -> None:
+        repo = self.init_repo()
+        argv, marker, ready, release = self._batch_timeout_descendant_fixture(
+            "batch-timeout-child"
+        )
+        real_popen = subprocess.Popen
+        supervised_process: subprocess.Popen[bytes] | None = None
+
+        def start_supervised_process(
+            *args: object,
+            **kwargs: object,
+        ) -> subprocess.Popen[bytes]:
+            nonlocal supervised_process
+            supervised_process = real_popen(*args, **kwargs)
+            self.addCleanup(
+                self._cleanup_batch_timeout_fixture_process_group,
+                supervised_process,
+            )
+            self._wait_for_batch_timeout_child(ready, supervised_process)
+            return supervised_process
+
         blob = project_journal.IndexJournalBlob(
             mode=b"100644",
             oid="a" * 40,
@@ -13118,10 +13152,25 @@ class ProjectJournalTests(unittest.TestCase):
             rel_path="docs/project_journal/entry.md",
         )
 
+        def delayed_fixture_command(*args: object, **kwargs: object) -> list[str]:
+            del args, kwargs
+            # Delay command construction before _capture_bounded_process starts its deadline.
+            time.sleep(0.45)
+            return argv
+
+        # Isolate process supervision from Git runtime trust and launch preparation.
         with mock.patch.object(
+            project_journal,
+            "_git_command",
+            side_effect=delayed_fixture_command,
+        ), mock.patch.object(
+            project_journal,
+            "_require_git_runtime",
+            return_value=None,
+        ), mock.patch.object(
             project_journal.subprocess,
             "Popen",
-            return_value=process,
+            side_effect=start_supervised_process,
         ):
             with self.assertRaisesRegex(
                 project_journal.UserError,
@@ -13130,11 +13179,42 @@ class ProjectJournalTests(unittest.TestCase):
                 project_journal._read_index_blobs_batch(
                     repo,
                     [blob],
-                    timeout_seconds=0.1,
+                    timeout_seconds=1,
                 )
 
-        time.sleep(0.4)
+        self.assertIsNotNone(supervised_process)
         self.assertFalse(marker.exists())
+        release.write_text("go", encoding="utf-8")
+        observation_deadline = time.monotonic() + 3
+        while not marker.exists() and time.monotonic() < observation_deadline:
+            time.sleep(0.01)
+        self.assertFalse(marker.exists())
+
+    def test_cat_file_batch_timeout_descendant_fixture_control_writes_marker(
+        self,
+    ) -> None:
+        argv, marker, ready, release = self._batch_timeout_descendant_fixture(
+            "batch-timeout-control-child"
+        )
+        process = subprocess.Popen(
+            argv,
+            env={"PATH": os.environ.get("PATH", "")},
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        self.addCleanup(self._cleanup_batch_timeout_fixture_process_group, process)
+        self._wait_for_batch_timeout_child(ready, process)
+
+        self.assertFalse(marker.exists())
+        release.write_text("go", encoding="utf-8")
+        marker_deadline = time.monotonic() + 3
+        while not marker.exists() and time.monotonic() < marker_deadline:
+            self.assertIsNone(process.poll())
+            time.sleep(0.01)
+        self.assertTrue(marker.exists())
+        self.assertEqual(marker.read_text(encoding="utf-8"), "survived")
 
     def test_cat_file_batch_nonzero_exit_kills_detached_stream_descendant(
         self,
