@@ -5,7 +5,7 @@ status: completed
 created: 2026-10-19
 updated: 2026-10-19
 branch: wip/journal-legacy-buffer
-pr:
+pr: https://github.com/Joey-Tools/codex-project-journal/pull/21
 supersedes: []
 superseded_by:
 ---
