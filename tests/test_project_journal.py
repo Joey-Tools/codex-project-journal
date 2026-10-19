@@ -718,6 +718,40 @@ class ProjectJournalTests(unittest.TestCase):
         exclude = (repo / ".git/info/exclude").read_text(encoding="utf-8")
         self.assertIn("docs/project_journal/INDEX.md", exclude.splitlines())
 
+    def test_legacy_large_journal_validates_generates_and_is_adopted(self) -> None:
+        repo = self.init_repo()
+        journal = self.write_journal(
+            repo,
+            "docs/project_journal/2026/05/2026-05-05-legacy-a1b2c3.md",
+            entry_id="20260505-a1b2c3",
+            title="Legacy Work",
+            status="active",
+            updated="2026-05-05",
+        )
+        original = journal.read_bytes()
+        target_size = 2 * 1024 * 1024
+        self.assertLess(len(original), target_size)
+        journal.write_bytes(original + b"x" * (target_size - len(original)))
+
+        validate = self.run_cli("validate", "--repo", str(repo))
+        self.assertEqual(validate.returncode, 0, validate.stderr)
+
+        generate = self.run_cli(
+            "generate",
+            "--repo",
+            str(repo),
+            "--output",
+            "docs/project_journal/INDEX.md",
+            "--ensure-exclude",
+        )
+        self.assertEqual(generate.returncode, 0, generate.stderr)
+
+        add = run_git(repo, "add", "--", str(journal.relative_to(repo)))
+        self.assertEqual(add.returncode, 0, add.stderr)
+        adoption = self.adoption_status(repo)
+        self.assertTrue(adoption["tracked_journal_adopted"])
+        self.assertEqual(adoption["valid_tracked_journal_count"], 1)
+
     def test_validate_skips_custom_generated_index(self) -> None:
         repo = self.init_repo()
         self.write_journal(
@@ -8833,7 +8867,25 @@ class ProjectJournalTests(unittest.TestCase):
             with self.assertRaises(project_journal.JournalLimitExceeded) as raised:
                 project_journal._parse_frontmatter(path)
 
-        self.assertIn("journal file exceeds", str(raised.exception))
+        self.assertIn(
+            f"journal file exceeds {project_journal.MAX_TRACKED_JOURNAL_BLOB_BYTES} bytes",
+            str(raised.exception),
+        )
+
+    def test_frontmatter_accepts_exact_blob_limit(self) -> None:
+        path = self.root / "exact-limit-frontmatter.md"
+        prefix = b"---\ntitle: Exact Limit\n---\n"
+        path.write_bytes(
+            prefix
+            + b"x" * (project_journal.MAX_TRACKED_JOURNAL_BLOB_BYTES - len(prefix))
+        )
+
+        fields = project_journal._parse_frontmatter(path)
+
+        self.assertEqual(
+            path.stat().st_size, project_journal.MAX_TRACKED_JOURNAL_BLOB_BYTES
+        )
+        self.assertEqual(fields["title"], "Exact Limit")
 
     def test_frontmatter_growth_is_bounded_during_read(self) -> None:
         path = self.root / "growing-frontmatter.md"
@@ -9557,6 +9609,29 @@ class ProjectJournalTests(unittest.TestCase):
             "tracked journal blobs exceed 5 total bytes",
         ):
             aggregate.feed(f"{oids[0]} blob 3\nabc\n{oids[1]} blob 3\n".encode("ascii"))
+
+    def test_cat_file_batch_parser_accepts_exact_blob_limit(self) -> None:
+        oid = "a" * 40
+        blob = project_journal.IndexJournalBlob(
+            mode=b"100644",
+            oid=oid,
+            raw_path=b"docs/project_journal/large.md",
+            rel_path="docs/project_journal/large.md",
+        )
+        limit = project_journal.MAX_TRACKED_JOURNAL_BLOB_BYTES
+        payload = b"x" * limit
+        parser = project_journal._CatFileBatchStreamParser([blob])
+        parser.feed(f"{oid} blob {limit}\n".encode("ascii"))
+        parser.feed(payload + b"\n")
+        parser.finish()
+        self.assertEqual(parser.contents(), [payload])
+
+        oversized = project_journal._CatFileBatchStreamParser([blob])
+        with self.assertRaisesRegex(
+            project_journal.UserError,
+            f"index blob exceeds {limit} bytes",
+        ):
+            oversized.feed(f"{oid} blob {limit + 1}\n".encode("ascii"))
 
     def test_cat_file_batch_reads_max_records_with_one_process(self) -> None:
         repo = self.init_repo()
@@ -13646,11 +13721,11 @@ class ProjectJournalTests(unittest.TestCase):
             skill,
         )
         self.assertIn(
-            "Reject worktree journals larger than 1 MiB from descriptor metadata before any content read",
+            "Reject worktree journals larger than 4 MiB from descriptor metadata before any content read",
             skill,
         )
         self.assertIn(
-            "Consume at most 1 MiB plus one byte per pass",
+            "Consume at most 4 MiB plus one byte per pass",
             skill,
         )
         self.assertIn("stream the second through one 64 KiB comparison chunk", skill)
@@ -13946,11 +14021,11 @@ class ProjectJournalTests(unittest.TestCase):
             readme,
         )
         self.assertIn(
-            "Worktree journals larger than 1 MiB are rejected from descriptor metadata before any content read",
+            "Worktree journals larger than 4 MiB are rejected from descriptor metadata before any content read",
             readme,
         )
         self.assertIn(
-            "Each pass consumes at most 1 MiB plus one byte",
+            "Each pass consumes at most 4 MiB plus one byte",
             readme,
         )
         self.assertIn(
