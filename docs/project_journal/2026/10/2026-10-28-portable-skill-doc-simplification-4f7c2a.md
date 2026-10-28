@@ -4,8 +4,8 @@ title: Portable Skill Doc Simplification
 status: completed
 created: 2026-10-28
 updated: 2026-10-28
-branch:
-pr:
+branch: docs/simplify-portable-project-journal
+pr: https://github.com/Joey-Tools/codex-project-journal/pull/24
 supersedes: []
 superseded_by:
 ---
