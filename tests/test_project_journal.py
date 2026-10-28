@@ -9,6 +9,7 @@ import io
 import json
 import os
 import pathlib
+import re
 import shlex
 import shutil
 import signal
@@ -32,6 +33,11 @@ TEMPLATES_MD = (
 )
 MIGRATION_PLAYBOOK_MD = (
     pathlib.Path(__file__).resolve().parents[1] / "references" / "migration-playbook.md"
+)
+CONTRACT_MD = (
+    pathlib.Path(__file__).resolve().parents[1]
+    / "references"
+    / "helper-safety-contract.md"
 )
 SPEC = importlib.util.spec_from_file_location("project_journal", SCRIPT)
 assert SPEC is not None
@@ -13562,10 +13568,7 @@ class ProjectJournalTests(unittest.TestCase):
     def test_codex_worktree_mapping_fail_closed_contract_is_documented(
         self,
     ) -> None:
-        for document in (
-            SKILL_MD.read_text(encoding="utf-8"),
-            README_MD.read_text(encoding="utf-8"),
-        ):
+        for document in (CONTRACT_MD.read_text(encoding="utf-8"),):
             self.assertIn("$CODEX_HOME/worktrees", document)
             self.assertIn("--git-dir", document)
             self.assertIn("--git-common-dir", document)
@@ -13575,14 +13578,22 @@ class ProjectJournalTests(unittest.TestCase):
     def test_skill_limits_auto_trigger_and_requires_first_adoption_need(self) -> None:
         skill = SKILL_MD.read_text(encoding="utf-8")
         frontmatter = skill.split("---", 2)[1]
+        contract = CONTRACT_MD.read_text(encoding="utf-8")
 
-        self.assertIn("Use only when repo policy requires this workflow", frontmatter)
+        self.assertIn(
+            "Use only when repo policy requires this workflow",
+            frontmatter,
+        )
         self.assertIn(
             "at least one valid tracked non-generated entry",
             frontmatter,
         )
         self.assertIn(
-            "a task spans Codex sessions, a PR, or a durable workstream",
+            "A PR or multi-session task alone is not a trigger",
+            frontmatter,
+        )
+        self.assertNotIn(
+            "a task spans Codex sessions",
             frontmatter,
         )
         self.assertIn(
@@ -13590,10 +13601,18 @@ class ProjectJournalTests(unittest.TestCase):
             frontmatter,
         )
         self.assertIn(
-            "treat the trigger as a reason to assess durable state, not as permission to create files",
+            "treat such a task only as a signal to assess durable state, not as permission to create files",
             skill,
         )
-        self.assertIn("adoption-status --repo <path>", skill)
+        self.assertNotIn("treat the trigger as a reason", skill)
+        self.assertIn(
+            "repository-owned durable coordination, recovery, or backlog state",
+            frontmatter,
+        )
+        self.assertIn(
+            "adoption-status --repo <path>",
+            skill,
+        )
         self.assertIn(
             "Directory presence, untracked files, and an empty or generated-`INDEX.md`-only directory do not establish adoption",
             skill,
@@ -13602,303 +13621,446 @@ class ProjectJournalTests(unittest.TestCase):
             "accepts only unconflicted stage-0 regular-file entries and validates the exact indexed blob",
             skill,
         )
-        self.assertIn("clears ambient Git control variables", skill)
-        self.assertIn("bounded credential-free `git --version` gate", skill)
-        self.assertIn("Git older than 2.45 fails closed", skill)
+        self.assertIn(
+            "ignores ambient Git control/configuration redirections",
+            contract,
+        )
+        self.assertIn(
+            "bounded credential-free Git 2.45-or-newer version",
+            contract,
+        )
+        self.assertIn(
+            "Only a successfully parsed version below 2.45 is cached as a version incompatibility",
+            contract,
+        )
         self.assertIn(
             "remainder of the same five-second initialization deadline",
-            skill,
+            contract,
         )
         self.assertIn(
-            "classify a timeout, nonzero exit, or malformed response as non-cacheable",
-            skill,
+            "a timeout, nonzero exit, or malformed response is a non-cacheable",
+            contract,
         )
         self.assertIn(
-            "snapshot-creation source, destination, and directory descriptors",
-            skill,
+            "Snapshot creation closes its source, destination, and directory descriptors",
+            contract,
         )
-        self.assertIn("one absolute monotonic deadline", skill)
-        self.assertIn("frontmatter parsing, semantic validation", skill)
-        self.assertIn("frontmatter field/list, validation-issue", skill)
         self.assertIn(
-            "Keep each exact invalid path once for structured validity decisions",
-            skill,
+            "one absolute monotonic deadline",
+            contract,
         )
-        self.assertIn("stable JSON `path_ref`", skill)
-        self.assertIn("final UTF-8-with-`backslashreplace` display bytes", skill)
-        self.assertIn("failed `git ls-files` must never echo stdout", skill)
-        self.assertIn("1 MiB aggregate retained-issue ceiling", skill)
+        self.assertIn(
+            "bounded frontmatter parsing and semantic validation",
+            contract,
+        )
+        self.assertIn(
+            "entry/field/list/issue budgets",
+            contract,
+        )
+        self.assertIn(
+            "Validation keeps each exact invalid path once for structured validity decisions",
+            contract,
+        )
+        self.assertIn(
+            "stable JSON `path_ref`",
+            contract,
+        )
+        self.assertIn(
+            "final UTF-8-with-`backslashreplace` display bytes",
+            contract,
+        )
+        self.assertIn(
+            "failed `git ls-files` never echoes stdout",
+            contract,
+        )
+        self.assertIn(
+            "Retained issue text keeps its separate existing 1 MiB aggregate ceiling",
+            contract,
+        )
         self.assertIn(
             "invalidates every member of a duplicate-ID group",
-            skill,
+            contract,
         )
         self.assertIn(
-            "index, entry, frontmatter field/list, validation-issue, byte, record, and stderr limits",
-            skill,
+            "index and entry/field/list/issue budgets",
+            contract,
         )
-        self.assertIn("one bounded `git cat-file --batch` session", skill)
-        self.assertIn("final raw index revalidation", skill)
         self.assertIn(
-            "keep the direct child unreaped as the PID/PGID identity fence",
-            skill,
+            "one bounded `git cat-file --batch` session",
+            contract,
         )
-        self.assertIn("status is observed with `WNOWAIT`", skill)
-        self.assertIn("Xcode Python 3.9.6", skill)
-        self.assertIn("kqueue `NOTE_EXIT`", skill)
-        self.assertIn("default waitable `SIGCHLD` semantics", skill)
-        self.assertIn("reject `SA_NOCLDWAIT`", skill)
-        self.assertIn("libc-injected `SA_RESTORER`", skill)
+        self.assertIn(
+            "final raw index revalidation",
+            contract,
+        )
+        self.assertIn(
+            "unreaped direct child as the PID/PGID identity fence",
+            contract,
+        )
+        self.assertIn(
+            "status is observed with `WNOWAIT`",
+            contract,
+        )
+        self.assertIn(
+            "Xcode Python 3.9.6",
+            contract,
+        )
+        self.assertIn(
+            "kqueue `NOTE_EXIT`",
+            contract,
+        )
+        self.assertIn(
+            "default waitable `SIGCHLD` semantics",
+            contract,
+        )
+        self.assertIn(
+            "rejects `SA_NOCLDWAIT`",
+            contract,
+        )
+        self.assertIn(
+            "libc-injected `SA_RESTORER`",
+            contract,
+        )
         self.assertIn(
             "before every numeric PID/PGID probe or signal",
-            skill,
+            contract,
         )
-        self.assertIn("Explicit ownership states", skill)
-        self.assertIn("reuses the already claimed ownership object", skill)
+        self.assertIn(
+            "Explicit cleanup ownership states",
+            contract,
+        )
+        self.assertIn(
+            "reuses the already claimed ownership object",
+            contract,
+        )
         self.assertIn(
             "bounded cleanup exception evidence attaches to the original action exception",
-            skill,
+            contract,
         )
         self.assertIn(
-            "attach descriptor-close faults to the current parse, limit, replacement, or access-policy error",
-            skill,
+            "descriptor-close faults attach to the current parse, limit, replacement, or access-policy error",
+            contract,
         )
         self.assertIn(
             "supports only macOS and Linux",
-            skill,
+            contract,
         )
-        self.assertIn("including other POSIX systems", skill)
-        self.assertNotIn("other POSIX hosts retain signal-zero", skill)
         self.assertIn(
-            "no numeric PGID is signalled after that fence is released",
+            "including other POSIX systems",
+            contract,
+        )
+        self.assertNotIn(
+            "other POSIX hosts retain signal-zero",
             skill,
         )
-        self.assertIn("reported as `cleanup-incomplete`", skill)
+        self.assertIn(
+            "never signals a numeric PGID after the final reap",
+            contract,
+        )
+        self.assertIn(
+            "reports `cleanup-incomplete`",
+            contract,
+        )
         self.assertIn(
             "`inconclusive` carries a structured `adoption_error` and null adoption fields",
             skill,
         )
-        self.assertIn("system and global Git configuration", skill)
-        self.assertIn("without following includes", skill)
-        self.assertIn("explicit repo-local `core.hooksPath`", skill)
+        self.assertIn(
+            "system and global Git configuration",
+            contract,
+        )
+        self.assertIn(
+            "without following includes",
+            contract,
+        )
+        self.assertIn(
+            "explicit repo-local `core.hooksPath`",
+            contract,
+        )
         self.assertIn(
             "distinguishes identity, content, and access-policy changes",
-            skill,
+            contract,
         )
         self.assertIn(
             "verified descriptor bytes into a fresh owner-private command launch",
-            skill,
+            contract,
         )
         self.assertIn(
-            "Require every lexical directory or symlink marker, followed target, and descriptor-bound ancestor to be owned by root or the current user",
-            skill,
+            "Every lexical directory or symlink marker, followed target, and descriptor-bound ancestor must be owned by root or the current user",
+            contract,
         )
         self.assertIn(
-            "reject every group/world-writable non-sticky directory",
-            skill,
+            "group/world-writable non-sticky directories and extended ACLs are rejected",
+            contract,
         )
         self.assertIn(
-            "one lexical absolute endpoint without synchronous path canonicalization",
-            skill,
+            "binds one lexical absolute temporary-root endpoint without synchronous path canonicalization",
+            contract,
         )
         self.assertIn(
             "immediately before and after `Popen`",
-            skill,
+            contract,
         )
         self.assertIn(
-            "A post-start mismatch enters the ordinary process-group/reap state machine",
-            skill,
+            "A post-start mismatch enters process-group/reap cleanup",
+            contract,
         )
         self.assertIn(
             "labels the original path as unverified",
-            skill,
+            contract,
         )
         self.assertIn(
-            "do not claim to stop a malicious same-UID replacement after the last pre-exec check",
-            skill,
+            "do not claim to prevent a malicious same-UID replacement after the final pre-exec check",
+            contract,
         )
         self.assertIn(
-            "close-only ordinary failure becomes a `UserError`",
-            skill,
+            "close-only ordinary failure is wrapped as `UserError`",
+            contract,
         )
         self.assertIn(
-            "Reject worktree journals larger than 4 MiB from descriptor metadata before any content read",
-            skill,
+            "Worktree journals larger than 4 MiB are rejected from descriptor metadata before any content read",
+            contract,
         )
         self.assertIn(
-            "Consume at most 4 MiB plus one byte per pass",
-            skill,
-        )
-        self.assertIn("stream the second through one 64 KiB comparison chunk", skill)
-        self.assertIn(
-            "derive `OSError` detail only from type/errno/strerror",
-            skill,
+            "Each pass consumes at most 4 MiB plus one byte",
+            contract,
         )
         self.assertIn(
-            "Reject concurrent growth and same-size content replacement",
-            skill,
+            "second uses at most one 64 KiB comparison chunk",
+            contract,
+        )
+        self.assertIn(
+            "renders `OSError` detail only from its type/errno/strerror",
+            contract,
+        )
+        self.assertIn(
+            "Concurrent growth and same-size content replacement therefore fail closed",
+            contract,
         )
         self.assertIn(
             "repeats descriptor/path identity, access, size, and digest validation",
-            skill,
+            contract,
         )
         self.assertIn(
-            "an unverified terminal reports a locator only after path revalidation",
-            skill,
+            "If terminal state is unverified, the helper reports a locator only after path revalidation",
+            contract,
         )
         self.assertIn(
             "preserve the exact original exception object, type, code, arguments, and traceback",
-            skill,
+            contract,
         )
         self.assertIn(
-            "source-snapshot descriptor inside that same preparation cleanup flow",
-            skill,
+            "source-snapshot descriptor closes inside that same preparation cleanup flow",
+            contract,
         )
-        self.assertIn("native no-replace or exchange rename semantics", skill)
-        self.assertIn("reported recovery locator", skill)
-        self.assertIn("installed-target-committed state", skill)
+        self.assertIn(
+            "native no-replace or exchange rename semantics",
+            contract,
+        )
+        self.assertIn(
+            "reported recovery locator",
+            contract,
+        )
+        self.assertIn(
+            "installed-target-committed state",
+            contract,
+        )
         self.assertIn(
             "completed cleanup and never claims a missing recovery object",
-            skill,
+            contract,
         )
         self.assertIn(
             "Final hook binding cleanup attempts the installation lock and every retained ancestor descriptor",
-            skill,
+            contract,
         )
         self.assertIn(
             "After successful acquisition, one POSIX signal fence covers the complete drain",
-            skill,
+            contract,
         )
         self.assertIn(
-            "entry-blocked pending `SIGINT` blocked and pending",
-            skill,
+            "entry-blocked pending `SIGINT` remains blocked and pending",
+            contract,
         )
-        self.assertIn("required `O_NOFOLLOW|O_NONBLOCK`", skill)
-        self.assertIn("every ancestor identity/access policy", skill)
         self.assertIn(
-            "preserve that exact action exception as primary",
-            skill,
+            "required `O_NOFOLLOW|O_NONBLOCK`",
+            contract,
+        )
+        self.assertIn(
+            "every ancestor identity/access policy",
+            contract,
+        )
+        self.assertIn(
+            "that exact action exception remains primary",
+            contract,
         )
         self.assertIn(
             "preserving the same object, type, arguments, and traceback",
-            skill,
+            contract,
         )
         self.assertIn(
-            "existing precedence for an earlier terminal-convergence failure "
-            "or managed-signal propagation is unchanged",
-            skill,
+            "existing precedence for an earlier terminal-convergence failure or managed-signal propagation is unchanged",
+            contract,
         )
         self.assertIn(
             "without `BaseException.add_note`",
-            skill,
+            contract,
         )
-        self.assertIn("clears a cached initialization failure", skill)
-        self.assertIn("reserves its final bounded detail slot", skill)
+        self.assertIn(
+            "clears a cached initialization failure",
+            contract,
+        )
+        self.assertIn(
+            "reserves its final bounded detail slot",
+            contract,
+        )
         self.assertIn(
             "CLI parsing, including `--help`, completes before Git runtime initialization",
-            skill,
+            contract,
         )
         self.assertIn(
             "held root-to-directory descriptor chain",
-            skill,
-        )
-        self.assertIn("`path_unverified`", skill)
-        self.assertIn(
-            "allowing timestamp and directory child-entry churn",
-            skill,
+            contract,
         )
         self.assertIn(
-            "do not overwrite authoritative index adoption",
-            skill,
+            "`path_unverified`",
+            contract,
         )
-        self.assertIn("each root is enriched at most twice", skill)
+        self.assertIn(
+            "not benign timestamp or directory child-entry churn",
+            contract,
+        )
+        self.assertIn(
+            "without erasing authoritative index adoption",
+            contract,
+        )
+        self.assertIn(
+            "each root is enriched at most twice",
+            contract,
+        )
         self.assertIn(
             "active `sessions` and flat `archived_sessions`",
-            skill,
+            contract,
         )
-        self.assertIn("`archived_sessions` as direct-child-only", skill)
-        self.assertIn("131,072-association budget", skill)
-        self.assertIn("`O_NOFOLLOW|O_NONBLOCK` descriptor", skill)
-        self.assertIn("distinct `inspection_reason` values", skill)
+        self.assertIn(
+            "archive source accepts only direct `rollout-*.jsonl` children",
+            contract,
+        )
+        self.assertIn(
+            "131,072 retained logical rollout associations across resolved and unresolved candidates",
+            contract,
+        )
+        self.assertIn(
+            "`O_NOFOLLOW|O_NONBLOCK` descriptor",
+            contract,
+        )
+        self.assertIn(
+            "corresponding distinct `inspection_reason`",
+            contract,
+        )
         self.assertIn(
             "object identity (`st_dev`, `st_ino`), access policy",
-            skill,
+            contract,
         )
-        self.assertIn("append/truncation", skill)
-        self.assertIn("Require `coverage_status: complete`", skill)
         self.assertIn(
-            "full bounded `discovery_coverage` object, including a stable `coverage_id`, exactly once",
-            skill,
+            "append/truncation",
+            contract,
         )
-        self.assertIn("small `discovery_coverage_ref` to every partial row", skill)
         self.assertIn(
-            "Buffer normalized distinct CWDs in first-seen order per rollout",
+            "Require `coverage_status: complete`",
             skill,
         )
         self.assertIn(
-            "Discard a failed rollout's pending buffer without rolling back aggregate counters",
-            skill,
+            "one deterministic final-sort anchor retains the full bounded `discovery_coverage` object with a stable `coverage_id`",
+            contract,
         )
         self.assertIn(
-            "explicitly owns and closes both the rollout-path and rollout-CWD iterators",
-            skill,
+            "every partial row carries a small `discovery_coverage_ref`",
+            contract,
         )
         self.assertIn(
-            "Freeze each primary's coverage counters when it is selected",
-            skill,
+            "stores normalized distinct CWDs in first-seen order in a per-rollout buffer",
+            contract,
         )
         self.assertIn(
-            "clear its traceback/context/cause after the handled error is no longer re-raised",
-            skill,
+            "A failed rollout discards its pending buffer without rolling back aggregate",
+            contract,
         )
         self.assertIn(
-            "bind the retained lexical current path once with required `O_DIRECTORY|O_CLOEXEC|O_NONBLOCK`",
-            skill,
+            "caller explicitly owns and closes both yielded iterators before coverage serialization",
+            contract,
         )
         self.assertIn(
-            "inspect `.git` only with descriptor-relative no-follow `stat`",
-            skill,
+            "Each selected error freezes its coverage counters before cleanup",
+            contract,
         )
         self.assertIn(
-            "label any lexical marker hint `path_unverified`",
-            skill,
+            "sheds traceback/context/cause references once it will no longer be re-raised",
+            contract,
         )
         self.assertIn(
-            "Keep one descriptor owner authoritative",
-            skill,
+            "opens the retained lexical current path once with required `O_DIRECTORY|O_CLOEXEC|O_NONBLOCK`",
+            contract,
         )
         self.assertIn(
-            "local current/parent variables are non-owning aliases",
-            skill,
+            "Every `.git` classification then uses only no-follow `stat(\".git\", dir_fd=current_fd)`",
+            contract,
         )
         self.assertIn(
-            "owner state distinguishes not-yet-closed from close-attempted descriptors",
-            skill,
+            "explicitly `path_unverified` lexical hint",
+            contract,
         )
         self.assertIn(
-            "contextual error is not the identical ambient exception",
-            skill,
-        )
-        self.assertIn("bounded three-line marker prefix", skill)
-        self.assertIn(
-            "Inaccessible journal, index, exclude, or hook paths remain null",
-            skill,
+            "One descriptor owner is authoritative across open registration, handoff, and context exit",
+            contract,
         )
         self.assertIn(
-            "Hook installation supports macOS and Linux only",
-            skill,
+            "`current_fd` and `parent_fd` are non-owning aliases",
+            contract,
+        )
+        self.assertIn(
+            "each owner entry records whether close has not started or has already been attempted",
+            contract,
+        )
+        self.assertIn(
+            "contextual exception differs by identity from the ambient exception recorded at close start",
+            contract,
+        )
+        self.assertIn(
+            "three-line marker prefix",
+            contract,
+        )
+        self.assertIn(
+            "Inaccessible journal, index, exclude, or hook paths therefore remain unknown",
+            contract,
+        )
+        self.assertIn(
+            "Opt-in hook installation supports macOS and Linux only",
+            contract,
         )
         self.assertIn(
             "`--includes --show-scope --show-origin --type=path --null --get core.hooksPath`",
-            skill,
+            contract,
         )
-        self.assertIn("`effective_hook_destination_changed`", skill)
-        self.assertIn("`effective_hook_configuration_unverified`", skill)
-        self.assertIn("point-in-time proof", skill)
+        self.assertIn(
+            "`effective_hook_destination_changed`",
+            contract,
+        )
+        self.assertIn(
+            "`effective_hook_configuration_unverified`",
+            contract,
+        )
+        self.assertIn(
+            "point-in-time proof",
+            contract,
+        )
         self.assertIn(
             "leave `docs/PROJECT_STATE.md`, `docs/PROJECT_TODO.md`, and `docs/project_journal/` unchanged",
             skill,
         )
-        self.assertNotIn("Treat the docs as the default convention", skill)
+        self.assertNotIn(
+            "Treat the docs as the default convention",
+            skill,
+        )
         self.assertNotIn(
             "assume `docs/PROJECT_STATE.md` and `docs/PROJECT_TODO.md` should exist",
             skill,
@@ -13907,10 +14069,29 @@ class ProjectJournalTests(unittest.TestCase):
             "If top-level trackers do not exist yet, create both files",
             skill,
         )
-        self.assertNotIn("Keep both top-level docs", skill)
+        self.assertNotIn(
+            "Keep both top-level docs",
+            skill,
+        )
         self.assertIn(
             "When present, keep `docs/PROJECT_STATE.md` and `docs/PROJECT_TODO.md`",
             skill,
+        )
+        self.assertIn(
+            "Validity is never recovered by rescanning formatted issue strings",
+            contract,
+        )
+        self.assertIn(
+            "isolated to that row through `discovery_status` and a field-keyed `discovery_error`",
+            contract,
+        )
+        self.assertIn(
+            "cleanup-incomplete validation fails closed",
+            contract,
+        )
+        self.assertIn(
+            "Semantic validation invalidates every member of a duplicate-ID group",
+            contract,
         )
 
     def test_skill_updates_smallest_layer_and_keeps_local_tools_conditional(
@@ -13944,6 +14125,7 @@ class ProjectJournalTests(unittest.TestCase):
         openai_yaml = OPENAI_YAML.read_text(encoding="utf-8")
         templates = TEMPLATES_MD.read_text(encoding="utf-8")
         migration = MIGRATION_PLAYBOOK_MD.read_text(encoding="utf-8")
+        contract = CONTRACT_MD.read_text(encoding="utf-8")
 
         self.assertIn("$project-journal", openai_yaml)
         self.assertIn("smallest applicable journal layer", openai_yaml)
@@ -13967,232 +14149,232 @@ class ProjectJournalTests(unittest.TestCase):
             "generated `INDEX.md` does not establish adoption",
             readme,
         )
-        self.assertIn("ignores ambient Git control/configuration redirections", readme)
+        self.assertIn("ignores ambient Git control/configuration redirections", contract)
         self.assertIn(
             "requires those exact bytes to return a bounded credential-free",
-            readme,
+            contract,
         )
         self.assertIn(
             "remainder of the same five-second initialization deadline",
-            readme,
+            contract,
         )
         self.assertIn(
             "timeout, nonzero exit, or malformed response is a non-cacheable",
-            readme,
+            contract,
         )
         self.assertIn(
             "source, destination, and directory descriptors through one bounded precedence helper",
-            readme,
+            contract,
         )
         self.assertIn(
             "verified descriptor bytes into a fresh owner-private command launch",
-            readme,
+            contract,
         )
         self.assertIn(
             "Every lexical directory or symlink marker, followed target, and descriptor-bound ancestor must be owned by root or the current user",
-            readme,
+            contract,
         )
         self.assertIn(
             "group/world-writable non-sticky directories and extended ACLs are rejected",
-            readme,
+            contract,
         )
         self.assertIn(
             "binds one lexical absolute temporary-root endpoint without synchronous path canonicalization",
-            readme,
+            contract,
         )
         self.assertIn(
             "immediately before and after `Popen`",
-            readme,
+            contract,
         )
         self.assertIn(
             "A post-start mismatch enters process-group/reap cleanup",
-            readme,
+            contract,
         )
         self.assertIn(
             "unverified original path hint rather than a false locator",
-            readme,
+            contract,
         )
         self.assertIn(
             "do not claim to prevent a malicious same-UID replacement after the final pre-exec check",
-            readme,
+            contract,
         )
         self.assertIn(
             "close-only ordinary failure is wrapped as `UserError`",
-            readme,
+            contract,
         )
         self.assertIn(
             "Worktree journals larger than 4 MiB are rejected from descriptor metadata before any content read",
-            readme,
+            contract,
         )
         self.assertIn(
             "Each pass consumes at most 4 MiB plus one byte",
-            readme,
+            contract,
         )
         self.assertIn(
             "second uses at most one 64 KiB comparison chunk",
-            readme,
+            contract,
         )
         self.assertIn(
             "renders `OSError` detail only from its type/errno/strerror",
-            readme,
+            contract,
         )
         self.assertIn(
             "Concurrent growth and same-size content replacement therefore fail closed",
-            readme,
+            contract,
         )
         self.assertIn(
             "locks the launch directory against ordinary replacement",
-            readme,
+            contract,
         )
         self.assertIn(
             "reports a locator only after path revalidation",
-            readme,
+            contract,
         )
-        self.assertIn("byte, record, and stderr bounds", readme)
-        self.assertIn("one bounded `git cat-file --batch` session", readme)
-        self.assertIn("one absolute monotonic deadline", readme)
-        self.assertIn("structured per-path validity", readme)
-        self.assertIn("entry/field/list/issue budgets", readme)
+        self.assertIn("byte, record, and stderr bounds", contract)
+        self.assertIn("one bounded `git cat-file --batch` session", contract)
+        self.assertIn("one absolute monotonic deadline", contract)
+        self.assertIn("structured per-path validity", contract)
+        self.assertIn("entry/field/list/issue budgets", contract)
         self.assertIn(
             "unreaped direct child as the PID/PGID identity fence",
-            readme,
+            contract,
         )
-        self.assertIn("Xcode Python 3.9.6", readme)
-        self.assertIn("kqueue `NOTE_EXIT`", readme)
-        self.assertIn("default waitable `SIGCHLD` semantics", readme)
-        self.assertIn("rejects `SA_NOCLDWAIT`", readme)
-        self.assertIn("libc-injected `SA_RESTORER`", readme)
+        self.assertIn("Xcode Python 3.9.6", contract)
+        self.assertIn("kqueue `NOTE_EXIT`", contract)
+        self.assertIn("default waitable `SIGCHLD` semantics", contract)
+        self.assertIn("rejects `SA_NOCLDWAIT`", contract)
+        self.assertIn("libc-injected `SA_RESTORER`", contract)
         self.assertIn(
             "before every numeric PID/PGID probe or signal",
-            readme,
+            contract,
         )
-        self.assertIn("Explicit cleanup ownership states", readme)
-        self.assertIn("never signals a numeric PGID after the final reap", readme)
-        self.assertIn("reports `cleanup-incomplete`", readme)
-        self.assertIn("system and global Git configuration", readme)
-        self.assertIn("native no-replace or exchange rename semantics", readme)
-        self.assertIn("installed-target-committed state", readme)
+        self.assertIn("Explicit cleanup ownership states", contract)
+        self.assertIn("never signals a numeric PGID after the final reap", contract)
+        self.assertIn("reports `cleanup-incomplete`", contract)
+        self.assertIn("system and global Git configuration", contract)
+        self.assertIn("native no-replace or exchange rename semantics", contract)
+        self.assertIn("installed-target-committed state", contract)
         self.assertIn(
             "completed cleanup and never claims a missing recovery object",
-            readme,
+            contract,
         )
         self.assertIn(
             "Final hook binding cleanup attempts the installation lock and every retained ancestor descriptor",
-            readme,
+            contract,
         )
         self.assertIn(
             "After successful acquisition, one POSIX signal fence covers the complete drain",
-            readme,
+            contract,
         )
         self.assertIn(
             "entry-blocked pending `SIGINT` remains blocked and pending",
-            readme,
+            contract,
         )
         self.assertIn(
             "preserving the same object, type, arguments, and traceback",
-            readme,
+            contract,
         )
         self.assertIn(
             "source-snapshot descriptor closes inside that same preparation cleanup flow",
-            readme,
+            contract,
         )
         self.assertIn(
             "existing precedence for an earlier terminal-convergence failure "
             "or managed-signal propagation is unchanged",
-            readme,
+            contract,
         )
-        self.assertIn("bind the complete absolute path", readme)
-        self.assertIn("structured `discovery_error`", readme)
-        self.assertIn("supports only macOS and Linux", readme)
-        self.assertIn("including other POSIX systems", readme)
-        self.assertNotIn("other POSIX hosts retain signal-zero", readme)
-        self.assertIn("each root is enriched at most twice", readme)
+        self.assertIn("bind the complete absolute path", contract)
+        self.assertIn("structured `discovery_error`", contract)
+        self.assertIn("supports only macOS and Linux", contract)
+        self.assertIn("including other POSIX systems", contract)
+        self.assertNotIn("other POSIX hosts retain signal-zero", contract)
+        self.assertIn("each root is enriched at most twice", contract)
         self.assertIn(
             "active `sessions` and flat `archived_sessions`",
-            readme,
+            contract,
         )
         self.assertIn(
             "archive source accepts only direct `rollout-*.jsonl` children",
-            readme,
+            contract,
         )
         self.assertIn(
             "131,072 retained logical rollout associations",
-            readme,
+            contract,
         )
-        self.assertIn("one shared 60-second monotonic deadline", readme)
-        self.assertIn("required `O_NOFOLLOW|O_NONBLOCK`", readme)
-        self.assertIn("distinct `inspection_reason`", readme)
+        self.assertIn("one shared 60-second monotonic deadline", contract)
+        self.assertIn("required `O_NOFOLLOW|O_NONBLOCK`", contract)
+        self.assertIn("distinct `inspection_reason`", contract)
         self.assertIn(
             "object identity (`st_dev`, `st_ino`), access policy",
-            readme,
+            contract,
         )
-        self.assertIn("append/truncation", readme)
-        self.assertIn("`coverage_status: complete`", readme)
-        self.assertIn("one deterministic final-sort anchor", readme)
-        self.assertIn("small `discovery_coverage_ref`", readme)
+        self.assertIn("append/truncation", contract)
+        self.assertIn("`coverage_status: complete`", contract)
+        self.assertIn("one deterministic final-sort anchor", contract)
+        self.assertIn("small `discovery_coverage_ref`", contract)
         self.assertIn(
             "first-seen order in a per-rollout buffer",
-            readme,
+            contract,
         )
         self.assertIn(
             "failed rollout discards its pending buffer without rolling back aggregate byte, record, verification-byte, or distinct-CWD counters",
-            readme,
+            contract,
         )
         self.assertIn(
             "caller explicitly owns and closes both yielded iterators before coverage serialization",
-            readme,
+            contract,
         )
         self.assertIn(
             "cannot disappear with `GeneratorExit`",
-            readme,
+            contract,
         )
         self.assertIn(
             "sheds traceback/context/cause references once it will no longer be re-raised",
-            readme,
+            contract,
         )
         self.assertIn(
             "descriptor-bound scan over at most `MAX_DISCOVERY_CWD_COMPONENTS + 1` existing ancestors",
-            readme,
+            contract,
         )
         self.assertIn(
             'Every `.git` classification then uses only no-follow `stat(".git", dir_fd=current_fd)`',
-            readme,
+            contract,
         )
         self.assertIn(
             "explicitly `path_unverified` lexical hint",
-            readme,
+            contract,
         )
         self.assertIn(
             "One descriptor owner is authoritative",
-            readme,
+            contract,
         )
         self.assertIn(
             "Context exit retries an interrupted drain",
-            readme,
+            contract,
         )
-        self.assertIn("first uncertain close failure", readme)
-        self.assertIn("ambient exception recorded at close start", readme)
-        self.assertIn("three-line marker prefix", readme)
+        self.assertIn("first uncertain close failure", contract)
+        self.assertIn("ambient exception recorded at close start", contract)
+        self.assertIn("three-line marker prefix", contract)
         self.assertIn(
             "Inaccessible journal, index, exclude, or hook paths",
-            readme,
+            contract,
         )
         self.assertIn(
             "Opt-in hook installation supports macOS and Linux only",
-            readme,
+            contract,
         )
         self.assertIn(
             "`--includes --show-scope --show-origin --type=path --null --get core.hooksPath`",
-            readme,
+            contract,
         )
-        self.assertIn("`effective_hook_destination_changed`", readme)
-        self.assertIn("`effective_hook_configuration_unverified`", readme)
-        self.assertIn("point-in-time proof", readme)
-        self.assertIn("Every user-visible indexed-path diagnostic", readme)
-        self.assertIn("failed `git ls-files` never echoes stdout", readme)
-        self.assertIn("duplicate-ID group invalidation", readme)
-        self.assertIn("without erasing authoritative index adoption", readme)
-        self.assertIn("`adopted`, `unadopted`, or `inconclusive`", readme)
+        self.assertIn("`effective_hook_destination_changed`", contract)
+        self.assertIn("`effective_hook_configuration_unverified`", contract)
+        self.assertIn("point-in-time proof", contract)
+        self.assertIn("Every user-visible indexed-path diagnostic", contract)
+        self.assertIn("failed `git ls-files` never echoes stdout", contract)
+        self.assertIn("duplicate-ID group invalidation", contract)
+        self.assertIn("without erasing authoritative index adoption", contract)
+        self.assertIn("`adopted`, `unadopted`, or `inconclusive`", contract)
         self.assertIn(
             "explicit product need justifies first adoption",
             templates,
@@ -14218,6 +14400,97 @@ class ProjectJournalTests(unittest.TestCase):
             "generated `INDEX.md` is not",
             migration,
         )
+
+    def test_skill_is_concise_portable_and_loads_contract_lazily(self) -> None:
+        skill = SKILL_MD.read_text(encoding="utf-8")
+        _, frontmatter, body = skill.split("---", 2)
+        fields = dict(
+            line.split(": ", 1) for line in frontmatter.strip().splitlines()
+        )
+
+        self.assertLessEqual(len(skill.encode("utf-8")), 8 * 1024)
+        self.assertLessEqual(max(len(line) for line in body.splitlines()), 200)
+        self.assertEqual(set(fields), {"name", "description"})
+        self.assertEqual(fields["name"], "project-journal")
+        self.assertLessEqual(len(fields["description"]), 1024)
+        prose = " ".join(body.split())
+        self.assertIn("A PR or multi-session task alone is not a trigger", fields["description"])
+        self.assertIn("references/helper-safety-contract.md", prose)
+        self.assertIn("only when changing or debugging the helper", prose)
+        self.assertIn("Routine journal updates do not need it", prose)
+        self.assertIn("UTF-8-safe display values", prose)
+        self.assertIn("may not round-trip to a real filesystem path", prose)
+        self.assertIn("Verify actual paths before acting", prose)
+        routing = "repository-owned durable coordination, recovery, or backlog state"
+        for document in (
+            fields["description"],
+            " ".join(README_MD.read_text(encoding="utf-8").split()),
+            OPENAI_YAML.read_text(encoding="utf-8"),
+        ):
+            self.assertIn(routing, document)
+            self.assertNotIn("a task spans Codex sessions", document)
+        self.assertIn("Optional, Codex-only", body)
+        for internal in (
+            "SA_NOCLDWAIT",
+            "kqueue",
+            "O_NOFOLLOW",
+            "sigpending",
+            "WNOWAIT",
+            "codex_worktree_mapping_unverified",
+        ):
+            self.assertNotIn(internal, skill)
+        self.assertNotIn("$remote-host-context", skill)
+        self.assertNotIn("Codex instance", skill)
+
+    def test_readme_is_concise_and_documents_portable_install(self) -> None:
+        readme = README_MD.read_text(encoding="utf-8")
+
+        self.assertLessEqual(len(readme.encode("utf-8")), 6 * 1024)
+        self.assertIn("Installing runs no code", readme)
+        self.assertIn("Python 3.9 or newer, standard library only", readme)
+        self.assertIn("Git 2.45 or newer", readme)
+        self.assertIn("Linux with glibc on x86_64 or AArch64", readme)
+        self.assertIn("~/.pi/agent/skills/project-journal/SKILL.md", readme)
+        self.assertIn(
+            "if [ -e ~/.pi/agent/skills/project-journal ] || "
+            "[ -L ~/.pi/agent/skills/project-journal ]; then",
+            readme,
+        )
+        self.assertIn("CLONE_DIR=/absolute/path/to/codex-project-journal", readme)
+        self.assertIn('ln -s "$CLONE_DIR" ~/.pi/agent/skills/project-journal', readme)
+        self.assertIn(
+            "a relative symlink target would resolve against the skills directory",
+            " ".join(readme.split()),
+        )
+        self.assertNotIn("ln -sf", readme)
+        self.assertIn("/reload", readme)
+        self.assertIn("${CODEX_HOME:-$HOME/.codex}/skills/project-journal", readme)
+        self.assertIn("references/helper-safety-contract.md", readme)
+        self.assertNotIn("npm", readme)
+        for internal in ("SA_NOCLDWAIT", "kqueue", "sigpending", "WNOWAIT"):
+            self.assertNotIn(internal, readme)
+
+    def test_skill_docs_links_resolve_and_avoid_personal_paths(self) -> None:
+        documents = [SKILL_MD, README_MD, CONTRACT_MD, TEMPLATES_MD, MIGRATION_PLAYBOOK_MD]
+        root = SKILL_MD.parent
+        for document in documents:
+            text = document.read_text(encoding="utf-8")
+            for target in re.findall(r"\]\(([^)\s]+)\)", text):
+                if "://" in target:
+                    continue
+                self.assertTrue(
+                    (document.parent / target.split("#", 1)[0]).exists(),
+                    f"{document.name}: broken link {target}",
+                )
+            for reference in re.findall(r"`(references/[A-Za-z0-9_.-]+\.md)`", text):
+                self.assertTrue(
+                    (root / reference).is_file(),
+                    f"{document.name}: missing {reference}",
+                )
+            self.assertIsNone(
+                re.search(r"/(?:Users|home)/[A-Za-z0-9_.-]+/", text),
+                f"{document.name}: host-specific home path",
+            )
 
     def test_validate_rejects_broken_supersedes_link(self) -> None:
         repo = self.init_repo()
